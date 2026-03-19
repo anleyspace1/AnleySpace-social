@@ -1,0 +1,8 @@
+{
+  "name": "AnleySpace",
+  "description": "A professional social media platform with a coin-based engagement system, featuring reels, marketplace, wallet, and live streaming.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}

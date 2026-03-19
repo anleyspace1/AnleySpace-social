@@ -1,0 +1,164 @@
+import React from 'react';
+import { NavLink } from 'react-router-dom';
+import { motion } from 'motion/react';
+import { 
+  Home, 
+  Users, 
+  LayoutGrid, 
+  ShoppingBag, 
+  Bookmark,
+  ChevronRight,
+  Bell,
+  Moon,
+  Sun,
+  LogOut
+} from 'lucide-react';
+import { cn } from '../lib/utils';
+import { MOCK_USER } from '../constants';
+import { useAuth } from '../contexts/AuthContext';
+import { ResponsiveImage } from './ResponsiveImage';
+
+export default function Sidebar({ onClose, darkMode, setDarkMode }: { onClose?: () => void; darkMode: boolean; setDarkMode: (val: boolean) => void }) {
+  const { user, profile, signOut } = useAuth();
+  
+  const displayUser = {
+    displayName: profile?.full_name || user?.user_metadata?.full_name || user?.user_metadata?.display_name || 'User',
+    username: profile?.username || user?.user_metadata?.username || user?.email?.split('@')[0] || 'user',
+    avatar: profile?.avatar_url || user?.user_metadata?.avatar_url || user?.user_metadata?.avatar || MOCK_USER.avatar
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="bg-white dark:bg-gray-900 rounded-2xl p-4 shadow-sm border border-gray-100 dark:border-gray-800">
+        <NavLink 
+          to="/profile" 
+          onClick={onClose}
+          className="flex items-center gap-3 mb-6 p-2 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-800 transition-all"
+        >
+          <div className="w-12 h-12 rounded-full overflow-hidden border-2 border-indigo-500 p-0.5">
+            <ResponsiveImage src={displayUser.avatar} alt={displayUser.username} width={48} height={48} className="w-full h-full rounded-full object-cover" />
+          </div>
+          <div>
+            <h3 className="font-bold text-sm">{displayUser.displayName}</h3>
+            <p className="text-xs text-gray-500">@{displayUser.username}</p>
+          </div>
+        </NavLink>
+
+        <nav className="space-y-1">
+          <SidebarLink to="/" icon={<Home size={20} />} label="Home" onClick={onClose} />
+          <SidebarLink to="/friends" icon={<Users size={20} />} label="Friends" onClick={onClose} />
+          <SidebarLink to="/groups" icon={<LayoutGrid size={20} />} label="Groups" onClick={onClose} />
+          <SidebarLink to="/marketplace" icon={<ShoppingBag size={20} />} label="Marketplace" onClick={onClose} />
+          <SidebarLink to="/notifications" icon={<Bell size={20} />} label="Notifications" onClick={onClose} />
+          <SidebarLink to="/saved" icon={<Bookmark size={20} />} label="Saved" onClick={onClose} />
+        </nav>
+      </div>
+
+      <div className="bg-white dark:bg-gray-900 rounded-2xl p-4 shadow-sm border border-gray-100 dark:border-gray-800">
+        <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4 px-2">Settings</h4>
+        <button 
+          onClick={() => setDarkMode(!darkMode)}
+          className="w-full flex items-center justify-between px-3 py-2.5 rounded-xl hover:bg-gray-100 dark:hover:bg-gray-800 transition-all text-gray-600 dark:text-gray-400"
+        >
+          <div className="flex items-center gap-3">
+            {darkMode ? <Sun size={20} /> : <Moon size={20} />}
+            <span className="text-sm">{darkMode ? 'Light Mode' : 'Dark Mode'}</span>
+          </div>
+          <div className={cn(
+            "w-10 h-5 rounded-full relative transition-colors",
+            darkMode ? "bg-indigo-600" : "bg-gray-300 dark:bg-gray-700"
+          )}>
+            <div className={cn(
+              "absolute top-1 w-3 h-3 rounded-full bg-white transition-all",
+              darkMode ? "left-6" : "left-1"
+            )} />
+          </div>
+        </button>
+
+        <button 
+          onClick={() => signOut()}
+          className="w-full flex items-center gap-3 px-3 py-2.5 mt-2 rounded-xl hover:bg-red-50 dark:hover:bg-red-900/20 text-red-600 transition-all"
+        >
+          <LogOut size={20} />
+          <span className="text-sm font-bold">Logout</span>
+        </button>
+      </div>
+
+      <div className="bg-white dark:bg-gray-900 rounded-2xl p-4 shadow-sm border border-gray-100 dark:border-gray-800">
+        <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4 px-2">Categories</h4>
+        <nav className="space-y-1">
+          <CategoryLink to="/?category=Technology" label="Technology" onClick={onClose} />
+          <CategoryLink to="/?category=Sports" label="Sports" onClick={onClose} />
+          <CategoryLink to="/?category=Art" label="Art" onClick={onClose} />
+          <CategoryLink to="/?category=Business" label="Business" onClick={onClose} />
+          <CategoryLink to="/?category=Education" label="Education" onClick={onClose} />
+        </nav>
+      </div>
+
+      <div className="bg-white dark:bg-gray-900 rounded-2xl p-4 shadow-sm border border-gray-100 dark:border-gray-800">
+        <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4 px-2">Shortcuts</h4>
+        <nav className="space-y-1">
+          <ShortcutLink to="/groups/travel" color="bg-blue-100 text-blue-600" label="Travel Lovers" onClick={onClose} />
+          <ShortcutLink to="/groups/music" color="bg-purple-100 text-purple-600" label="Music Hub" onClick={onClose} />
+          <ShortcutLink to="/groups/fitness" color="bg-orange-100 text-orange-600" label="Fitness Club" onClick={onClose} />
+          <ShortcutLink to="/groups/gaming" color="bg-red-100 text-red-600" label="Gaming World" onClick={onClose} />
+        </nav>
+      </div>
+    </div>
+  );
+}
+
+function SidebarLink({ to, icon, label, onClick }: { to: string; icon: React.ReactNode; label: string; onClick?: () => void }) {
+  return (
+    <motion.div whileHover={{ x: 4 }} whileTap={{ scale: 0.98 }}>
+      <NavLink 
+        to={to}
+        onClick={onClick}
+        className={({ isActive }) => cn(
+          "w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all",
+          isActive ? "bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 font-bold" : "text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800"
+        )}
+      >
+        {icon}
+        <span className="text-sm">{label}</span>
+      </NavLink>
+    </motion.div>
+  );
+}
+
+function CategoryLink({ to, label, onClick }: { to: string; label: string; onClick?: () => void }) {
+  return (
+    <motion.div whileHover={{ x: 4 }} whileTap={{ scale: 0.98 }}>
+      <NavLink 
+        to={to}
+        onClick={onClick}
+        className={({ isActive }) => cn(
+          "w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all text-sm",
+          isActive ? "bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 font-bold" : "text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800"
+        )}
+      >
+        {label}
+      </NavLink>
+    </motion.div>
+  );
+}
+
+function ShortcutLink({ to, color, label, onClick }: { to: string; color: string; label: string; onClick?: () => void }) {
+  return (
+    <motion.div whileHover={{ x: 4 }} whileTap={{ scale: 0.98 }}>
+      <NavLink 
+        to={to}
+        onClick={onClick}
+        className={({ isActive }) => cn(
+          "w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all text-gray-600 dark:text-gray-400 group",
+          isActive ? "bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 font-bold" : "hover:bg-gray-100 dark:hover:bg-gray-800"
+        )}
+      >
+        <div className={cn("w-8 h-8 rounded-lg flex items-center justify-center text-xs font-bold transition-transform group-hover:scale-110 shadow-sm", color)}>
+          {label.charAt(0)}
+        </div>
+        <span className="text-sm">{label}</span>
+      </NavLink>
+    </motion.div>
+  );
+}
