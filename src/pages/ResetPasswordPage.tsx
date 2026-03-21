@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { supabase } from '../lib/supabase';
+import { getCachedSession, supabase } from '../lib/supabase';
 import { Lock, ArrowRight, Loader2, CheckCircle } from 'lucide-react';
 import { motion } from 'motion/react';
 
@@ -14,7 +14,7 @@ export default function ResetPasswordPage() {
 
   useEffect(() => {
     // Check if we have a session (the user should be logged in via the reset link)
-    supabase.auth.getSession().then(({ data: { session } }) => {
+    getCachedSession().then((session) => {
       if (!session) {
         setError('Invalid or expired reset link. Please request a new one.');
       }

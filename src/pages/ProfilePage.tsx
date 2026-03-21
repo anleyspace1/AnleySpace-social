@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Settings, 
@@ -35,7 +35,7 @@ import StoryEditor from '../components/StoryEditor';
 import { ResponsiveImage } from '../components/ResponsiveImage';
 
 export default function ProfilePage() {
-  const { username } = useParams();
+  const { id: profileIdParam } = useParams();
   const navigate = useNavigate();
   const { user, profile: myProfile } = useAuth();
   const [searchParams] = useSearchParams();
@@ -43,12 +43,13 @@ export default function ProfilePage() {
   const [userProfile, setUserProfile] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [userPosts, setUserPosts] = useState<Post[]>([]);
+  const [savedItems, setSavedItems] = useState<Post[]>([]);
 
-  const isOwnProfile = !username || (myProfile && username === myProfile.username);
+  const isOwnProfile = !profileIdParam || (myProfile && profileIdParam === myProfile.id);
 
   useEffect(() => {
     fetchProfile();
-  }, [username, myProfile]);
+  }, [profileIdParam, myProfile]);
 
   const fetchProfile = async () => {
     setLoading(true);
@@ -56,11 +57,11 @@ export default function ProfilePage() {
       let profileData;
       if (isOwnProfile && myProfile) {
         profileData = myProfile;
-      } else if (username) {
+      } else if (profileIdParam) {
         const { data, error } = await supabase
           .from('profiles')
           .select('*')
-          .eq('username', username)
+          .eq('id', profileIdParam)
           .single();
         
         if (error) throw error;
@@ -136,21 +137,89 @@ export default function ProfilePage() {
     }
   };
 
+  const fetchSavedPosts = useCallback(async () => {
+    if (!user?.id || !isOwnProfile) {
+      setSavedItems([]);
+      return;
+    }
+    try {
+      console.log('[Profile] fetchSavedPosts start', user.id);
+      const { data: saveRows, error: saveErr } = await supabase
+        .from('saved_posts')
+        .select('post_id')
+        .eq('user_id', user.id);
+
+      if (saveErr) throw saveErr;
+      const ids = (saveRows || []).map((r: { post_id: string }) => r.post_id).filter(Boolean);
+      console.log('[Profile] fetchSavedPosts saved row count', ids.length, ids);
+
+      if (ids.length === 0) {
+        setSavedItems([]);
+        return;
+      }
+
+      const { data: postsData, error: postsErr } = await supabase
+        .from('posts')
+        .select('*')
+        .in('id', ids);
+
+      if (postsErr) throw postsErr;
+
+      const byId = new Map((postsData || []).map((p: any) => [p.id, p]));
+      const ordered = ids.map((id) => byId.get(id)).filter(Boolean) as any[];
+
+      const authorIds = [...new Set(ordered.map((p) => p.user_id).filter(Boolean))];
+      let profById: Record<string, { username?: string; avatar_url?: string }> = {};
+      if (authorIds.length > 0) {
+        const { data: profs, error: profErr } = await supabase
+          .from('profiles')
+          .select('id, username, avatar_url')
+          .in('id', authorIds);
+        if (profErr) {
+          console.error('[Profile] fetchSavedPosts profiles error', profErr);
+        } else {
+          (profs || []).forEach((p: any) => {
+            profById[p.id] = p;
+          });
+        }
+      }
+
+      const formatted: Post[] = ordered.map((p: any) => {
+        const prof = profById[p.user_id];
+        return {
+          id: p.id,
+          image: p.image_url || p.video_url,
+          videoUrl: p.video_url,
+          user: {
+            username: prof?.username || 'Unknown',
+            avatar: prof?.avatar_url || `https://picsum.photos/seed/${p.user_id}/100/100`,
+          },
+          caption: p.content,
+          likes: p.likes_count ?? 0,
+          comments: p.comments_count ?? 0,
+          shares: p.shares_count ?? 0,
+          timestamp: new Date(p.created_at).toLocaleDateString(),
+        };
+      });
+
+      setSavedItems(formatted);
+      console.log('[Profile] fetchSavedPosts done', formatted.length);
+    } catch (err) {
+      console.error('[Profile] fetchSavedPosts error', err);
+      setSavedItems([]);
+    }
+  }, [user?.id, isOwnProfile]);
+
   const displayUser = userProfile || {
-    username: username || 'user',
-    displayName: username || 'User',
-    avatar: `https://picsum.photos/seed/${username}/200/200`,
+    username: 'Unknown User',
+    displayName: 'Unknown User',
+    avatar: `https://picsum.photos/seed/${profileIdParam || 'unknown-user'}/200/200`,
     bio: '',
     coins: 0,
     isVerified: false,
   };
 
   const [userVideos] = useState<Video[]>(MOCK_VIDEOS.filter(v => v.user.username === displayUser.username || isOwnProfile).slice(0, 4));
-  
-  const [savedItems] = useState<Post[]>([
-    { id: 's1', image: 'https://picsum.photos/seed/saved1/800/800', user: { username: 'travel_pro', avatar: 'https://picsum.photos/seed/user1/100/100' }, caption: 'Dream destination! 😍', likes: 5400, comments: 230, shares: 120, timestamp: '1w ago' },
-    { id: 's2', image: 'https://picsum.photos/seed/saved2/800/800', user: { username: 'foodie_hub', avatar: 'https://picsum.photos/seed/user2/100/100' }, caption: 'Best pasta ever. 🍝', likes: 3200, comments: 89, shares: 45, timestamp: '2w ago' },
-  ]);
 
   useEffect(() => {
     const postId = searchParams.get('post');
@@ -173,6 +242,12 @@ export default function ProfilePage() {
   const [activeTab, setActiveTab] = useState<'Posts' | 'Videos' | 'Saved'>('Posts');
   const [selectedPost, setSelectedPost] = useState<Post | null>(null);
   const [selectedVideo, setSelectedVideo] = useState<Video | null>(null);
+
+  useEffect(() => {
+    if (activeTab === 'Saved' && isOwnProfile && user?.id) {
+      fetchSavedPosts();
+    }
+  }, [activeTab, isOwnProfile, user?.id, fetchSavedPosts]);
 
   useEffect(() => {
     if (userProfile) {
@@ -671,9 +746,9 @@ function UserListModal({ title, users, onToggleFollow, onClose, loading }: { tit
     (user.name || '').toLowerCase().includes((searchQuery || '').toLowerCase())
   );
 
-  const handleUserClick = (username: string) => {
+  const handleUserClick = (id: string) => {
     onClose();
-    navigate(`/profile/${username}`);
+    navigate(`/profile/${id}`);
   };
 
   return (
@@ -727,7 +802,7 @@ function UserListModal({ title, users, onToggleFollow, onClose, loading }: { tit
               <div key={user.id} className="flex items-center justify-between">
                 <div 
                   className="flex items-center gap-3 cursor-pointer group"
-                  onClick={() => handleUserClick(user.username)}
+                  onClick={() => handleUserClick(user.id)}
                 >
                   <img src={user.avatar} alt={user.username} className="w-12 h-12 rounded-full border border-gray-100 dark:border-gray-800 group-hover:border-indigo-500 transition-colors" />
                   <div>

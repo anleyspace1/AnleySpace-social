@@ -2,12 +2,13 @@ import express from "express";
 import { createServer } from "http";
 import { Server } from "socket.io";
 import { createServer as createViteServer } from "vite";
-import db from "./src/lib/db"; // Removed .js extension
+import db from "./src/lib/db.ts";
 import { v4 as uuidv4 } from 'uuid';
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
+import multer from 'multer';
 
 dotenv.config();
 
@@ -74,27 +75,7 @@ async function syncGroupMessages(groupId: string) {
 
 async function startServer() {
   const app = express();
-  const httpServer = createServer(app);
-  const io = new Server(httpServer, {
-    cors: {
-      origin: "*",
-      methods: ["GET", "POST"]
-    }
-  });
-
-  const PORT = 3000;
-  const logFile = path.join(process.cwd(), 'server.log');
-  const logToFile = (msg: string) => {
-    fs.appendFileSync(logFile, `${msg} - ${new Date().toISOString()}\n`);
-  };
-
-  console.log(`SERVER: NODE_ENV is ${process.env.NODE_ENV}`);
-  logToFile(`SERVER: NODE_ENV is ${process.env.NODE_ENV}`);
-
-  app.use(express.json({ limit: '10mb' }));
-  app.use(express.urlencoded({ limit: '10mb', extended: true }));
-
-  // CORS middleware
+  // CORS must run before any /api routes so cross-origin dev (e.g. Vite on :5173 + API on :3000) works.
   app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -104,6 +85,185 @@ async function startServer() {
     }
     next();
   });
+  const httpServer = createServer(app);
+  const io = new Server(httpServer, {
+    cors: {
+      origin: "*",
+      methods: ["GET", "POST"]
+    }
+  });
+
+  const PORT = 3000;
+  const storiesUploadDir = path.join(process.cwd(), 'uploads', 'stories');
+  if (!fs.existsSync(storiesUploadDir)) {
+    fs.mkdirSync(storiesUploadDir, { recursive: true });
+  }
+  const storyUploadStorage = multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, storiesUploadDir),
+    filename: (_req, file, cb) => {
+      const ext =
+        path.extname(file.originalname) ||
+        (String(file.mimetype || '').startsWith('video/') ? '.mp4' : '.jpg');
+      cb(null, `${uuidv4()}${ext}`);
+    },
+  });
+  const uploadStoryFile = multer({
+    storage: storyUploadStorage,
+    limits: { fileSize: 80 * 1024 * 1024 },
+  });
+
+  /** Stories FK requires user_id to exist in local SQLite `users` (Supabase users may not be synced yet). */
+  const ensureLocalUserForStory = (userId: string, username: string, avatar: string) => {
+    if (!userId) return;
+    try {
+      db.prepare(`INSERT OR IGNORE INTO users (id, coins) VALUES (?, 1000)`).run(userId);
+      db.prepare(
+        `UPDATE users SET username = COALESCE(?, username), avatar = COALESCE(?, avatar) WHERE id = ?`
+      ).run(username || null, avatar || null, userId);
+    } catch (e) {
+      console.error('ensureLocalUserForStory:', e);
+      logToFile(`SERVER: ensureLocalUserForStory: ${e}`);
+    }
+  };
+
+  const logFile = path.join(process.cwd(), 'server.log');
+  const logToFile = (msg: string) => {
+    fs.appendFileSync(logFile, `${msg} - ${new Date().toISOString()}\n`);
+  };
+
+  console.log(`SERVER: NODE_ENV is ${process.env.NODE_ENV}`);
+  logToFile(`SERVER: NODE_ENV is ${process.env.NODE_ENV}`);
+
+  // POST /api/stories (multipart) MUST be registered BEFORE express.json / urlencoded
+  // so multer receives the raw multipart stream.
+  app.post('/api/stories', (req, res, next) => {
+    const ct = String(req.headers['content-type'] || '').toLowerCase();
+    console.log('[trace:story-upload] L1 POST /api/stories hit', {
+      contentType: req.headers['content-type'],
+      isMultipart: ct.includes('multipart/form-data'),
+    });
+    if (!ct.includes('multipart/form-data')) {
+      console.log('[trace:story-upload] L1 → next() (not multipart, JSON handler will run after body parsers)');
+      return next();
+    }
+    if (!fs.existsSync(storiesUploadDir)) {
+      fs.mkdirSync(storiesUploadDir, { recursive: true });
+    }
+    console.log('[trace:story-upload] L1 running multer single(file)');
+    uploadStoryFile.single('file')(req, res, async (err) => {
+      if (err) {
+        console.log('[trace:story-upload] L1 multer err → 400 Upload error');
+        console.error('MULTER ERROR:', err);
+        return res.status(400).json({ ok: false, error: 'Upload error' });
+      }
+      console.log('FINAL CHECK:');
+      console.log('REQ.FILE:', req.file);
+      console.log('REQ.BODY:', req.body);
+      const userId = req.body?.userId as string | undefined;
+      const username = (req.body?.username as string) || '';
+      const avatar = (req.body?.avatar as string) || '';
+      if (!req.file || !userId || !username) {
+        console.log('[trace:story-upload] L1 validation fail → 400 Missing required fields', {
+          hasFile: !!req.file,
+          hasUserId: !!userId,
+          hasUsername: !!username,
+        });
+        return res.status(400).json({ ok: false, error: 'Missing required fields' });
+      }
+      console.log('[trace:story-upload] L1 validation OK → DB insert');
+      try {
+        ensureLocalUserForStory(userId, username, avatar);
+        const mediaType = String(req.file.mimetype || '').startsWith('video') ? 'video' : 'image';
+        const mediaUrl = `/uploads/stories/${req.file.filename}`;
+        const id = uuidv4();
+        const createdAt = new Date().toISOString();
+        const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+        db.prepare(`
+          INSERT INTO stories (id, user_id, username, avatar, image_url, media_url, media_type, created_at, expires_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(id, userId, username, avatar, mediaUrl, mediaUrl, mediaType, createdAt, expiresAt);
+        try {
+          await supabase.from('stories').upsert({
+            id,
+            user_id: userId,
+            username,
+            avatar,
+            image_url: mediaUrl,
+            media_url: mediaUrl,
+            media_type: mediaType,
+            created_at: createdAt,
+            expires_at: expiresAt,
+          });
+        } catch (e) {
+          logToFile(`SERVER: Supabase story sync error: ${e}`);
+        }
+        return res.json({
+          ok: true,
+          id,
+          user_id: userId,
+          media_url: mediaUrl,
+          media_type: mediaType,
+          created_at: createdAt,
+        });
+      } catch (e) {
+        console.error('UPLOAD ERROR:', e);
+        logToFile(`SERVER: Create story error: ${e}`);
+        return res.status(500).json({ ok: false, error: 'Failed to create story' });
+      }
+    });
+  });
+
+  // JSON/urlencoded parsers — must be registered before any route that reads req.body (e.g. POST /api/story-replies).
+  app.use(express.json({ limit: '10mb' }));
+  app.use(express.urlencoded({ limit: '10mb', extended: true }));
+
+  // JSON body story (e.g. StoryEditor) — runs after body parsers via next() from multipart gate above
+  app.post('/api/stories', async (req, res) => {
+    console.log('[trace:story-upload] L2 POST /api/stories (JSON path)', {
+      contentType: req.headers['content-type'],
+      bodyKeys: req.body && typeof req.body === 'object' ? Object.keys(req.body) : [],
+    });
+    try {
+      const { userId: jsonUserId, username: jsonUsername, avatar: jsonAvatar, imageUrl } = req.body;
+      if (!jsonUserId || !imageUrl) {
+        console.log('[trace:story-upload] L2 validation fail → 400 (need userId + imageUrl)', {
+          hasJsonUserId: !!jsonUserId,
+          hasImageUrl: !!imageUrl,
+        });
+        return res.status(400).json({ ok: false, error: 'Missing required fields' });
+      }
+      console.log('[trace:story-upload] L2 validation OK → DB insert (JSON story)');
+      ensureLocalUserForStory(jsonUserId, jsonUsername, jsonAvatar);
+      logToFile(`SERVER: Creating story for ${jsonUsername}, image length: ${String(imageUrl).length}`);
+      const id = uuidv4();
+      const createdAt = new Date().toISOString();
+      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      db.prepare(`
+        INSERT INTO stories (id, user_id, username, avatar, image_url, media_url, media_type, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(id, jsonUserId, jsonUsername, jsonAvatar, imageUrl, null, 'image', createdAt, expiresAt);
+      try {
+        await supabase.from('stories').upsert({
+          id,
+          user_id: jsonUserId,
+          username: jsonUsername,
+          avatar: jsonAvatar,
+          image_url: imageUrl,
+          created_at: createdAt,
+          expires_at: expiresAt,
+        });
+      } catch (e) {
+        logToFile(`SERVER: Supabase story sync error: ${e}`);
+      }
+      res.json({ ok: true, id });
+    } catch (e) {
+      console.error('UPLOAD ERROR:', e);
+      logToFile(`SERVER: Create story error: ${e}`);
+      return res.status(500).json({ ok: false, error: 'Failed to create story' });
+    }
+  });
+
+  app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 
   // Request logging middleware
   app.use((req, res, next) => {
@@ -214,19 +374,210 @@ async function startServer() {
     }
   });
 
-  app.get("/api/users/search", (req, res) => {
-    const { q } = req.query;
-    logToFile(`SERVER: Search request for "${q}"`);
-    if (!q) return res.json([]);
-    
+  // Basic users listing/search endpoint (kept for compatibility)
+  app.get("/api/users", async (req, res) => {
+    const qRaw = req.query.q;
+    const qStr: string =
+      typeof qRaw === 'string'
+        ? qRaw
+        : Array.isArray(qRaw)
+          ? (typeof qRaw[0] === 'string' ? qRaw[0] : '')
+          : '';
+    const normalized = qStr ? qStr.trim().replace(/^@/, '') : '';
+
+    try {
+      if (supabase) {
+        let query = supabase
+          .from('profiles')
+          .select('id, username, full_name, display_name, avatar_url, followers_count, following_count')
+          .limit(normalized ? 20 : 50);
+
+        if (normalized) {
+          query = query.or(`username.ilike.%${normalized}%,full_name.ilike.%${normalized}%,display_name.ilike.%${normalized}%`);
+        }
+
+        const { data, error } = await query.order('username', { ascending: true });
+        if (!error && data) {
+          const mapped = data.map((p: any) => ({
+            id: p.id,
+            username: p.username || 'User',
+            full_name: p.full_name || p.display_name || p.username || 'User',
+            avatar: p.avatar_url || null,
+            followers_count: p.followers_count || 0,
+            following_count: p.following_count || 0
+          }));
+          return res.json(mapped);
+        }
+      }
+
+      if (!normalized) {
+        const users = db.prepare(`
+          SELECT id, username, full_name, avatar, followers_count, following_count
+          FROM users
+          ORDER BY username ASC
+          LIMIT 50
+        `).all();
+        return res.json(users);
+      }
+
+      const users = db.prepare(`
+        SELECT id, username, full_name, avatar, followers_count, following_count
+        FROM users
+        WHERE username LIKE ? OR full_name LIKE ?
+        LIMIT 20
+      `).all(`%${normalized}%`, `%${normalized}%`);
+      return res.json(users);
+    } catch (e) {
+      logToFile(`SERVER: /api/users error: ${e}`);
+      return res.status(500).json({ error: 'Failed to fetch users' });
+    }
+  });
+
+  app.get("/api/users/search", async (req, res) => {
+    const qRaw = req.query.q;
+    const qStr: string =
+      typeof qRaw === 'string'
+        ? qRaw
+        : Array.isArray(qRaw)
+          ? (typeof qRaw[0] === 'string' ? qRaw[0] : '')
+          : '';
+    const normalized = qStr ? qStr.trim().replace(/^@/, '') : '';
+
+    logToFile(`SERVER: Search request for "${qStr}" (normalized: "${normalized}")`);
+    if (!normalized) return res.json([]);
+
+    if (supabase) {
+      try {
+        const { data, error } = await supabase
+          .from('profiles')
+          .select('id, username, full_name, display_name, avatar_url, bio, coins, followers_count, following_count')
+          .or(`username.ilike.%${normalized}%,full_name.ilike.%${normalized}%,display_name.ilike.%${normalized}%`)
+          .limit(20);
+
+        if (!error && data) {
+          const mapped = data.map((p: any) => ({
+            id: p.id,
+            username: p.username || 'User',
+            full_name: p.full_name || p.display_name || p.username || 'User',
+            avatar: p.avatar_url || null,
+            followers_count: p.followers_count || 0,
+            following_count: p.following_count || 0
+          }));
+
+          const stmt = db.prepare(`
+            INSERT INTO users (id, username, avatar, full_name, bio, coins, followers_count, following_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              username = excluded.username,
+              avatar = excluded.avatar,
+              full_name = excluded.full_name,
+              bio = COALESCE(excluded.bio, users.bio),
+              coins = excluded.coins,
+              followers_count = excluded.followers_count,
+              following_count = excluded.following_count
+          `);
+          const transaction = db.transaction((items) => {
+            for (const p of items) {
+              stmt.run(
+                p.id,
+                p.username || 'User',
+                p.avatar_url || null,
+                p.full_name || p.display_name || p.username || 'User',
+                p.bio || null,
+                p.coins || 0,
+                p.followers_count || 0,
+                p.following_count || 0
+              );
+            }
+          });
+          transaction(data || []);
+
+          logToFile(`SERVER: Search results count (Supabase): ${mapped.length}`);
+          return res.json(mapped);
+        }
+      } catch (e) {
+        logToFile(`SERVER: Supabase search exception: ${e}`);
+      }
+    }
+
     const users = db.prepare(`
       SELECT id, username, full_name, avatar, followers_count, following_count 
       FROM users 
       WHERE username LIKE ? OR full_name LIKE ?
       LIMIT 20
-    `).all(`%${q}%`, `%${q}%`);
-    logToFile(`SERVER: Search results count: ${users.length}`);
-    res.json(users);
+    `).all(`%${normalized}%`, `%${normalized}%`);
+
+    logToFile(`SERVER: Search results count (SQLite): ${users.length}`);
+    return res.json(users);
+  });
+
+  // Feed posts with profile usernames/avatars
+  app.get("/api/posts", async (req, res) => {
+    try {
+      if (!supabase) return res.json([]);
+      const categoryRaw = req.query.category;
+      const category = typeof categoryRaw === 'string' ? categoryRaw.trim() : '';
+
+      let query = supabase
+        .from('posts')
+        .select(`
+          *,
+          profiles (
+            id,
+            username,
+            avatar_url
+          )
+        `)
+        .order('created_at', { ascending: false });
+      if (category) query = query.eq('category', category);
+
+      const { data: posts, error: postsError } = await query;
+      if (postsError) {
+        console.error('[API /api/posts] posts query failed:', postsError);
+        return res.status(500).json({ error: postsError.message });
+      }
+      console.log('[API /api/posts] total posts fetched:', Array.isArray(posts) ? posts.length : 0);
+      if (!posts || posts.length === 0) {
+        console.log('[API /api/posts] posts query returned empty result');
+        return res.json([]);
+      }
+
+      const merged = posts.map((post: any) => {
+        const profile = Array.isArray(post.profiles) ? (post.profiles[0] || null) : (post.profiles || null);
+        return {
+          ...post,
+          profiles: profile,
+          username: profile?.username || null,
+          avatar_url: profile?.avatar_url || null
+        };
+      });
+      return res.json(merged);
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || 'Failed to fetch posts' });
+    }
+  });
+
+  // Suggested people sourced from profiles table
+  app.get("/api/users/suggestions", async (req, res) => {
+    try {
+      if (!supabase) return res.json([]);
+      const userIdRaw = req.query.userId;
+      const userId = typeof userIdRaw === 'string' ? userIdRaw : '';
+      const limitRaw = req.query.limit;
+      const limit = typeof limitRaw === 'string' ? Number(limitRaw) || 3 : 3;
+
+      let query = supabase
+        .from('profiles')
+        .select('id, username, full_name, avatar_url')
+        .limit(limit);
+      if (userId) query = query.neq('id', userId);
+
+      const { data, error } = await query;
+      if (error) return res.status(500).json({ error: error.message });
+      return res.json(data || []);
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || 'Failed to fetch suggestions' });
+    }
   });
 
   app.post("/api/users/follow", async (req, res) => {
@@ -235,6 +586,11 @@ async function startServer() {
     if (!followerId || !followingId) return res.status(400).json({ error: 'Missing IDs' });
 
     try {
+      // Ensure both users exist in the local SQLite cache.
+      // Without this, the `follows` INSERT fails due to foreign key constraints.
+      db.prepare('INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)').run(followerId, followerId);
+      db.prepare('INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)').run(followingId, followingId);
+
       const transaction = db.transaction(() => {
         const result = db.prepare('INSERT OR IGNORE INTO follows (follower_id, following_id) VALUES (?, ?)').run(followerId, followingId);
         logToFile(`SERVER: Follow insert result changes: ${result.changes}`);
@@ -301,6 +657,57 @@ async function startServer() {
     } catch (err) {
       logToFile(`SERVER: Unfollow error: ${err}`);
       res.status(500).json({ error: 'Failed to unfollow' });
+    }
+  });
+
+  // Friends page: lists from SQLite (matches local follower/following counts when Supabase follows is empty/out of sync)
+  app.get("/api/users/:id/following-list", (req, res) => {
+    const id = req.params.id;
+    try {
+      const rows = db.prepare(`
+        SELECT u.id, u.username, u.avatar, u.full_name, u.followers_count
+        FROM follows f
+        JOIN users u ON u.id = f.following_id
+        WHERE f.follower_id = ?
+      `).all(id) as { id: string; username: string; avatar: string | null; full_name: string | null; followers_count: number }[];
+      console.log(`[SERVER] following-list user=${id} count=${rows.length}`);
+      const mapped = rows.map((r) => ({
+        id: r.id,
+        username: r.username,
+        avatar_url: r.avatar,
+        full_name: r.full_name,
+        display_name: r.full_name,
+        followers_count: r.followers_count ?? 0,
+      }));
+      res.json(mapped);
+    } catch (err) {
+      logToFile(`SERVER: following-list error: ${err}`);
+      res.status(500).json({ error: "Failed to load following list" });
+    }
+  });
+
+  app.get("/api/users/:id/followers-list", (req, res) => {
+    const id = req.params.id;
+    try {
+      const rows = db.prepare(`
+        SELECT u.id, u.username, u.avatar, u.full_name, u.followers_count
+        FROM follows f
+        JOIN users u ON u.id = f.follower_id
+        WHERE f.following_id = ?
+      `).all(id) as { id: string; username: string; avatar: string | null; full_name: string | null; followers_count: number }[];
+      console.log(`[SERVER] followers-list user=${id} count=${rows.length}`);
+      const mapped = rows.map((r) => ({
+        id: r.id,
+        username: r.username,
+        avatar_url: r.avatar,
+        full_name: r.full_name,
+        display_name: r.full_name,
+        followers_count: r.followers_count ?? 0,
+      }));
+      res.json(mapped);
+    } catch (err) {
+      logToFile(`SERVER: followers-list error: ${err}`);
+      res.status(500).json({ error: "Failed to load followers list" });
     }
   });
 
@@ -684,19 +1091,54 @@ async function startServer() {
     const { username, userId, avatar } = req.body;
     const groupId = req.params.id;
     
-    let user = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
+    const normalizedUsername = typeof username === 'string' ? username.trim().replace(/^@/, '') : '';
+
+    let user = normalizedUsername
+      ? db.prepare('SELECT id FROM users WHERE username = ?').get(normalizedUsername)
+      : null;
     
     if (!user && userId) {
       try {
         db.prepare('INSERT OR IGNORE INTO users (id, username, avatar) VALUES (?, ?, ?)')
-          .run(userId, username, avatar);
+          .run(userId, normalizedUsername, avatar);
         user = { id: userId };
       } catch (e) {
         console.error('Error syncing user during invite:', e);
       }
     }
+
+    // If the invited user hasn't logged in on this device yet, they might not exist in the local SQLite cache.
+    // In that case, fetch them from Supabase by username and sync them locally.
+    if (!user && normalizedUsername && supabase) {
+      try {
+        const { data, error } = await supabase
+          .from('profiles')
+          .select('id, username, avatar_url, full_name, display_name, bio')
+          .ilike('username', normalizedUsername)
+          .maybeSingle();
+
+        if (error) {
+          console.error('Supabase profile lookup error (invite):', error.code, error.message);
+        } else if (data?.id) {
+          const fullName = data.full_name || data.display_name || data.username;
+          db.prepare(`
+            INSERT INTO users (id, username, avatar, full_name, bio)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              username = excluded.username,
+              avatar = excluded.avatar,
+              full_name = excluded.full_name,
+              bio = COALESCE(excluded.bio, users.bio)
+          `).run(data.id, data.username, data.avatar_url, fullName, data.bio);
+
+          user = { id: data.id };
+        }
+      } catch (e) {
+        console.error('Supabase profile lookup exception (invite):', e);
+      }
+    }
     
-    if (!user) return res.status(404).json({ error: 'User not found. Please ensure the user has logged in at least once.' });
+    if (!user) return res.status(404).json({ error: 'User not found. Please check the username.' });
     
     try {
       db.prepare('INSERT OR IGNORE INTO group_members (group_id, user_id, role) VALUES (?, ?, ?)')
@@ -707,9 +1149,9 @@ async function startServer() {
       try {
         await supabase.from('profiles').upsert({
           id: user.id,
-          username: username,
+          username: normalizedUsername,
           avatar_url: avatar,
-          display_name: username
+          display_name: normalizedUsername
         });
       } catch (e) {
         // Table might not exist or other error
@@ -1310,14 +1752,66 @@ async function startServer() {
   });
 
   // Reels Endpoints
-  app.get("/api/reels", (req, res) => {
+  app.get("/api/reels", async (req, res) => {
+    const toReelsPublicUrl = (value: string | null | undefined) => {
+      if (!value) return value;
+      if (value.startsWith('http://') || value.startsWith('https://')) return value;
+      const storagePath = value.startsWith('reels/') ? value.slice('reels/'.length) : value;
+      if (!supabase) return value;
+      const { data } = supabase.storage.from('reels').getPublicUrl(storagePath);
+      return data?.publicUrl || value;
+    };
+
     const reels = db.prepare(`
-      SELECT r.*, u.username, u.avatar
+      SELECT 
+        r.*,
+        u.username,
+        u.avatar,
+        COALESCE(l.likes_count, 0) as likes,
+        COALESCE(c.comments_count, 0) as comments,
+        COALESCE(v.views_count, 0) as views
       FROM reels r
       JOIN users u ON r.user_id = u.id
+      LEFT JOIN (
+        SELECT reel_id, COUNT(*) as likes_count
+        FROM reel_likes
+        GROUP BY reel_id
+      ) l ON l.reel_id = r.id
+      LEFT JOIN (
+        SELECT reel_id, COUNT(*) as comments_count
+        FROM reel_comments
+        GROUP BY reel_id
+      ) c ON c.reel_id = r.id
+      LEFT JOIN (
+        SELECT reel_id, COUNT(*) as views_count
+        FROM reel_views
+        GROUP BY reel_id
+      ) v ON v.reel_id = r.id
       ORDER BY r.created_at DESC
     `).all();
-    res.json(reels);
+    let profileMap: Record<string, { username?: string | null; avatar_url?: string | null }> = {};
+    if (supabase && reels.length > 0) {
+      const userIds = Array.from(new Set(reels.map((r: any) => r.user_id).filter(Boolean)));
+      if (userIds.length > 0) {
+        const { data } = await supabase
+          .from('profiles')
+          .select('id, username, avatar_url')
+          .in('id', userIds);
+        profileMap = (data || []).reduce((acc: any, p: any) => {
+          acc[p.id] = p;
+          return acc;
+        }, {});
+      }
+    }
+
+    const normalized = reels.map((r: any) => ({
+      ...r,
+      username: profileMap[r.user_id]?.username || r.username || 'User',
+      avatar: profileMap[r.user_id]?.avatar_url || r.avatar || null,
+      url: toReelsPublicUrl(r.url),
+      thumbnail: toReelsPublicUrl(r.thumbnail)
+    }));
+    res.json(normalized);
   });
 
   // Stories API
@@ -1359,57 +1853,407 @@ async function startServer() {
     }
   });
 
-  app.post("/api/stories", async (req, res) => {
-    const { userId, username, avatar, imageUrl } = req.body;
-    if (!userId || !imageUrl) return res.status(400).json({ error: 'Missing required fields' });
+  app.post('/api/test-upload', (req, res) => {
+    console.log('TEST ROUTE HIT');
+    res.json({ ok: true });
+  });
 
-    logToFile(`SERVER: Creating story for ${username}, image length: ${imageUrl.length}`);
-    const id = uuidv4();
-    const createdAt = new Date().toISOString();
-    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-
+  app.post("/api/story-views", async (req, res) => {
     try {
-      db.prepare(`
-        INSERT INTO stories (id, user_id, username, avatar, image_url, created_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(id, userId, username, avatar, imageUrl, createdAt, expiresAt);
-      
-      // Sync to Supabase
-      try {
-        await supabase.from('stories').upsert({
-          id,
-          user_id: userId,
-          username,
-          avatar,
-          image_url: imageUrl,
-          created_at: createdAt,
-          expires_at: expiresAt
-        });
-      } catch (e) {
-        logToFile(`SERVER: Supabase story sync error: ${e}`);
+      const { story_id } = req.body || {};
+      if (!story_id || typeof story_id !== "string") {
+        return res.status(400).json({ error: "Missing story_id" });
       }
 
+      const authHeader = req.headers.authorization;
+      const token =
+        typeof authHeader === "string" && authHeader.startsWith("Bearer ")
+          ? authHeader.slice(7)
+          : null;
+
+      let viewerId: string | null = null;
+      if (supabase && token) {
+        const { data, error } = await supabase.auth.getUser(token);
+        if (!error && data?.user?.id) {
+          viewerId = data.user.id;
+        }
+      }
+
+      if (!viewerId) {
+        return res.status(401).json({ error: "Unauthorized" });
+      }
+
+      const id = uuidv4();
+      const createdAt = new Date().toISOString();
+      const ins = db.prepare(`
+        INSERT OR IGNORE INTO story_views (id, story_id, viewer_id, created_at)
+        VALUES (?, ?, ?, ?)
+      `);
+      const result = ins.run(id, story_id, viewerId, createdAt);
+      if (result.changes === 0) {
+        return res.json({ ok: true, duplicate: true });
+      }
+      return res.json({ ok: true, id });
+    } catch (err) {
+      logToFile(`SERVER: POST /api/story-views error: ${err}`);
+      return res.status(500).json({ error: "Failed to record view" });
+    }
+  });
+
+  app.get("/api/stories/:storyId/views", (req, res) => {
+    try {
+      const { storyId } = req.params;
+      if (!storyId) return res.status(400).json({ error: "Missing story id" });
+
+      const rows = db
+        .prepare(
+          `
+        SELECT v.viewer_id AS user_id, u.username, u.avatar AS avatar_url
+        FROM story_views v
+        LEFT JOIN users u ON u.id = v.viewer_id
+        WHERE v.story_id = ?
+        ORDER BY v.created_at ASC
+      `
+        )
+        .all(storyId) as { user_id: string; username: string | null; avatar_url: string | null }[];
+
+      res.json(
+        rows.map((r) => ({
+          user_id: r.user_id,
+          username: r.username ?? null,
+          avatar_url: r.avatar_url ?? null,
+        }))
+      );
+    } catch (err) {
+      logToFile(`SERVER: GET /api/stories/:id/views error: ${err}`);
+      res.status(500).json({ error: "Failed to load views" });
+    }
+  });
+
+  app.post("/api/story-replies", (req, res) => {
+    try {
+      let bodyLog = "(unavailable)";
+      try {
+        bodyLog =
+          req.body != null && typeof req.body === "object"
+            ? JSON.stringify(req.body)
+            : String(req.body);
+      } catch {
+        bodyLog = "(could not stringify req.body)";
+      }
+      logToFile(
+        `SERVER: POST /api/story-replies content-type=${String(req.headers["content-type"] || "")} body=${bodyLog}`
+      );
+
+      if (req.body == null || typeof req.body !== "object") {
+        return res.status(400).json({ error: "Request body must be a JSON object" });
+      }
+      if (Object.keys(req.body).length === 0) {
+        return res.status(400).json({ error: "Empty JSON body — send storyId, senderId, receiverId, message" });
+      }
+
+      const { storyId, senderId, receiverId, message } = req.body as Record<string, unknown>;
+      const text = typeof message === "string" ? message.trim() : "";
+      if (
+        !storyId ||
+        typeof storyId !== "string" ||
+        !senderId ||
+        typeof senderId !== "string" ||
+        !receiverId ||
+        typeof receiverId !== "string" ||
+        !text
+      ) {
+        return res
+          .status(400)
+          .json({ error: "Missing or invalid storyId, senderId, receiverId, or message" });
+      }
+
+      const story = db
+        .prepare("SELECT user_id FROM stories WHERE id = ?")
+        .get(storyId) as { user_id: string | null } | undefined;
+      if (!story) {
+        return res.status(404).json({ error: "Story not found" });
+      }
+      const ownerId = story.user_id != null ? String(story.user_id).trim() : "";
+      if (!ownerId || ownerId !== String(receiverId).trim()) {
+        return res.status(400).json({ error: "receiverId does not match story owner" });
+      }
+
+      db.prepare("INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)").run(senderId, senderId);
+      const senderRow = db
+        .prepare("SELECT username FROM users WHERE id = ?")
+        .get(senderId) as { username: string | null } | undefined;
+      const fromUsername = senderRow?.username ?? null;
+
+      const id = uuidv4();
+      const createdAt = new Date().toISOString();
+      db.prepare(`
+        INSERT INTO story_replies (id, story_id, from_user_id, from_username, body, receiver_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(id, storyId, senderId, fromUsername, text, receiverId, createdAt);
+
+      const notifId = uuidv4();
+      db.prepare(`
+        INSERT INTO notifications (id, user_id, type, actor_id, story_id, message, read, created_at)
+        VALUES (?, ?, 'story_reply', ?, ?, ?, 0, ?)
+      `).run(notifId, receiverId, senderId, storyId, text.slice(0, 500), createdAt);
+
+      logToFile(
+        `SERVER: Story reply (API) id=${id} story=${storyId} sender=${senderId} receiver=${receiverId}`
+      );
+      return res.json({ success: true, id });
+    } catch (err) {
+      logToFile(`SERVER: POST /api/story-replies unexpected error: ${err}`);
+      if (!res.headersSent) {
+        return res.status(500).json({ error: "Failed to save story reply" });
+      }
+    }
+  });
+
+  app.post("/api/stories/:storyId/reply", (req, res) => {
+    const { storyId } = req.params;
+    const { message, fromUserId, fromUsername } = req.body || {};
+    const text = typeof message === 'string' ? message.trim() : '';
+    if (!storyId || !text) {
+      return res.status(400).json({ error: 'Missing story id or message' });
+    }
+    const id = uuidv4();
+    const createdAt = new Date().toISOString();
+    try {
+      db.prepare(`
+        INSERT INTO story_replies (id, story_id, from_user_id, from_username, body, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(id, storyId, fromUserId || null, fromUsername || null, text, createdAt);
+      logToFile(
+        `SERVER: Story reply id=${id} story=${storyId} from=${fromUserId || 'anon'} (${fromUsername || ''})`
+      );
       res.json({ success: true, id });
     } catch (err) {
-      logToFile(`SERVER: Create story error: ${err}`);
-      res.status(500).json({ error: 'Failed to create story' });
+      logToFile(`SERVER: Story reply error: ${err}`);
+      res.status(500).json({ error: 'Failed to save reply' });
     }
   });
 
   app.post("/api/reels", (req, res) => {
-    const { userId, url, thumbnail, caption, soundTitle, soundArtist } = req.body;
+    const { userId, url, thumbnail, caption, soundTitle, soundArtist, username, avatar } = req.body;
     const id = uuidv4();
     
     try {
+      const toReelsPublicUrl = (value: string | null | undefined) => {
+        if (!value) return value;
+        if (value.startsWith('http://') || value.startsWith('https://')) return value;
+        const storagePath = value.startsWith('reels/') ? value.slice('reels/'.length) : value;
+        if (!supabase) return value;
+        const { data } = supabase.storage.from('reels').getPublicUrl(storagePath);
+        return data?.publicUrl || value;
+      };
+
+      const finalUrl = toReelsPublicUrl(url);
+      const finalThumbnail = toReelsPublicUrl(thumbnail || url);
+
+      // Keep FK-safe: ensure uploader exists in local users cache.
+      db.prepare('INSERT OR IGNORE INTO users (id, username, avatar) VALUES (?, ?, ?)')
+        .run(userId, username || userId, avatar || null);
+
       db.prepare(`
         INSERT INTO reels (id, user_id, url, thumbnail, caption, sound_title, sound_artist)
         VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(id, userId, url, thumbnail || url, caption || '', soundTitle || null, soundArtist || null);
+      `).run(id, userId, finalUrl, finalThumbnail, caption || '', soundTitle || null, soundArtist || null);
       
       res.json({ success: true, id });
     } catch (err) {
       console.error('Reel upload error:', err);
       res.status(500).json({ error: 'Failed to save reel' });
+    }
+  });
+
+  app.post("/api/reels/:id/like", (req, res) => {
+    const reelId = req.params.id;
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'Missing userId' });
+
+    try {
+      db.prepare('INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)').run(userId, userId);
+      const existing = db.prepare('SELECT 1 FROM reel_likes WHERE reel_id = ? AND user_id = ?').get(reelId, userId);
+      if (existing) {
+        db.prepare('DELETE FROM reel_likes WHERE reel_id = ? AND user_id = ?').run(reelId, userId);
+      } else {
+        db.prepare('INSERT INTO reel_likes (reel_id, user_id) VALUES (?, ?)').run(reelId, userId);
+      }
+
+      const row = db.prepare('SELECT COUNT(*) as count FROM reel_likes WHERE reel_id = ?').get(reelId) as any;
+      res.json({ success: true, liked: !existing, likes: row?.count || 0 });
+    } catch (err) {
+      console.error('Reel like error:', err);
+      res.status(500).json({ error: 'Failed to toggle like' });
+    }
+  });
+
+  app.post("/api/reels/:id/view", (req, res) => {
+    const reelId = req.params.id;
+    const { userId } = req.body;
+
+    try {
+      const reelExists = !!db.prepare('SELECT 1 FROM reels WHERE id = ?').get(reelId);
+      if (!reelExists) {
+        return res.status(404).json({ error: 'Reel not found' });
+      }
+
+      if (userId) {
+        const userExists = !!db.prepare('SELECT 1 FROM users WHERE id = ?').get(userId);
+        if (!userExists) {
+          return res.status(404).json({ error: 'User not found' });
+        }
+        db.prepare('INSERT OR IGNORE INTO reel_views (reel_id, user_id) VALUES (?, ?)').run(reelId, userId);
+      }
+      const row = db.prepare('SELECT COUNT(*) as count FROM reel_views WHERE reel_id = ?').get(reelId) as any;
+      res.json({ success: true, views: row?.count || 0 });
+    } catch (err) {
+      console.error('Reel view error:', err);
+      res.status(500).json({ error: 'Failed to record view' });
+    }
+  });
+
+  app.get("/api/reels/:id/comments", async (req, res) => {
+    const reelId = req.params.id;
+    try {
+      const reelExists = !!db.prepare('SELECT 1 FROM reels WHERE id = ?').get(reelId);
+      if (!reelExists) {
+        return res.status(404).json({ error: 'Reel not found' });
+      }
+
+      const comments = db.prepare(`
+        SELECT rc.id, rc.reel_id, rc.user_id, rc.text, rc.created_at, u.username, u.avatar
+        FROM reel_comments rc
+        LEFT JOIN users u ON u.id = rc.user_id
+        WHERE rc.reel_id = ?
+        ORDER BY rc.created_at DESC
+      `).all(reelId);
+      let profileMap: Record<string, { username?: string | null; avatar_url?: string | null }> = {};
+      if (supabase && comments.length > 0) {
+        const userIds = Array.from(new Set(comments.map((c: any) => c.user_id).filter(Boolean)));
+        if (userIds.length > 0) {
+          const { data } = await supabase
+            .from('profiles')
+            .select('id, username, avatar_url')
+            .in('id', userIds);
+          profileMap = (data || []).reduce((acc: any, p: any) => {
+            acc[p.id] = p;
+            return acc;
+          }, {});
+        }
+      }
+      res.json(comments.map((c: any) => ({
+        ...c,
+        username: profileMap[c.user_id]?.username || c.username || 'User',
+        avatar: profileMap[c.user_id]?.avatar_url || c.avatar || null
+      })));
+    } catch (err) {
+      console.error('Reel comments fetch error:', err);
+      res.status(500).json({ error: 'Failed to fetch comments' });
+    }
+  });
+
+  app.post("/api/reels/:id/comments", async (req, res) => {
+    const reelId = req.params.id;
+    const userId = req.body.userId || req.body.user_id;
+    const content = req.body.content || req.body.text;
+    const { username, avatar } = req.body;
+    const bodyReelId = req.body.reel_id;
+    if (!userId || !content?.trim()) return res.status(400).json({ error: 'Missing user_id or content' });
+    if (bodyReelId && bodyReelId !== reelId) return res.status(400).json({ error: 'reel_id mismatch' });
+
+    const id = uuidv4();
+    try {
+      const reelExists = !!db.prepare('SELECT 1 FROM reels WHERE id = ?').get(reelId);
+      if (!reelExists) {
+        return res.status(404).json({ error: 'Reel not found' });
+      }
+
+      const userExists = !!db.prepare('SELECT 1 FROM users WHERE id = ?').get(userId);
+      if (!userExists) {
+        let profileUsername: string | null = null;
+        let profileAvatar: string | null = null;
+        if (supabase) {
+          const { data } = await supabase
+            .from('profiles')
+            .select('id, username, avatar_url')
+            .eq('id', userId)
+            .maybeSingle();
+          profileUsername = data?.username || null;
+          profileAvatar = data?.avatar_url || null;
+        }
+        db.prepare('INSERT OR IGNORE INTO users (id, username, avatar) VALUES (?, ?, ?)')
+          .run(userId, profileUsername || username || 'User', profileAvatar || avatar || null);
+      }
+
+      db.prepare('UPDATE users SET username = COALESCE(?, username), avatar = COALESCE(?, avatar) WHERE id = ?')
+        .run(username || null, avatar || null, userId);
+
+      db.prepare('INSERT INTO reel_comments (id, reel_id, user_id, text) VALUES (?, ?, ?, ?)')
+        .run(id, reelId, userId, content.trim());
+
+      const created = db.prepare(`
+        SELECT rc.id, rc.reel_id, rc.user_id, rc.text, rc.created_at, u.username, u.avatar
+        FROM reel_comments rc
+        LEFT JOIN users u ON u.id = rc.user_id
+        WHERE rc.id = ?
+      `).get(id);
+
+      let createdWithProfile = created as any;
+      if (supabase && created?.user_id) {
+        const { data } = await supabase
+          .from('profiles')
+          .select('id, username, avatar_url')
+          .eq('id', created.user_id)
+          .maybeSingle();
+        if (data) {
+          createdWithProfile = {
+            ...created,
+            username: data.username || created.username || 'User',
+            avatar: data.avatar_url || created.avatar || null
+          };
+        }
+      }
+
+      const updatedCommentsRaw = db.prepare(`
+        SELECT rc.id, rc.reel_id, rc.user_id, rc.text, rc.created_at, u.username, u.avatar
+        FROM reel_comments rc
+        LEFT JOIN users u ON u.id = rc.user_id
+        WHERE rc.reel_id = ?
+        ORDER BY rc.created_at DESC
+      `).all(reelId);
+
+      let profileMap: Record<string, { username?: string | null; avatar_url?: string | null }> = {};
+      if (supabase && updatedCommentsRaw.length > 0) {
+        const userIds = Array.from(new Set(updatedCommentsRaw.map((c: any) => c.user_id).filter(Boolean)));
+        if (userIds.length > 0) {
+          const { data } = await supabase
+            .from('profiles')
+            .select('id, username, avatar_url')
+            .in('id', userIds);
+          profileMap = (data || []).reduce((acc: any, p: any) => {
+            acc[p.id] = p;
+            return acc;
+          }, {});
+        }
+      }
+
+      const updatedComments = updatedCommentsRaw.map((c: any) => ({
+        ...c,
+        username: profileMap[c.user_id]?.username || c.username || 'User',
+        avatar: profileMap[c.user_id]?.avatar_url || c.avatar || null
+      }));
+
+      res.json({
+        success: true,
+        comment: createdWithProfile,
+        comments: updatedComments.length,
+        commentsList: updatedComments
+      });
+    } catch (err) {
+      console.error('Reel comment create error:', err);
+      res.status(500).json({ error: 'Failed to save comment' });
     }
   });
 
@@ -1445,7 +2289,18 @@ async function startServer() {
     });
 
     socket.on("send_group_message", async (data) => {
-      const { groupId, userId, username, text, type, audioUrl, imageUrl } = data;
+      const groupId = data?.groupId ?? data?.group_id;
+      const userId = data?.userId ?? data?.user_id;
+      const username = data?.username;
+      const text = data?.text;
+      const type = data?.type;
+      const audioUrl = data?.audioUrl ?? data?.audio_url;
+      const imageUrl = data?.imageUrl ?? data?.image_url;
+
+      if (!groupId || !userId) {
+        console.warn('send_group_message missing groupId/userId:', data);
+        return;
+      }
       
       // Check membership
       const membership = db.prepare('SELECT * FROM group_members WHERE group_id = ? AND user_id = ?').get(groupId, userId);

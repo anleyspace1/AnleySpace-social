@@ -1,14 +1,14 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence, Reorder } from 'motion/react';
-import { 
-  Plus, 
-  Video, 
-  Image as ImageIcon, 
-  Smile, 
-  MoreHorizontal, 
-  Heart, 
-  MessageCircle, 
-  Share2, 
+import {
+  Plus,
+  Video,
+  Image as ImageIcon,
+  Smile,
+  MoreHorizontal,
+  Heart,
+  MessageCircle,
+  Share2,
   Bookmark,
   ChevronRight,
   TrendingUp,
@@ -29,14 +29,107 @@ import {
   ListTodo,
   GripVertical
 } from 'lucide-react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useNavigate, useSearchParams, useLocation } from 'react-router-dom';
 import { cn } from '../lib/utils';
+import { API_ORIGIN } from '../lib/apiOrigin';
+import { fetchActiveStories, filterActiveStories } from '../lib/activeStories';
 import { MOCK_USER } from '../constants';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import ShareModal from '../components/ShareModal';
 import StoryEditor from '../components/StoryEditor';
 import { ResponsiveImage } from '../components/ResponsiveImage';
+
+const resolveProfileUsername = (username?: string | null) => {
+  const value = (username || '').trim();
+  if (!value) return 'Unknown User';
+  return value;
+};
+
+/** Inline hashtags as clickable navigation (same route as TrendingSection). */
+function renderTextWithHashtags(
+  text: string,
+  navigate: (to: string) => void
+) {
+  const raw = String(text ?? '');
+  const parts = raw.split(/(#[^\s#]+)/g);
+  return parts.map((part, i) => {
+    if (part.startsWith('#') && part.length > 1) {
+      const tag = part.slice(1);
+      return (
+        <button
+          key={`h-${i}-${tag}`}
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            console.log('[PostItem] hashtag click', tag);
+            navigate(`/hashtag/${encodeURIComponent(tag)}`);
+          }}
+          className="inline p-0 m-0 border-0 bg-transparent cursor-pointer hover:underline font-inherit text-inherit align-baseline"
+        >
+          {part}
+        </button>
+      );
+    }
+    return <span key={`t-${i}`}>{part}</span>;
+  });
+}
+
+// Helper: Double tap detection and heart animation overlay
+function useDoubleTap(onDoubleTap: () => void, delay = 300) {
+  // Returns object: {onTouchStart, onClick, ...} for props spread
+  const lastTap = useRef<number | null>(null);
+
+  const handler = (e: React.MouseEvent | React.TouchEvent) => {
+    const now = Date.now();
+    if (lastTap.current && now - lastTap.current < delay) {
+      onDoubleTap();
+      lastTap.current = null;
+    } else {
+      lastTap.current = now;
+    }
+  };
+
+  return {
+    onClick: handler,
+    onTouchStart: handler,
+  };
+}
+
+function HeartOverlay({ show }: { show: boolean }) {
+  return (
+    <AnimatePresence>
+      {show && (
+        <motion.div
+          key="heart"
+          className="absolute inset-0 flex items-center justify-center pointer-events-none z-20"
+          initial={{ scale: 0.7, opacity: 0 }}
+          animate={{ scale: 1.4, opacity: 1 }}
+          exit={{ scale: 0.7, opacity: 0 }}
+          transition={{ duration: 0.5, type: 'spring' }}
+        >
+          <Heart size={88} className="fill-red-500/90 text-red-500" />
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
+
+// Helper: Fetch all users' stories info for avatar ring (same data as fetchActiveStories)
+async function fetchActiveStoriesMap(): Promise<Record<string, any[]>> {
+  try {
+    const flat = await fetchActiveStories();
+    return flat.reduce((acc: Record<string, any[]>, story: any) => {
+      const uid = story.user_id || story.username;
+      if (!uid) return acc;
+      if (!acc[uid]) acc[uid] = [];
+      acc[uid].push(story);
+      return acc;
+    }, {});
+  } catch (_err) {
+    return {};
+  }
+}
 
 export default function HomePage() {
   const navigate = useNavigate();
@@ -58,7 +151,7 @@ export default function HomePage() {
               {category}
             </span>
           </div>
-          <button 
+          <button
             onClick={() => navigate('/')}
             className="text-xs text-gray-400 hover:text-indigo-600 transition-colors font-bold"
           >
@@ -73,52 +166,245 @@ export default function HomePage() {
   );
 }
 
+// --------- Stories with non-expired, avatar ring, open story on avatar ----------
 function Stories() {
-  const [selectedStory, setSelectedStory] = useState<number | null>(null);
-  const [isStoryEditorOpen, setIsStoryEditorOpen] = useState(false);
-  const [storyImage, setStoryImage] = useState<string | null>(null);
+  const [seenUsers, setSeenUsers] = useState<string[]>([]);
+  const [storyUploading, setStoryUploading] = useState(false);
   const [realStories, setRealStories] = useState<any[]>([]);
+  const [avatarStoriesMap, setAvatarStoriesMap] = useState<Record<string, any[]>>({});
   const fileInputRef = React.useRef<HTMLInputElement>(null);
-  const { profile, user } = useAuth();
+  const seenHydratedRef = React.useRef(false);
+  const { user } = useAuth();
+  const location = useLocation();
 
   useEffect(() => {
+    try {
+      const saved = localStorage.getItem('seenUsers') || localStorage.getItem('seenStories');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) setSeenUsers([...new Set(parsed.map(String))]);
+      }
+    } catch {
+      /* ignore */
+    }
+    seenHydratedRef.current = true;
+  }, [location.pathname]);
+
+  useEffect(() => {
+    if (!seenHydratedRef.current) return;
+    localStorage.setItem('seenUsers', JSON.stringify(seenUsers));
+  }, [seenUsers]);
+
+  // Fetch stories + stories per user
+  useEffect(() => {
     fetchStories();
+    fetchActiveStoriesMap().then((map) => setAvatarStoriesMap(map));
   }, []);
 
   const fetchStories = async () => {
     try {
-      const res = await fetch('/api/stories');
-      if (res.ok) {
-        const data = await res.json();
-        setRealStories(data);
-      }
+      const data = await fetchActiveStories();
+      setRealStories(data);
     } catch (err) {
       console.error('Error fetching stories:', err);
     }
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setStoryImage(reader.result as string);
-        setIsStoryEditorOpen(true);
-      };
-      reader.readAsDataURL(file);
-    }
+  const DEFAULT_STORY_THUMB = '/default-story.png';
+
+  const isValidStoryImgSrc = (v: unknown): v is string => {
+    if (typeof v !== 'string') return false;
+    const u = v.trim();
+    if (!u) return false;
+    return /^https?:\/\//i.test(u) || u.startsWith('/') || u.startsWith('data:');
   };
 
-  const stories = [
-    { id: 's1', user: 'sarah_j', avatar: 'https://picsum.photos/seed/sarah/100/100', image: 'https://picsum.photos/seed/story1/400/700' },
-    { id: 's2', user: 'tech_guru', avatar: 'https://picsum.photos/seed/tech/100/100', image: 'https://picsum.photos/seed/story2/400/700' },
-    ...realStories.map(s => ({
+  /** Prefer API media_url, then image_url; never pass empty/invalid strings to img. */
+  const stories = filterActiveStories(realStories).map((s) => {
+    const mediaRaw = s.media_url;
+    const imageRaw = s.image_url;
+    const mediaTrimmed =
+      typeof mediaRaw === 'string' && mediaRaw.trim() ? mediaRaw.trim() : '';
+    const imageTrimmed =
+      typeof imageRaw === 'string' && imageRaw.trim() ? imageRaw.trim() : '';
+    const resolvedMedia =
+      (mediaTrimmed && isValidStoryImgSrc(mediaTrimmed) ? mediaTrimmed : '') ||
+      (imageTrimmed && isValidStoryImgSrc(imageTrimmed) ? imageTrimmed : '') ||
+      null;
+    const imageUrlStr =
+      typeof s.image_url === 'string' && s.image_url.trim() ? s.image_url.trim() : '';
+    const mediaUrlStr =
+      typeof s.media_url === 'string' && s.media_url.trim() ? s.media_url.trim() : '';
+    return {
       id: s.id,
       user: s.username,
       avatar: s.avatar,
-      image: s.image_url
-    }))
-  ];
+      image: s.image_url || s.media_url,
+      media_url: resolvedMedia,
+      image_url: imageUrlStr,
+      media_url_raw: mediaUrlStr,
+      media_type: s.media_type,
+      user_id: s.user_id,
+      expires_at: s.expires_at,
+    };
+  });
+
+  const displayStories = (() => {
+    const result: any[] = [];
+    const seenUserKey = new Set<string>();
+    for (const s of stories as any[]) {
+      const uid = (s.user_id as string | undefined)?.trim();
+      if (!uid) {
+        const fallbackKey = `nuid:${s.user || (s as any).username || s.id}`;
+        if (!seenUserKey.has(fallbackKey)) {
+          seenUserKey.add(fallbackKey);
+          result.push(s);
+        }
+        continue;
+      }
+      if (!seenUserKey.has(uid)) {
+        seenUserKey.add(uid);
+        result.push(s);
+      }
+    }
+    return result;
+  })();
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    console.log('[trace:story-upload] 1 handleFileChange entered');
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!user?.id) {
+      alert('You must be logged in');
+      return;
+    }
+
+    const username =
+      (user as { username?: string }).username ||
+      user.user_metadata?.username ||
+      user.email?.split('@')[0];
+
+    if (!username) {
+      alert('No username found');
+      return;
+    }
+
+    const avatar =
+      (user as { avatar_url?: string }).avatar_url ||
+      user.user_metadata?.avatar_url ||
+      '';
+
+    const formData = new FormData();
+    formData.append('file', file, file.name);
+    formData.append('userId', user.id);
+    formData.append('username', username);
+    formData.append('avatar', avatar);
+
+    setStoryUploading(true);
+    try {
+      console.log('[trace:story-upload] 2 FormData ready, about to fetch POST /api/stories');
+      console.log('🚀 UPLOAD START');
+      console.log('FINAL FRONTEND CHECK:', {
+        hasFile: !!file,
+        userId: user?.id,
+        username,
+      });
+
+      const API = import.meta.env.VITE_API_ORIGIN || '';
+      const res = await fetch(`${API}/api/stories`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      console.log('[trace:story-upload] 3 fetch resolved, status=', res.status, 'ok=', res.ok);
+      console.log('STATUS:', res.status);
+
+      const text = await res.text();
+      let data: { ok?: boolean; error?: string } | undefined;
+      try {
+        data = text ? JSON.parse(text) : undefined;
+      } catch {
+        console.error('UPLOAD: non-JSON response body:', text.slice(0, 500));
+        throw new Error('Invalid server response');
+      }
+      console.log('RESPONSE:', data);
+
+      if (!res.ok || data?.ok === false) {
+        console.log(
+          '[trace:story-upload] 4 client will throw (bad response)',
+          { resOk: res.ok, dataOk: data?.ok, serverError: data?.error }
+        );
+        throw new Error(data?.error || 'Upload failed');
+      }
+
+      console.log('[trace:story-upload] 5 success path, refreshing stories');
+      console.log('✅ UPLOAD SUCCESS');
+
+      await fetchStories();
+      await fetchActiveStoriesMap().then((map) => setAvatarStoriesMap(map));
+    } catch (err) {
+      console.log('[trace:story-upload] 6 catch (alert path)', err);
+      console.error('❌ UPLOAD ERROR:', err);
+      alert('Failed to upload story. Please try again.');
+    } finally {
+      console.log('[trace:story-upload] 7 finally: clearing uploading state + input');
+      setStoryUploading(false);
+      e.currentTarget.value = '';
+    }
+  };
+
+  const navigate = useNavigate();
+
+  // If clicking story avatar, navigate to /story/:id (user_id or username for StoryPage)
+  function handleAvatarClick(story: any) {
+    const target = story.user_id?.trim() || story.user || (story as any).username;
+    const userId = story.user_id?.trim() || target;
+    if (target) {
+      navigate(`/story/${encodeURIComponent(target)}`, {
+        state: { userId },
+      });
+    }
+  }
+
+  // Show story ring for active stories per user
+  function hasActiveStoryForUser(usernameOrId: string) {
+    return (
+      avatarStoriesMap[usernameOrId] &&
+      avatarStoriesMap[usernameOrId].length > 0
+    );
+  }
+
+  // Compose user identifier (id/username) for mapping with fetched avatars
+  function extractUserIdOrUsername(story: any) {
+    return story.user_id || story.user || story.username;
+  }
+
+  function storyThumbnailSrc(story: any): string {
+    const primary = story.media_url;
+    if (primary && typeof primary === 'string' && isValidStoryImgSrc(primary)) {
+      return primary.trim();
+    }
+    const fromImage = story.image;
+    if (fromImage && typeof fromImage === 'string' && isValidStoryImgSrc(fromImage)) {
+      return fromImage.trim();
+    }
+    return DEFAULT_STORY_THUMB;
+  }
+
+  /** Thumbnail img src: prefer image_url then media_url; never use raw video URL in <img>. */
+  function storyRowThumbSrc(story: any): string {
+    const imageUrl = typeof story.image_url === 'string' ? story.image_url : '';
+    const mediaRaw = typeof story.media_url_raw === 'string' ? story.media_url_raw : '';
+    const ordered = (imageUrl.trim() || mediaRaw.trim());
+    if (ordered && /\.(mp4|webm|ogg)$/i.test(ordered)) {
+      const av = story.avatar;
+      if (typeof av === 'string' && isValidStoryImgSrc(av)) return av.trim();
+      return DEFAULT_STORY_THUMB;
+    }
+    if (ordered && isValidStoryImgSrc(ordered)) return ordered.trim();
+    return storyThumbnailSrc(story);
+  }
 
   return (
     <div className="bg-white dark:bg-gray-900 rounded-none lg:rounded-2xl p-4 shadow-sm border-b lg:border border-gray-100 dark:border-gray-800 overflow-hidden">
@@ -128,244 +414,81 @@ function Stories() {
       </div>
       <div className="flex items-center gap-3 overflow-x-auto no-scrollbar pb-2 px-1">
         {/* Add Story Button */}
-        <input 
-          type="file" 
-          ref={fileInputRef} 
-          className="hidden" 
-          accept="image/*" 
+        <input
+          type="file"
+          ref={fileInputRef}
+          className="hidden"
+          accept="image/*,video/*"
           onChange={handleFileChange}
+          disabled={storyUploading}
         />
-        <button 
-          onClick={() => fileInputRef.current?.click()}
-          className="flex flex-col items-center gap-1 flex-shrink-0"
+        <button
+          type="button"
+          onClick={() => !storyUploading && fileInputRef.current?.click()}
+          disabled={storyUploading}
+          className="flex flex-col items-center gap-1 flex-shrink-0 disabled:opacity-60"
         >
           <div className="relative w-14 h-14 sm:w-16 sm:h-16 rounded-full border-2 border-dashed border-gray-300 dark:border-gray-700 flex items-center justify-center text-gray-400 hover:border-indigo-500 hover:text-indigo-500 transition-all group">
-            <Plus size={18} className="group-hover:scale-110 transition-transform" />
+            {storyUploading ? (
+              <span className="text-[10px] font-bold text-indigo-500">…</span>
+            ) : (
+              <Plus size={18} className="group-hover:scale-110 transition-transform" />
+            )}
           </div>
-          <span className="text-[9px] sm:text-[10px] font-bold text-gray-500 dark:text-gray-400">Your Story</span>
+          <span className="text-[9px] sm:text-[10px] font-bold text-gray-500 dark:text-gray-400">
+            {storyUploading ? 'Uploading…' : 'Your Story'}
+          </span>
         </button>
 
         {/* Story Items */}
-        {stories.map((story, i) => (
-          <button 
-            key={story.id} 
-            onClick={() => setSelectedStory(i)}
-            className="flex flex-col items-center gap-1 flex-shrink-0"
-          >
-            <div className="w-14 h-14 sm:w-16 sm:h-16 rounded-full p-[2px] bg-gradient-to-tr from-yellow-400 via-red-500 to-purple-600">
-              <div className="w-full h-full rounded-full border-2 border-white dark:border-black overflow-hidden bg-gray-100 dark:bg-gray-800">
-                <ResponsiveImage src={story.avatar} alt={story.user} width={64} height={64} className="w-full h-full object-cover" />
-              </div>
-            </div>
-            <span className="text-[9px] sm:text-[10px] font-bold text-gray-500 dark:text-gray-400 truncate w-14 sm:w-16 text-center">{story.user}</span>
-          </button>
-        ))}
-      </div>
-
-      <AnimatePresence>
-        {selectedStory !== null && (
-          <StoryViewer 
-            key={selectedStory}
-            stories={stories} 
-            initialIndex={selectedStory} 
-            onClose={() => setSelectedStory(null)} 
-          />
-        )}
-      </AnimatePresence>
-
-      <StoryEditor 
-        isOpen={isStoryEditorOpen}
-        onClose={() => setIsStoryEditorOpen(false)}
-        onPublished={fetchStories}
-        content={{
-          image: storyImage || '',
-          user: {
-            username: profile?.username || 'me',
-            avatar: profile?.avatar_url || MOCK_USER.avatar
-          }
-        }}
-      />
-    </div>
-  );
-}
-
-function StoryViewer({ stories, initialIndex, onClose }: { stories: any[]; initialIndex: number; onClose: () => void; key?: React.Key }) {
-  const [currentIndex, setCurrentIndex] = useState(initialIndex);
-  const [progress, setProgress] = useState(0);
-  const [reply, setReply] = useState('');
-  const [isLiked, setIsLiked] = useState(false);
-
-  // Timer for progress
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setProgress((prev) => {
-        if (prev >= 100) return 100;
-        return prev + 1.5; // Slightly faster for better UX
-      });
-    }, 50);
-
-    return () => clearInterval(timer);
-  }, [currentIndex]);
-
-  // Handle story transition when progress reaches 100
-  useEffect(() => {
-    if (progress >= 100) {
-      if (currentIndex < (stories?.length || 0) - 1) {
-        setCurrentIndex(currentIndex + 1);
-        setProgress(0);
-        setIsLiked(false);
-      } else {
-        onClose();
-      }
-    }
-  }, [progress, currentIndex, stories?.length, onClose]);
-
-  const handleReply = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!reply.trim()) return;
-    alert(`Reply sent to ${stories[currentIndex].user}: ${reply}`);
-    setReply('');
-  };
-
-  return (
-    <motion.div 
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      className="fixed inset-0 z-[100] bg-black/90 backdrop-blur-sm flex items-center justify-center p-4 md:p-8"
-    >
-      {/* Close Button - Top Right */}
-      <button 
-        onClick={onClose} 
-        className="absolute top-6 right-6 text-white/40 hover:text-white transition-colors z-[110]"
-      >
-        <X size={32} />
-      </button>
-
-      {/* Desktop Navigation Arrows */}
-      <div className="hidden md:flex absolute inset-x-0 top-1/2 -translate-y-1/2 justify-between px-8 pointer-events-none">
-        <button 
-          disabled={currentIndex === 0}
-          onClick={(e) => {
-            e.stopPropagation();
-            if (currentIndex > 0) {
-              setCurrentIndex(currentIndex - 1);
-              setProgress(0);
-              setIsLiked(false);
-            }
-          }}
-          className={cn(
-            "w-12 h-12 rounded-full bg-white/10 backdrop-blur-md flex items-center justify-center text-white pointer-events-auto transition-all",
-            currentIndex === 0 ? "opacity-0 cursor-default" : "hover:bg-white/20"
-          )}
-        >
-          <ChevronLeft size={24} />
-        </button>
-        <button 
-          onClick={(e) => {
-            e.stopPropagation();
-            if (currentIndex < (stories?.length || 0) - 1) {
-              setCurrentIndex(currentIndex + 1);
-              setProgress(0);
-              setIsLiked(false);
-            } else {
-              onClose();
-            }
-          }}
-          className="w-12 h-12 rounded-full bg-white/10 backdrop-blur-md flex items-center justify-center text-white pointer-events-auto hover:bg-white/20 transition-all"
-        >
-          <ChevronRight size={24} />
-        </button>
-      </div>
-
-      <motion.div 
-        initial={{ scale: 0.9, opacity: 0 }}
-        animate={{ scale: 1, opacity: 1 }}
-        exit={{ scale: 0.9, opacity: 0 }}
-        className="relative w-full max-w-[400px] max-h-full aspect-[9/16] bg-gray-900 rounded-[32px] overflow-hidden shadow-2xl flex flex-col border border-white/10"
-      >
-        <div className="relative flex-1 overflow-hidden">
-          <ResponsiveImage src={stories[currentIndex].image} alt="" width={400} height={711} className="w-full h-full object-cover" />
-          
-          {/* Progress Bars */}
-          <div className="absolute top-4 left-4 right-4 flex gap-1.5 z-10">
-            {stories.map((_, i) => (
-              <div key={i} className="flex-1 h-1 bg-white/20 rounded-full overflow-hidden">
-                <div 
-                  className="h-full bg-white transition-all duration-100 ease-linear"
-                  style={{ 
-                    width: i < currentIndex ? '100%' : i === currentIndex ? `${progress}%` : '0%' 
-                  }}
-                />
-              </div>
-            ))}
-          </div>
-
-          {/* User Info */}
-          <div className="absolute top-8 left-4 flex items-center justify-between right-4 z-10">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-full p-0.5 bg-gradient-to-tr from-yellow-400 to-purple-600">
-                <ResponsiveImage src={stories[currentIndex].avatar} alt="" width={40} height={40} className="w-full h-full rounded-full border-2 border-black object-cover" />
-              </div>
-              <div className="flex flex-col">
-                <span className="text-white font-bold text-sm leading-tight">{stories[currentIndex].user}</span>
-                <span className="text-white/60 text-[10px]">12h</span>
-              </div>
-            </div>
-          </div>
-
-          {/* Mobile Navigation Areas */}
-          <div className="absolute inset-0 flex md:hidden">
-            <button 
-              className="flex-1 h-full cursor-default" 
-              onClick={() => {
-                if (currentIndex > 0) {
-                  setCurrentIndex(currentIndex - 1);
-                  setProgress(0);
-                  setIsLiked(false);
-                }
-              }}
-            />
-            <button 
-              className="flex-1 h-full cursor-default" 
-              onClick={() => {
-                if (currentIndex < (stories?.length || 0) - 1) {
-                  setCurrentIndex(currentIndex + 1);
-                  setProgress(0);
-                  setIsLiked(false);
-                } else {
-                  onClose();
-                }
-              }}
-            />
-          </div>
-        </div>
-
-        {/* Bottom Interaction Bar */}
-        <div className="p-4 bg-black/40 backdrop-blur-md border-t border-white/5 flex items-center gap-3">
-          <form onSubmit={handleReply} className="flex-1 flex items-center gap-2 bg-white/10 rounded-full px-4 py-2.5 border border-white/10">
-            <input 
-              type="text" 
-              value={reply}
-              onChange={(e) => setReply(e.target.value)}
-              placeholder="Send message"
-              className="flex-1 bg-transparent border-none focus:ring-0 text-white text-xs placeholder:text-white/50"
-            />
-          </form>
-          <div className="flex items-center gap-3">
-            <button 
-              onClick={() => setIsLiked(!isLiked)}
-              className="text-white hover:scale-110 transition-transform active:scale-125"
+        {displayStories.map((story) => {
+          console.log('Story:', story);
+          const userKey = extractUserIdOrUsername(story);
+          const showRing = hasActiveStoryForUser(userKey);
+          const isSeen = story.user_id && seenUsers.includes(String(story.user_id));
+          const isVideo =
+            story.media_type === 'video' ||
+            !!(typeof story.media_url_raw === 'string' &&
+              story.media_url_raw.match(/\.(mp4|webm|ogg)$/i));
+          const thumbSrc = storyRowThumbSrc(story);
+          return (
+            <button
+              key={story.id}
+              onClick={() => handleAvatarClick(story)}
+              className="flex flex-col items-center gap-1 flex-shrink-0"
             >
-              <Heart size={22} className={cn(isLiked ? "fill-red-500 text-red-500" : "text-white")} />
+              <div className={cn(
+                'w-16 h-16 rounded-full p-[2px]',
+                showRing && (isSeen ? 'ring-2 ring-gray-300' : 'ring-2 ring-pink-500')
+              )}>
+                <div className="w-full h-full rounded-full border-2 border-white dark:border-black overflow-hidden bg-gray-100 dark:bg-gray-800">
+                  <div className="w-full h-full rounded-full overflow-hidden">
+                    <div className="relative w-full h-full">
+                      <img
+                        src={thumbSrc}
+                        alt=""
+                        className="w-full h-full object-cover rounded-full"
+                        onError={(e) => {
+                          const el = e.currentTarget;
+                          if (el.src.includes('default-story.png')) return;
+                          el.src = DEFAULT_STORY_THUMB;
+                        }}
+                      />
+                      {isVideo && (
+                        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                          <span style={{ fontSize: '18px', color: 'white' }}>▶</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <span className="text-[9px] sm:text-[10px] font-bold text-gray-500 dark:text-gray-400 truncate w-14 sm:w-16 text-center">{story.user}</span>
             </button>
-            <button className="text-white hover:scale-110 transition-transform">
-              <Share2 size={22} />
-            </button>
-          </div>
-        </div>
-      </motion.div>
-    </motion.div>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -380,14 +503,14 @@ function CreatePost({ onGoLive, onPostCreated }: { onGoLive: () => void; onPostC
         <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 mb-4">
           <div className="flex items-center gap-3 flex-1">
             <img src={profile?.avatar_url || MOCK_USER.avatar} alt="" className="w-10 h-10 rounded-full object-cover flex-shrink-0" referrerPolicy="no-referrer" />
-            <button 
+            <button
               onClick={() => setIsModalOpen(true)}
               className="flex-1 bg-gray-100 dark:bg-gray-800 text-gray-500 text-left px-4 py-2.5 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors text-sm truncate"
             >
               What's on your mind, {profile?.display_name?.split(' ')[0] || 'friend'}?
             </button>
           </div>
-          <button 
+          <button
             onClick={onGoLive}
             className="bg-red-500 text-white px-4 py-2.5 rounded-full hover:bg-red-600 transition-all flex items-center justify-center gap-2 font-bold text-sm shadow-lg shadow-red-500/20 whitespace-nowrap"
           >
@@ -404,8 +527,8 @@ function CreatePost({ onGoLive, onPostCreated }: { onGoLive: () => void; onPostC
 
       <AnimatePresence>
         {isModalOpen && (
-          <CreatePostModal 
-            onClose={() => setIsModalOpen(false)} 
+          <CreatePostModal
+            onClose={() => setIsModalOpen(false)}
             onPostCreated={onPostCreated}
           />
         )}
@@ -414,265 +537,115 @@ function CreatePost({ onGoLive, onPostCreated }: { onGoLive: () => void; onPostC
   );
 }
 
-function CreatePostModal({ onClose, onPostCreated }: { onClose: () => void; onPostCreated?: () => void }) {
-  const { user, profile } = useAuth();
-  const [text, setText] = useState('');
-  const [selectedImage, setSelectedImage] = useState<string | null>(null);
-  const [imageFile, setImageFile] = useState<File | null>(null);
-  const [selectedVideo, setSelectedVideo] = useState<string | null>(null);
-  const [videoFile, setVideoFile] = useState<File | null>(null);
-  const [feeling, setFeeling] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+function CreatePostModal({
+  onClose,
+  onPostCreated,
+}: {
+  onClose: () => void;
+  onPostCreated?: () => void;
+}) {
+  const { user } = useAuth();
+  const [searchParams] = useSearchParams();
+  const categoryParam = searchParams.get('category');
 
-  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      setImageFile(file);
-      setSelectedVideo(null);
-      setVideoFile(null);
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setSelectedImage(reader.result as string);
-      };
-      reader.readAsDataURL(file);
-    }
-  };
+  const [content, setContent] = useState('');
+  const [imageUrl, setImageUrl] = useState('');
+  const [videoUrl, setVideoUrl] = useState('');
+  const [busy, setBusy] = useState(false);
 
-  const handleVideoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      setVideoFile(file);
-      setSelectedImage(null);
-      setImageFile(null);
-      const url = URL.createObjectURL(file);
-      setSelectedVideo(url);
-    }
-  };
-
-  const handlePost = async () => {
+  const publish = async () => {
     if (!user) {
-      alert('You must be logged in to post');
+      alert('Please log in to post.');
       return;
     }
-    
-    if (!text.trim() && !imageFile && !videoFile) {
-      alert('Please add some content to your post');
-      return;
-    }
+    if (!content.trim() && !imageUrl.trim() && !videoUrl.trim()) return;
 
-    setLoading(true);
+    setBusy(true);
     try {
-      let imageUrl = null;
-      let videoUrl = null;
+      const payload: any = {
+        user_id: user.id,
+        content: content.trim(),
+        image_url: imageUrl.trim() || null,
+        video_url: videoUrl.trim() || null,
+        category: categoryParam || 'general',
+      };
 
-      // 1. Upload Image to "posts" bucket if it exists
-      if (imageFile) {
-        const fileExt = imageFile.name.split('.').pop();
-        const fileName = `${Math.random().toString(36).substring(2)}_${Date.now()}.${fileExt}`;
-        const filePath = fileName; // Upload to root of "posts" bucket
-
-        const { error: uploadError } = await supabase.storage
-          .from('posts')
-          .upload(filePath, imageFile, {
-            cacheControl: '3600',
-            upsert: false
-          });
-
-        if (uploadError) {
-          console.error('Image upload error:', uploadError);
-          if (uploadError.message.includes('Bucket not found')) {
-            throw new Error('Storage bucket "posts" not found. Please create a public bucket named "posts" in your Supabase dashboard.');
-          }
-          throw new Error(`Image upload failed: ${uploadError.message}`);
-        }
-
-        // 2. Retrieve the public URL
-        const { data: publicUrlData } = supabase.storage
-          .from('posts')
-          .getPublicUrl(filePath);
-        
-        imageUrl = publicUrlData.publicUrl;
-      }
-
-      // Upload Video if exists
-      if (videoFile) {
-        const fileExt = videoFile.name.split('.').pop();
-        const fileName = `${Math.random().toString(36).substring(2)}_${Date.now()}.${fileExt}`;
-        const filePath = `videos/${fileName}`;
-
-        const { error: uploadError } = await supabase.storage
-          .from('posts')
-          .upload(filePath, videoFile, {
-            cacheControl: '3600',
-            upsert: false
-          });
-
-        if (uploadError) {
-          console.error('Video upload error:', uploadError);
-          if (uploadError.message.includes('Bucket not found')) {
-            throw new Error('Storage bucket "posts" not found. Please create a public bucket named "posts" in your Supabase dashboard.');
-          }
-          throw new Error(`Video upload failed: ${uploadError.message}`);
-        }
-
-        const { data: publicUrlData } = supabase.storage
-          .from('posts')
-          .getPublicUrl(filePath);
-        
-        videoUrl = publicUrlData.publicUrl;
-      }
-
-      // 3. Save the URL in the image_url column in the posts table
-      const { error: insertError } = await supabase
-        .from('posts')
-        .insert({
-          user_id: user.id,
-          content: text.trim(),
-          created_at: new Date(),
-          image_url: imageUrl,
-          video_url: videoUrl
-        });
-      
-      if (insertError) {
-        console.error('Database insertion error:', insertError);
-        throw insertError;
-      }
+      const { error } = await supabase.from('posts').insert(payload);
+      if (error) throw error;
 
       onClose();
-      // Refresh posts
-      if (onPostCreated) {
-        onPostCreated();
-      } else if (typeof window !== 'undefined') {
-        window.location.reload(); // Fallback
-      }
+      onPostCreated?.();
     } catch (err: any) {
-      console.error('Error creating post:', err);
-      alert(err.message || 'Failed to create post. Please ensure your Supabase Storage "posts" bucket is public and configured correctly.');
+      console.error('CreatePostModal publish error:', err);
+      alert(err?.message || 'Failed to create post');
     } finally {
-      setLoading(false);
+      setBusy(false);
     }
   };
 
-  const feelings = ['Happy', 'Loved', 'Excited', 'Crazy', 'Blessed', 'Sad'];
-
   return (
-    <motion.div
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      className="fixed inset-0 z-[110] bg-white/80 dark:bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
-    >
-      <motion.div
-        initial={{ scale: 0.9, opacity: 0, y: 20 }}
-        animate={{ scale: 1, opacity: 1, y: 0 }}
-        exit={{ scale: 0.9, opacity: 0, y: 20 }}
-        className="bg-white dark:bg-gray-900 w-full max-w-[500px] rounded-2xl shadow-2xl border border-gray-100 dark:border-gray-800 overflow-hidden"
-      >
-        <div className="p-4 border-b border-gray-100 dark:border-gray-800 flex items-center justify-between">
-          <div className="w-8" />
-          <h3 className="font-bold text-lg">Create Post</h3>
-          <button onClick={onClose} className="p-2 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors">
+    <div className="fixed inset-0 z-[180] flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
+      <div className="relative w-full max-w-lg rounded-3xl bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-800 shadow-2xl p-6">
+        <div className="flex items-start justify-between gap-4 mb-4">
+          <div>
+            <h3 className="text-xl font-bold">Create Post</h3>
+            <p className="text-xs text-gray-500 mt-1">Share something with your community.</p>
+          </div>
+          <button
+            onClick={onClose}
+            className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-full transition-colors"
+            aria-label="Close"
+          >
             <X size={20} />
           </button>
         </div>
 
-        <div className="p-4 space-y-4 max-h-[70vh] overflow-y-auto no-scrollbar">
-          <div className="flex items-center gap-3">
-            <img src={profile?.avatar_url || MOCK_USER.avatar} alt="" className="w-10 h-10 rounded-full object-cover" referrerPolicy="no-referrer" />
-            <div>
-              <h4 className="font-bold text-sm">{profile?.display_name || profile?.username || 'User'}</h4>
-              {feeling && (
-                <span className="text-xs text-gray-500">is feeling <span className="font-bold">{feeling}</span></span>
-              )}
-            </div>
-          </div>
-
+        <div className="space-y-4">
           <textarea
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            placeholder={`What's on your mind, ${profile?.display_name?.split(' ')[0] || 'friend'}?`}
-            className="w-full min-h-[120px] bg-transparent border-none resize-none focus:ring-0 text-lg placeholder:text-gray-400"
+            value={content}
+            onChange={(e) => setContent(e.target.value)}
+            placeholder="What's on your mind?"
+            className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl p-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            rows={4}
           />
 
-          {selectedImage && (
-            <div className="relative rounded-xl overflow-hidden border border-gray-100 dark:border-gray-800">
-              <img src={selectedImage} alt="Selected" className="w-full object-cover max-h-[300px]" referrerPolicy="no-referrer" />
-              <button 
-                onClick={() => setSelectedImage(null)}
-                className="absolute top-2 right-2 p-1.5 bg-black/50 text-white rounded-full hover:bg-black/70 transition-colors"
-              >
-                <X size={16} />
-              </button>
-            </div>
-          )}
-
-          {selectedVideo && (
-            <div className="relative rounded-xl overflow-hidden border border-gray-100 dark:border-gray-800">
-              <video src={selectedVideo} controls className="w-full max-h-[300px] bg-black" />
-              <button 
-                onClick={() => setSelectedVideo(null)}
-                className="absolute top-2 right-2 p-1.5 bg-black/50 text-white rounded-full hover:bg-black/70 transition-colors z-10"
-              >
-                <X size={16} />
-              </button>
-            </div>
-          )}
-
-          <div className="space-y-4">
-            <div className="p-3 rounded-xl border border-gray-100 dark:border-gray-800 flex items-center justify-between">
-              <span className="text-sm font-bold text-gray-500">Add to your post</span>
-              <div className="flex items-center gap-2">
-                <label className="p-2 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors cursor-pointer text-green-500" title="Add Photo">
-                  <ImageIcon size={20} />
-                  <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
-                </label>
-                <label className="p-2 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors cursor-pointer text-blue-500" title="Add Video">
-                  <Video size={20} />
-                  <input type="file" className="hidden" accept="video/*" onChange={handleVideoUpload} />
-                </label>
-                <button className="p-2 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors text-yellow-500" title="Feeling/Activity">
-                  <Smile size={20} />
-                </button>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap gap-2">
-              {feelings.map((f) => (
-                <button
-                  key={f}
-                  onClick={() => setFeeling(feeling === f ? null : f)}
-                  className={cn(
-                    "px-3 py-1.5 rounded-full text-xs font-bold transition-all",
-                    feeling === f 
-                      ? "bg-indigo-600 text-white" 
-                      : "bg-gray-100 dark:bg-gray-800 text-gray-500 hover:bg-gray-200 dark:hover:bg-gray-700"
-                  )}
-                >
-                  {f}
-                </button>
-              ))}
-            </div>
+          <div className="space-y-2">
+            <label className="text-xs font-bold text-gray-500 uppercase tracking-wider">Image URL (optional)</label>
+            <input
+              value={imageUrl}
+              onChange={(e) => setImageUrl(e.target.value)}
+              placeholder="https://..."
+              className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl px-3 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            />
           </div>
-        </div>
 
-        <div className="p-4">
-          <button 
-            disabled={(!text.trim() && !selectedImage && !selectedVideo) || loading}
-            className="w-full bg-indigo-600 disabled:bg-gray-300 dark:disabled:bg-gray-800 text-white py-2.5 rounded-xl font-bold transition-all shadow-lg shadow-indigo-500/20 flex items-center justify-center gap-2"
-            onClick={handlePost}
+          <div className="space-y-2">
+            <label className="text-xs font-bold text-gray-500 uppercase tracking-wider">Video URL (optional)</label>
+            <input
+              value={videoUrl}
+              onChange={(e) => setVideoUrl(e.target.value)}
+              placeholder="https://..."
+              className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl px-3 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            />
+          </div>
+
+          <button
+            onClick={publish}
+            disabled={busy}
+            className="w-full bg-indigo-600 hover:bg-indigo-700 text-white py-3 rounded-2xl font-bold transition-all shadow-lg shadow-indigo-500/20 disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {loading && <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>}
-            Post
+            {busy ? 'Posting...' : 'Post'}
           </button>
         </div>
-      </motion.div>
-    </motion.div>
+      </div>
+    </div>
   );
 }
 
 function PostAction({ icon, label, onClick }: { icon: React.ReactNode; label: string; onClick?: () => void }) {
   return (
-    <button 
+    <button
       onClick={onClick}
       className="flex items-center gap-2 px-4 py-2 rounded-xl hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
     >
@@ -682,18 +655,123 @@ function PostAction({ icon, label, onClick }: { icon: React.ReactNode; label: st
   );
 }
 
+// ---------------- FEED COMPONENTS: video, double-tap, avatar ring, nav ---------
 function Feed({ category, refreshKey }: { category?: string | null; refreshKey?: number }) {
   const { user } = useAuth();
   const [posts, setPosts] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [userStoriesMap, setUserStoriesMap] = useState<Record<string, any[]>>({});
+
+  const fetchPosts = async () => {
+    setLoading(true);
+    try {
+      const { data: postsData, error: postsError } = await supabase
+        .from('posts')
+        .select('*')
+        .order('created_at', { ascending: false });
+      console.log('POSTS DATA:', postsData);
+
+      if (postsError) {
+        console.error('Error loading posts:', postsError);
+        setPosts([]);
+        return;
+      }
+
+      const basePosts = postsData || [];
+      if (basePosts.length === 0) {
+        setPosts([]);
+        return;
+      }
+
+      const userIds = Array.from(new Set(basePosts.map((p: any) => p.user_id).filter(Boolean)));
+      let profilesById: Record<string, { id: string; username?: string | null; avatar_url?: string | null }> = {};
+      if (userIds.length > 0) {
+        const { data: profilesRows, error: profilesError } = await supabase
+          .from('profiles')
+          .select('id, username, avatar_url')
+          .in('id', userIds);
+        if (profilesError) {
+          console.error('Error loading profiles for posts:', profilesError);
+        } else if (profilesRows) {
+          profilesById = profilesRows.reduce((acc: any, row: any) => {
+            acc[row.id] = row;
+            return acc;
+          }, {});
+        }
+      }
+
+      const postIds = basePosts.map((p: any) => p.id).filter(Boolean);
+      let likesByPost: Record<string, number> = {};
+      let commentsByPost: Record<string, number> = {};
+      let likesMergeOk = false;
+      let commentsMergeOk = false;
+
+      if (postIds.length > 0) {
+        const { data: likeRows, error: likesAggErr } = await supabase
+          .from('likes')
+          .select('post_id')
+          .in('post_id', postIds);
+        if (likesAggErr) {
+          console.error('Error loading likes for feed merge:', likesAggErr);
+        } else {
+          likesMergeOk = true;
+          (likeRows || []).forEach((row: { post_id: string }) => {
+            likesByPost[row.post_id] = (likesByPost[row.post_id] || 0) + 1;
+          });
+        }
+
+        const { data: commentRows, error: commentsAggErr } = await supabase
+          .from('comments')
+          .select('post_id')
+          .in('post_id', postIds);
+        if (commentsAggErr) {
+          console.error('Error loading comments for feed merge:', commentsAggErr);
+        } else {
+          commentsMergeOk = true;
+          (commentRows || []).forEach((row: { post_id: string }) => {
+            commentsByPost[row.post_id] = (commentsByPost[row.post_id] || 0) + 1;
+          });
+        }
+      }
+
+      const mappedPosts = basePosts.map((post: any) => {
+        const prof = post.user_id ? profilesById[post.user_id] : null;
+        const likes_count = likesMergeOk
+          ? likesByPost[post.id] ?? 0
+          : post.likes_count ?? 0;
+        const comments_count = commentsMergeOk
+          ? commentsByPost[post.id] ?? 0
+          : post.comments_count ?? 0;
+        return {
+          ...post,
+          likes_count,
+          comments_count,
+          profiles: prof || null,
+          username: prof?.username || null,
+          avatar_url: prof?.avatar_url || null,
+        };
+      });
+
+      setPosts(mappedPosts);
+    } catch (err) {
+      console.error('Error in fetchPosts:', err);
+      setPosts([]);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
     fetchPosts();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshKey, user?.id]);
 
-    // Subscribe to real-time updates
+  // Subscribe to real-time updates once
+  useEffect(() => {
     const channel = supabase
       .channel('public:posts')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'posts' }, () => {
+        console.log('[Home] realtime posts change -> fetchPosts()');
         fetchPosts();
       })
       .subscribe();
@@ -701,65 +779,16 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [category, refreshKey, user]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  const fetchPosts = async () => {
-    setLoading(true);
-    try {
-      // 1. Fetch posts first (no join to avoid breaking if relationship is missing)
-      let query = supabase
-        .from('posts')
-        .select('*');
-      
-      if (category) {
-        query = query.eq('category', category);
-      }
-      
-      const { data: postsData, error: postsError } = await query.order('created_at', { ascending: false });
-
-      if (postsError) {
-        console.error('Supabase error fetching global feed:', postsError);
-        throw postsError;
-      }
-
-      if (!postsData || postsData.length === 0) {
-        setPosts([]);
-        return;
-      }
-
-      // 2. Fetch profiles for these users separately
-      const userIds = Array.from(new Set(postsData.map(p => p.user_id)));
-      const { data: profilesData, error: profilesError } = await supabase
-        .from('profiles')
-        .select('id, username, full_name, avatar_url')
-        .in('id', userIds);
-
-      if (profilesError) {
-        console.error('Error fetching profiles for posts:', profilesError);
-        // Don't throw, we still want to show posts
-      }
-
-      // 3. Map profiles to posts
-      const profilesMap = (profilesData || []).reduce((acc: any, profile: any) => {
-        acc[profile.id] = profile;
-        return acc;
-      }, {});
-
-      const postsWithProfiles = postsData.map(post => ({
-        ...post,
-        profiles: profilesMap[post.user_id] || null
-      }));
-
-      console.log('Global Feed Data:', postsWithProfiles);
-      setPosts(postsWithProfiles);
-    } catch (err) {
-      console.error('Error in fetchPosts:', err);
-    } finally {
-      setLoading(false);
-    }
-  };
+  // Fetch non-expired story map for all user_ids for avatar ring and navigation
+  useEffect(() => {
+    fetchActiveStoriesMap().then(setUserStoriesMap);
+  }, [refreshKey]);
 
   const handleDeletePost = async (postId: string, postUserId: string) => {
+    console.log('[Feed] handleDeletePost', { postId, postUserId });
     if (!user || user.id !== postUserId) {
       alert('You can only delete your own posts');
       return;
@@ -772,7 +801,7 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
           .delete()
           .eq('id', postId)
           .eq('user_id', user.id);
-        
+
         if (error) throw error;
         setPosts(posts.filter(p => p.id !== postId));
       } catch (err) {
@@ -797,11 +826,17 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
       {filteredPosts.length > 0 ? (
         filteredPosts.map((post, index) => (
           <React.Fragment key={post.id}>
-            <PostItem 
-              post={post} 
-              onDelete={() => handleDeletePost(post.id, post.user_id)} 
+            <PostItem
+              post={post}
+              index={index}
+              onDelete={() => handleDeletePost(post.id, post.user_id)}
+              onPostUpdated={(postId, newContent) => {
+                setPosts((prev) =>
+                  prev.map((p) => (p.id === postId ? { ...p, content: newContent } : p))
+                );
+              }}
+              userStoriesMap={userStoriesMap}
             />
-            {/* Insert suggested content for mobile/tablet between posts */}
             {index === 0 && (
               <div className="xl:hidden space-y-6">
                 <PeopleYouMayKnow />
@@ -823,7 +858,21 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
   );
 }
 
-function PostItem({ post, onDelete }: { post: any; onDelete: () => void; key?: React.Key }) {
+// -------------- Enhanced PostItem: video, double tap, avatar ring, nav ----------
+function PostItem({
+  post,
+  index = 0,
+  onDelete,
+  onPostUpdated,
+  userStoriesMap = {},
+}: {
+  post: any;
+  index?: number;
+  onDelete: () => void;
+  onPostUpdated?: (postId: string, newContent: string) => void;
+  userStoriesMap?: Record<string, any[]>;
+  key?: React.Key;
+}) {
   const { user, profile } = useAuth();
   const navigate = useNavigate();
   const [isLiked, setIsLiked] = useState(false);
@@ -839,43 +888,150 @@ function PostItem({ post, onDelete }: { post: any; onDelete: () => void; key?: R
   const [isEditing, setIsEditing] = useState(false);
   const [editContent, setEditContent] = useState(post.content);
 
-  const postUser = {
-    name: post.profiles?.full_name || post.profiles?.username || post.username || 'User',
-    username: post.profiles?.username || post.username,
-    avatar: post.profiles?.avatar_url || post.avatar_url || `https://picsum.photos/seed/${post.user_id}/100/100`,
-    time: post.created_at ? new Date(post.created_at).toLocaleString() : 'Just now',
-    isMe: post.user_id === user?.id
-  };
+  // Double-tap state for heart animation
+  const [showHeart, setShowHeart] = useState(false);
+
+  // Video player ref for intersection observer
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+
+  // Track if post video is visible
+  const [videoVisible, setVideoVisible] = useState(false);
 
   useEffect(() => {
+    setEditContent(post.content ?? '');
+  }, [post.id, post.content]);
+
+  const postProfile = Array.isArray(post.profiles)
+    ? post.profiles[0]
+    : post.profiles;
+
+  const displayUsername = postProfile?.username || post.username || 'Unknown User';
+  const displayAvatar =
+    postProfile?.avatar_url ||
+    post.avatar_url ||
+    `https://picsum.photos/seed/${post.user_id}/100/100`;
+
+  const imageUrl =
+    typeof post.image_url === 'string' ? post.image_url.trim() : post.image_url;
+  const videoUrl =
+    typeof post.video_url === 'string' ? post.video_url.trim() : post.video_url;
+
+  const postUser = {
+    name: displayUsername,
+    username: displayUsername,
+    avatar: displayAvatar,
+    user_id: post.user_id,
+    time: post.created_at ? new Date(post.created_at).toLocaleString() : 'Just now',
+    isMe: post.user_id === user?.id,
+  };
+
+  // Enhanced: username click to /profile/:id
+  const handleProfileClick = useCallback(() => {
+    if (postUser.user_id) {
+      navigate(`/profile/${postUser.user_id}`);
+    }
+  }, [postUser, navigate]);
+
+  // EXACT same resolution + map key as Stories row (storyTarget chain, not user_id alone)
+  const storyUid =
+    typeof post.user_id === 'string'
+      ? post.user_id.trim()
+      : post.user_id != null && post.user_id !== ''
+        ? String(post.user_id).trim()
+        : '';
+  const storyTarget =
+    storyUid || (post as { user?: string }).user || post.username || '';
+  const storyUserIdForState = storyUid || storyTarget;
+
+  const hasActiveStory = !!(userStoriesMap[storyTarget]?.length);
+
+  const handleAvatarClick = useCallback(() => {
+    if (hasActiveStory && storyTarget) {
+      navigate(`/story/${encodeURIComponent(storyTarget)}`, {
+        state: { userId: storyUserIdForState },
+      });
+    } else if (postUser.user_id) {
+      navigate(`/profile/${postUser.user_id}`);
+    }
+  }, [hasActiveStory, storyTarget, storyUserIdForState, postUser.user_id, navigate]);
+
+  // Double tap to like
+  const handleDoubleTap = useCallback(() => {
+    setShowHeart(true);
+    if (!isLiked) handleLike();
+    setTimeout(() => setShowHeart(false), 800);
+  }, [isLiked]); // eslint-disable-line
+
+  // Intersection observer for video autoplay (desktop/mobile)
+  useEffect(() => {
+    if (!videoRef.current || !videoUrl) return;
+    const node = videoRef.current;
+    let pausedByObserver = false;
+
+    const handler = (entries: IntersectionObserverEntry[]) => {
+      const entry = entries[0];
+      if (entry.isIntersecting) {
+        setVideoVisible(true);
+        node.play().catch(() => {}); // suppress
+        pausedByObserver = false;
+      } else {
+        setVideoVisible(false);
+        node.pause();
+        pausedByObserver = true;
+      }
+    };
+
+    const observer = new window.IntersectionObserver(handler, {
+      threshold: 0.65,
+    });
+
+    observer.observe(node);
+    return () => {
+      observer.disconnect();
+      if (pausedByObserver) node.pause();
+    };
+  }, [videoUrl, videoRef]);
+
+  useEffect(() => {
+    checkIfSaved();
+    fetchLikesCount();
+    fetchCommentsCount();
     if (user) {
       checkIfLiked();
-      fetchLikesCount();
-      fetchCommentsCount();
     }
     if (showComments) {
       fetchComments();
     }
-  }, [post.id, user, showComments]);
+  }, [post.id, post.likes_count, post.comments_count, user, showComments]);
 
   const fetchLikesCount = async () => {
+    if (!post?.id) return;
     const { count, error } = await supabase
       .from('likes')
       .select('*', { count: 'exact', head: true })
       .eq('post_id', post.id);
-    
-    if (!error && count !== null) {
+
+    if (error) {
+      console.error('[PostItem] fetchLikesCount', error);
+      return;
+    }
+    if (count !== null) {
       setLikesCount(count);
     }
   };
 
   const fetchCommentsCount = async () => {
+    if (!post?.id) return;
     const { count, error } = await supabase
       .from('comments')
       .select('*', { count: 'exact', head: true })
       .eq('post_id', post.id);
-    
-    if (!error && count !== null) {
+
+    if (error) {
+      console.error('[PostItem] fetchCommentsCount', error);
+      return;
+    }
+    if (count !== null) {
       setCommentsCount(count);
     }
   };
@@ -888,7 +1044,7 @@ function PostItem({ post, onDelete }: { post: any; onDelete: () => void; key?: R
       .eq('post_id', post.id)
       .eq('user_id', user.id)
       .maybeSingle();
-    
+
     if (!error && data) {
       setIsLiked(true);
     } else {
@@ -896,25 +1052,69 @@ function PostItem({ post, onDelete }: { post: any; onDelete: () => void; key?: R
     }
   };
 
+  const checkIfSaved = async () => {
+    const { data: authData, error: authErr } = await supabase.auth.getUser();
+    const userId = authData?.user?.id;
+    if (authErr) {
+      console.error('[PostItem] checkIfSaved getUser', authErr);
+      setIsSaved(false);
+      return;
+    }
+    if (!userId || !post?.id) {
+      setIsSaved(false);
+      return;
+    }
+    const { data, error } = await supabase
+      .from('saved_posts')
+      .select('id')
+      .eq('post_id', post.id)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (error) {
+      console.error('[PostItem] checkIfSaved query', error);
+      setIsSaved(false);
+      return;
+    }
+    setIsSaved(!!data);
+  };
+
   const fetchComments = async () => {
     setLoadingComments(true);
     try {
       const { data, error } = await supabase
         .from('comments')
-        .select('*')
+        .select('id, post_id, user_id, content, created_at')
         .eq('post_id', post.id)
         .order('created_at', { ascending: true });
-      
+
       if (error) throw error;
-      
-      const formattedComments = data.map(c => ({
+
+      const userIds = Array.from(new Set((data || []).map((c: any) => c.user_id).filter(Boolean)));
+      let profilesMap: Record<string, any> = {};
+      if (userIds.length > 0) {
+        const { data: profilesData, error: profilesError } = await supabase
+          .from('profiles')
+          .select('id, username, avatar_url')
+          .in('id', userIds);
+        if (profilesError) {
+          console.error('Error fetching comment profiles:', profilesError);
+        } else {
+          profilesMap = (profilesData || []).reduce((acc: any, p: any) => {
+            acc[p.id] = p;
+            return acc;
+          }, {});
+        }
+      }
+
+      const formattedComments = (data || []).map((c: any) => ({
         id: c.id,
-        user: c.username || 'unknown',
+        user: resolveProfileUsername(profilesMap[c.user_id]?.username),
         text: c.content,
-        avatar: c.avatar_url || `https://picsum.photos/seed/${c.user_id}/100/100`,
-        time: new Date(c.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        avatar: profilesMap[c.user_id]?.avatar_url || `https://picsum.photos/seed/${c.user_id}/100/100`,
+        time: new Date(c.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       }));
-      
+
       setComments(formattedComments);
     } catch (err) {
       console.error('Error fetching comments:', err);
@@ -929,14 +1129,12 @@ function PostItem({ post, onDelete }: { post: any; onDelete: () => void; key?: R
       return;
     }
 
-    // Optimistic update
     const wasLiked = isLiked;
     setIsLiked(!wasLiked);
-    setLikesCount(prev => wasLiked ? prev - 1 : prev + 1);
+    setLikesCount((prev) => (wasLiked ? prev - 1 : prev + 1));
 
     try {
       if (wasLiked) {
-        // Unlike
         const { error } = await supabase
           .from('likes')
           .delete()
@@ -944,20 +1142,18 @@ function PostItem({ post, onDelete }: { post: any; onDelete: () => void; key?: R
           .eq('user_id', user.id);
         if (error) throw error;
       } else {
-        // Like
         const { error } = await supabase
           .from('likes')
           .insert({
             post_id: post.id,
-            user_id: user.id
+            user_id: user.id,
           });
         if (error) throw error;
       }
     } catch (err) {
       console.error('Error toggling like:', err);
-      // Rollback on error
       setIsLiked(wasLiked);
-      setLikesCount(prev => wasLiked ? prev + 1 : prev - 1);
+      setLikesCount((prev) => (wasLiked ? prev + 1 : prev - 1));
     }
   };
 
@@ -979,26 +1175,26 @@ function PostItem({ post, onDelete }: { post: any; onDelete: () => void; key?: R
           post_id: post.id,
           user_id: user.id,
           content: commentText,
-          created_at: new Date()
+          created_at: new Date(),
         })
-        .select()
+        .select('id, user_id, content, created_at')
         .single();
-      
+
       if (error) throw error;
 
       const newCommentObj = {
         id: data.id,
-        user: data.username || 'me',
+        user: resolveProfileUsername(profile?.username),
         text: data.content,
-        avatar: data.avatar_url || `https://picsum.photos/seed/${data.user_id}/100/100`,
-        time: 'now'
+        avatar: profile?.avatar_url || `https://picsum.photos/seed/${data.user_id}/100/100`,
+        time: 'now',
       };
 
       setComments([...comments, newCommentObj]);
-      setCommentsCount(prev => prev + 1);
+      setCommentsCount((prev) => prev + 1);
     } catch (err) {
       console.error('Error adding comment:', err);
-      setNewComment(commentText); // Restore text on error
+      setNewComment(commentText);
       alert('Failed to add comment');
     }
   };
@@ -1009,25 +1205,46 @@ function PostItem({ post, onDelete }: { post: any; onDelete: () => void; key?: R
 
   const handleCopyLink = () => {
     const url = `${window.location.origin}/?post=${post.id}`;
-    navigator.clipboard.writeText(url).then(() => {
-      alert('Link copied to clipboard!');
-    }).catch(err => {
-      console.error('Failed to copy link:', err);
-    });
+    navigator.clipboard
+      .writeText(url)
+      .then(() => {
+        alert('Link copied to clipboard!');
+      })
+      .catch((err) => {
+        console.error('Failed to copy link:', err);
+      });
   };
 
   const handleSaveEdit = async () => {
     if (!user || user.id !== post.user_id) return;
     if (!editContent.trim()) return;
-    
+
     try {
-      const { error } = await supabase
+      console.log('[PostItem] handleSaveEdit', {
+        postId: post.id,
+        userId: user.id,
+        postUserId: post.user_id,
+      });
+      const { data, error } = await supabase
         .from('posts')
         .update({ content: editContent.trim() })
         .eq('id', post.id)
-        .eq('user_id', user.id);
-      
+        .eq('user_id', user.id)
+        .select('id, content')
+        .maybeSingle();
+
+      console.log('[PostItem] handleSaveEdit supabase response', { data, error });
       if (error) throw error;
+      if (!data) {
+        console.error('[PostItem] update affected 0 rows (RLS or id mismatch)', {
+          postId: post.id,
+          userId: user.id,
+          postUserId: post.user_id,
+        });
+        alert('Failed to update post (no rows updated). Check you own this post and RLS allows UPDATE.');
+        return;
+      }
+      onPostUpdated?.(post.id, data.content ?? editContent.trim());
       setIsEditing(false);
     } catch (err) {
       console.error('Error updating post:', err);
@@ -1035,23 +1252,130 @@ function PostItem({ post, onDelete }: { post: any; onDelete: () => void; key?: R
     }
   };
 
+  const handleSaveToggle = async () => {
+    const { data: authData, error: authErr } = await supabase.auth.getUser();
+    const userId = authData?.user?.id;
+
+    if (authErr) {
+      console.error('[PostItem] handleSaveToggle getUser failed', authErr);
+      return;
+    }
+    if (!userId) {
+      console.error('[PostItem] handleSaveToggle: no authenticated user id');
+      alert('Please login to save posts');
+      return;
+    }
+    if (!post?.id) {
+      console.error('[PostItem] handleSaveToggle: post_id is missing', { post });
+      return;
+    }
+
+    const wasSaved = isSaved;
+    console.log('[PostItem] handleSaveToggle', {
+      postId: post.id,
+      userId,
+      wasSaved,
+    });
+
+    if (wasSaved) {
+      const { error } = await supabase
+        .from('saved_posts')
+        .delete()
+        .eq('post_id', post.id)
+        .eq('user_id', userId);
+
+      if (error) {
+        console.error('[PostItem] saved_posts delete failed', error);
+        return;
+      }
+      console.log('[PostItem] saved_posts delete success', { post_id: post.id, user_id: userId });
+      setIsSaved(false);
+      return;
+    }
+
+    const { data: inserted, error: insertErr } = await supabase
+      .from('saved_posts')
+      .insert({
+        post_id: post.id,
+        user_id: userId,
+      })
+      .select('post_id, user_id')
+      .maybeSingle();
+
+    if (insertErr) {
+      console.error('[PostItem] saved_posts insert failed', insertErr);
+      return;
+    }
+    if (inserted) {
+      console.log('[PostItem] saved_posts insert success', inserted);
+    } else {
+      console.warn(
+        '[PostItem] saved_posts insert OK (no error) but .select returned no row — allow SELECT on saved_posts for returning rows, or verify row in dashboard',
+        { post_id: post.id, user_id: userId }
+      );
+    }
+    setIsSaved(true);
+  };
+
   const formatCount = (count: number) => {
     return count >= 1000 ? `${(count / 1000).toFixed(1)}K` : count;
+  };
+
+  // Prepare double tap handlers for media only
+  const doubleTapHandlers = useDoubleTap(handleDoubleTap);
+
+  // Video click navigates to reels with selected video context.
+  const handleVideoClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const reelId = (post as any).reel_id || post.id;
+    console.log('[Home] navigate to reels', {
+      reelId,
+      index,
+      videoUrl
+    });
+    navigate('/reels', {
+      state: {
+        videoId: reelId,
+        postId: post.id,
+        videoUrl,
+        index,
+        thumbnail: imageUrl || videoUrl,
+        caption: post.content,
+        username: postUser.username,
+        avatar: postUser.avatar
+      }
+    });
   };
 
   return (
     <div className="bg-white dark:bg-gray-900 rounded-none lg:rounded-2xl shadow-sm border-b lg:border border-gray-100 dark:border-gray-800">
       <div className="p-4 flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <button 
-            onClick={() => navigate('/profile')}
-            className="w-10 h-10 rounded-full border border-gray-100 dark:border-gray-800 overflow-hidden hover:opacity-80 transition-opacity"
+          {/* AVATAR with story ring + navigation */}
+          <button
+            onClick={handleAvatarClick}
+            className={cn(
+              "w-10 h-10 rounded-full border border-gray-100 dark:border-gray-800 overflow-hidden hover:opacity-80 transition-opacity relative flex-shrink-0",
+              hasActiveStory && "ring-2 ring-yellow-400 ring-offset-2"
+            )}
+            style={
+              hasActiveStory
+                ? { boxShadow: '0 0 0 2px #fff, 0 0 0 6px #facc15' }
+                : undefined
+            }
+            tabIndex={0}
           >
-            <img src={postUser.avatar} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+            <img
+              src={postUser.avatar}
+              alt=""
+              className="w-full h-full object-cover"
+              referrerPolicy="no-referrer"
+            />
           </button>
           <div>
-            <button 
-              onClick={() => navigate('/profile')}
+            {/* USERNAME NAVIGATION */}
+            <button
+              onClick={handleProfileClick}
               className="font-bold text-sm hover:underline hover:text-indigo-600 transition-colors block text-left"
             >
               {postUser.name}
@@ -1059,8 +1383,8 @@ function PostItem({ post, onDelete }: { post: any; onDelete: () => void; key?: R
             <span className="text-[10px] text-gray-400">{postUser.time}</span>
           </div>
         </div>
-        <PostMenu 
-          isMe={postUser.isMe} 
+        <PostMenu
+          isMe={postUser.isMe}
           onDelete={onDelete}
           onEdit={() => setIsEditing(true)}
           onReport={() => alert('Post reported. Thank you for keeping our community safe.')}
@@ -1068,7 +1392,7 @@ function PostItem({ post, onDelete }: { post: any; onDelete: () => void; key?: R
           onCopyLink={handleCopyLink}
         />
       </div>
-      
+
       <div className="px-4 pb-4">
         {isEditing ? (
           <div className="space-y-3 mb-4">
@@ -1079,7 +1403,7 @@ function PostItem({ post, onDelete }: { post: any; onDelete: () => void; key?: R
               placeholder="What's on your mind?"
             />
             <div className="flex justify-end gap-2">
-              <button 
+              <button
                 onClick={() => {
                   setIsEditing(false);
                   setEditContent(post.content);
@@ -1088,7 +1412,7 @@ function PostItem({ post, onDelete }: { post: any; onDelete: () => void; key?: R
               >
                 Cancel
               </button>
-              <button 
+              <button
                 onClick={handleSaveEdit}
                 className="px-4 py-1.5 bg-indigo-600 text-white rounded-lg text-xs font-bold hover:bg-indigo-700 transition-colors shadow-sm"
               >
@@ -1097,27 +1421,50 @@ function PostItem({ post, onDelete }: { post: any; onDelete: () => void; key?: R
             </div>
           </div>
         ) : (
-          <p className="text-sm mb-4">{post.content}</p>
+          <p className="text-sm mb-4">{renderTextWithHashtags(post.content ?? '', navigate)}</p>
         )}
       </div>
 
-      {(post.video_url || post.image_url) && (
-        <div className="px-0">
+      {(videoUrl || imageUrl) && (
+        <div className="px-0 relative">
           <div className="relative overflow-hidden bg-gray-100 dark:bg-gray-800 border-y lg:border lg:rounded-2xl border-gray-100 dark:border-gray-800 aspect-video flex items-center justify-center w-full">
-            {post.video_url ? (
-              <video 
-                src={post.video_url} 
-                controls 
-                className="w-full h-full object-contain bg-black" 
-              />
+            {/* Double tap overlay for video or image */}
+            {videoUrl ? (
+              // Video: autoplay/muted/loop, click = /reels/:id, double tap = like + heart
+              <div className="relative w-full h-full flex items-center justify-center select-none">
+                <video
+                  ref={videoRef}
+                  src={videoUrl}
+                  controls
+                  muted
+                  loop
+                  playsInline
+                  className="w-full h-full object-contain bg-black"
+                  style={{ cursor: "pointer", background: "#000" }}
+                  {...doubleTapHandlers}
+                  onClick={(e) => {
+                    if (e.detail === 1) {
+                      // Wait: will single tap become double? Defer navigation if double tap
+                      setTimeout(() => {
+                        if (!showHeart) handleVideoClick(e);
+                      }, 300); // match double tap delay
+                    }
+                  }}
+                />
+                <HeartOverlay show={showHeart} />
+              </div>
             ) : (
-              <ResponsiveImage 
-                src={post.image_url} 
-                alt="" 
-                width={800}
-                height={450}
-                className="w-full h-full object-cover" 
-              />
+              // Image: use raw URL so Supabase storage works without transform API
+              <div className="relative w-full h-full flex items-center justify-center select-none">
+                <img
+                  src={imageUrl || ''}
+                  alt=""
+                  className="w-full h-full object-cover"
+                  referrerPolicy="no-referrer"
+                  {...doubleTapHandlers}
+                />
+                <HeartOverlay show={showHeart} />
+              </div>
             )}
           </div>
         </div>
@@ -1126,10 +1473,12 @@ function PostItem({ post, onDelete }: { post: any; onDelete: () => void; key?: R
       <div className="p-4">
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-1">
-            <div className={cn(
-              "w-5 h-5 rounded-full flex items-center justify-center text-white transition-colors",
-              isLiked ? "bg-red-500" : "bg-indigo-600"
-            )}>
+            <div
+              className={cn(
+                "w-5 h-5 rounded-full flex items-center justify-center text-white transition-colors",
+                isLiked ? "bg-red-500" : "bg-indigo-600"
+              )}
+            >
               <Heart size={10} fill="white" />
             </div>
             <span className="text-xs text-gray-500">{formatCount(likesCount)}</span>
@@ -1143,24 +1492,24 @@ function PostItem({ post, onDelete }: { post: any; onDelete: () => void; key?: R
         </div>
 
         <div className="flex items-center justify-between pt-4 border-t border-gray-100 dark:border-gray-800">
-          <FeedAction 
-            icon={<Heart size={20} className={cn("transition-colors", isLiked && "text-red-500 fill-red-500")} />} 
-            label="Like" 
+          <FeedAction
+            icon={<Heart size={20} className={cn("transition-colors", isLiked && "text-red-500 fill-red-500")} />}
+            label="Like"
             active={isLiked}
             onClick={handleLike}
           />
-          <FeedAction 
-            icon={<MessageCircle size={20} className={cn("transition-colors", showComments && "text-indigo-600")} />} 
-            label="Comment" 
+          <FeedAction
+            icon={<MessageCircle size={20} className={cn("transition-colors", showComments && "text-indigo-600")} />}
+            label="Comment"
             active={showComments}
             onClick={() => setShowComments(!showComments)}
           />
           <FeedAction icon={<Share2 size={20} />} label="Share" onClick={handleShare} />
-          <FeedAction 
-            icon={<Bookmark size={20} className={cn("transition-colors", isSaved && "text-yellow-500 fill-yellow-500")} />} 
-            label="Save" 
+          <FeedAction
+            icon={<Bookmark size={20} className={cn("transition-colors", isSaved && "text-yellow-500 fill-yellow-500")} />}
+            label="Save"
             active={isSaved}
-            onClick={() => setIsSaved(!isSaved)}
+            onClick={handleSaveToggle}
           />
         </div>
 
@@ -1199,14 +1548,14 @@ function PostItem({ post, onDelete }: { post: any; onDelete: () => void; key?: R
 
                 <form onSubmit={handleAddComment} className="flex items-center gap-2 bg-gray-100 dark:bg-gray-800 rounded-2xl p-1.5">
                   <ResponsiveImage src={profile?.avatar_url || MOCK_USER.avatar} alt="" width={40} height={40} className="w-7 h-7 rounded-full object-cover ml-1" />
-                  <input 
-                    type="text" 
+                  <input
+                    type="text"
                     value={newComment}
                     onChange={(e) => setNewComment(e.target.value)}
-                    placeholder="Write a comment..." 
+                    placeholder="Write a comment..."
                     className="flex-1 bg-transparent border-none focus:ring-0 py-1.5 text-xs"
                   />
-                  <button 
+                  <button
                     type="submit"
                     disabled={!newComment.trim()}
                     className={cn(
@@ -1223,8 +1572,8 @@ function PostItem({ post, onDelete }: { post: any; onDelete: () => void; key?: R
         </AnimatePresence>
       </div>
 
-      <ShareModal 
-        isOpen={isShareModalOpen} 
+      <ShareModal
+        isOpen={isShareModalOpen}
         onClose={() => setIsShareModalOpen(false)}
         onAddStory={() => {
           setIsShareModalOpen(false);
@@ -1233,14 +1582,14 @@ function PostItem({ post, onDelete }: { post: any; onDelete: () => void; key?: R
         postUrl={`${window.location.origin}/post/${post.id}`}
       />
 
-      <StoryEditor 
+      <StoryEditor
         isOpen={isStoryEditorOpen}
         onClose={() => setIsStoryEditorOpen(false)}
         content={{
-          image: post.image_url,
+          image: imageUrl || post.image_url,
           user: {
-            username: (postUser.name || 'user').toLowerCase().replace(' ', '_'),
-            avatar: postUser.avatar
+            username: (postUser.username || 'unknown').toLowerCase().replace(/\s+/g, '_'),
+            avatar: postUser.avatar,
           }
         }}
       />
@@ -1248,19 +1597,28 @@ function PostItem({ post, onDelete }: { post: any; onDelete: () => void; key?: R
   );
 }
 
+// --- PostMenu/MenuButton, RightSidebar, FeedAction, PeopleYouMayKnow, TrendingSection, SuggestedGroups unchanged ---
+
 function PostMenu({ isMe, onEdit, onDelete, onReport, onShare, onCopyLink }: { isMe: boolean; onEdit: () => void; onDelete: () => void; onReport: () => void; onShare: () => void; onCopyLink: () => void }) {
   const [isOpen, setIsOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (!isOpen) return;
-    const handleClick = () => setIsOpen(false);
-    window.addEventListener('click', handleClick);
-    return () => window.removeEventListener('click', handleClick);
+    const handleClickOutside = (e: MouseEvent) => {
+      const el = rootRef.current;
+      if (el && !el.contains(e.target as Node)) {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [isOpen]);
 
   return (
-    <div className="relative" onClick={(e) => e.stopPropagation()}>
-      <button 
+    <div ref={rootRef} className="relative" onClick={(e) => e.stopPropagation()}>
+      <button
+        type="button"
         onClick={() => setIsOpen(!isOpen)}
         className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-full text-gray-400 transition-colors"
       >
@@ -1278,8 +1636,8 @@ function PostMenu({ isMe, onEdit, onDelete, onReport, onShare, onCopyLink }: { i
             <div className="py-1">
               {isMe ? (
                 <>
-                  <MenuButton icon={<Edit2 size={16} />} label="Edit Post" onClick={() => { onEdit(); setIsOpen(false); }} />
-                  <MenuButton icon={<Trash2 size={16} />} label="Delete Post" onClick={() => { onDelete(); setIsOpen(false); }} className="text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20" />
+                  <MenuButton icon={<Edit2 size={16} />} label="Edit Post" onClick={() => { console.log('[PostMenu] Edit Post'); onEdit(); setIsOpen(false); }} />
+                  <MenuButton icon={<Trash2 size={16} />} label="Delete Post" onClick={() => { console.log('[PostMenu] Delete Post'); onDelete(); setIsOpen(false); }} className="text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20" />
                 </>
               ) : (
                 <>
@@ -1298,7 +1656,8 @@ function PostMenu({ isMe, onEdit, onDelete, onReport, onShare, onCopyLink }: { i
 
 function MenuButton({ icon, label, onClick, className }: { icon: React.ReactNode; label: string; onClick: () => void; className?: string }) {
   return (
-    <button 
+    <button
+      type="button"
       onClick={(e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -1327,7 +1686,8 @@ export function RightSidebar() {
 
 function FeedAction({ icon, label, active, onClick }: { icon: React.ReactNode; label: string; active?: boolean; onClick?: () => void }) {
   return (
-    <button 
+    <button
+      type="button"
       onClick={onClick}
       className={cn(
         "flex-1 flex items-center justify-center gap-2 py-2 rounded-xl transition-all text-gray-500",
@@ -1351,23 +1711,19 @@ function PeopleYouMayKnow() {
     const fetchSuggested = async () => {
       if (!user) return;
       try {
-        const { data, error } = await supabase
-          .from('profiles')
-          .select('*')
-          .neq('id', user.id)
-          .limit(3);
-        
-        if (error) throw error;
-        
+        const res = await fetch(`/api/users/suggestions?userId=${encodeURIComponent(user.id)}&limit=3`);
+        if (!res.ok) throw new Error('Failed to fetch suggestions');
+        const data = await res.json();
+
         if (data) {
           setPeople(data);
-          
+
           const { data: followsData } = await supabase
             .from('follows')
             .select('following_id')
             .eq('follower_id', user.id)
             .in('following_id', data.map(p => p.id));
-          
+
           const followingMap: Record<string, boolean> = {};
           followsData?.forEach(f => {
             followingMap[f.following_id] = true;
@@ -1417,20 +1773,20 @@ function PeopleYouMayKnow() {
         {people.map((person) => (
           <div key={person.id} className="flex items-center justify-between">
             <div className="flex items-center gap-3">
-              <button 
-                onClick={() => navigate(`/profile/${person.username}`)}
+              <button
+                onClick={() => navigate(`/profile/${person.id}`)}
                 className="w-10 h-10 rounded-full border border-gray-100 dark:border-gray-800 overflow-hidden hover:opacity-80 transition-opacity"
               >
                 <img src={person.avatar_url || `https://picsum.photos/seed/${person.id}/100/100`} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
               </button>
-              <button 
-                onClick={() => navigate(`/profile/${person.username}`)}
+              <button
+                onClick={() => navigate(`/profile/${person.id}`)}
                 className="text-sm font-bold hover:underline hover:text-indigo-600 transition-colors"
               >
-                {person.full_name || person.username}
+                {resolveProfileUsername(person.username)}
               </button>
             </div>
-            <button 
+            <button
               onClick={() => handleFollow(person.id)}
               className={cn(
                 "text-xs font-bold transition-colors",
@@ -1454,8 +1810,8 @@ function TrendingSection() {
       <h3 className="font-bold text-sm mb-4">Trending</h3>
       <div className="space-y-3">
         {trends.map((trend) => (
-          <button 
-            key={trend} 
+          <button
+            key={trend}
             onClick={() => navigate(`/hashtag/${trend}`)}
             className="block text-indigo-600 text-sm font-bold hover:underline"
           >
@@ -1470,7 +1826,7 @@ function TrendingSection() {
 function SuggestedGroups() {
   const navigate = useNavigate();
   const [joined, setJoined] = useState<Record<string, boolean>>({});
-  
+
   const groups = [
     { id: 'g1', name: 'Photographers', icon: '📸', image: 'https://picsum.photos/seed/photo/400/200' },
     { id: 'g2', name: 'Travelers', icon: '✈️', image: 'https://picsum.photos/seed/travel/400/200' },
@@ -1486,8 +1842,8 @@ function SuggestedGroups() {
       <h3 className="font-bold text-sm mb-4">Suggested Groups</h3>
       <div className="space-y-4">
         {groups.map(group => (
-          <div 
-            key={group.id} 
+          <div
+            key={group.id}
             onClick={() => navigate(`/groups/${group.id}`)}
             className="flex items-center justify-between cursor-pointer group"
           >
@@ -1497,12 +1853,12 @@ function SuggestedGroups() {
               </div>
               <span className="text-sm font-bold group-hover:text-indigo-600 transition-colors">{group.name}</span>
             </div>
-            <button 
+            <button
               onClick={(e) => handleJoin(e, group.id)}
               className={cn(
                 "px-3 py-1 rounded-lg text-xs font-bold transition-all",
-                joined[group.id] 
-                  ? "bg-gray-100 dark:bg-gray-800 text-gray-500" 
+                joined[group.id]
+                  ? "bg-gray-100 dark:bg-gray-800 text-gray-500"
                   : "bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 hover:bg-indigo-100"
               )}
             >

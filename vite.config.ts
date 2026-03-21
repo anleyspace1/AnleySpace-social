@@ -17,8 +17,23 @@ export default defineConfig(({mode}) => {
     },
     server: {
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
-      // Do not modifyâfile watching is disabled to prevent flickering during agent edits.
+      // Do not modify—file watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',
+      // Forward /api to backend; strip Content-Length on multipart so the proxy does not break boundaries.
+      proxy: {
+        '/api': {
+          target: 'http://localhost:3000',
+          changeOrigin: true,
+          secure: false,
+          configure: (proxy) => {
+            proxy.on('proxyReq', (proxyReq, req) => {
+              if (req.headers['content-type']?.includes('multipart/form-data')) {
+                proxyReq.removeHeader('content-length');
+              }
+            });
+          },
+        },
+      },
     },
   };
 });

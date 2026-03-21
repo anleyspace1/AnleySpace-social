@@ -131,17 +131,8 @@ export default function CreateReelPage() {
     setIsUploading(true);
 
     try {
-      // 1. Ensure bucket exists (attempt to create if missing)
-      const { data: buckets } = await supabase.storage.listBuckets();
-      const bucketExists = buckets?.some(b => b.name === 'reels');
-      
-      if (!bucketExists) {
-        await supabase.storage.createBucket('reels', { public: true }).catch(err => {
-          console.warn('Auto-bucket creation failed (expected with anon key):', err);
-        });
-      }
-
-      // 2. Upload to Supabase Storage
+      // Upload directly to the "reels" bucket.
+      // This avoids false negatives when listBuckets is restricted for anon keys.
       const fileName = `${Date.now()}-${file.name.replace(/[^a-zA-Z0-9.]/g, '_')}`;
       const { data: uploadData, error: uploadError } = await supabase.storage
         .from('reels')
@@ -151,17 +142,19 @@ export default function CreateReelPage() {
         });
 
       if (uploadError) {
-        if (uploadError.message.includes('Bucket not found')) {
+        if (uploadError.message.includes('Bucket not found') || uploadError.message.includes('not found')) {
           throw new Error('The "reels" storage bucket was not found in your Supabase project. Please create a public bucket named "reels" in your Supabase Storage dashboard.');
         }
         throw uploadError;
       }
 
+      const uploadedPath = uploadData?.path || fileName;
       const { data: { publicUrl } } = supabase.storage
         .from('reels')
-        .getPublicUrl(fileName);
+        .getPublicUrl(uploadedPath);
+      if (!publicUrl) throw new Error('Failed to generate public URL for uploaded reel');
 
-      // 2. Save to our backend
+      // Save reel metadata to backend
       const response = await fetch('/api/reels', {
         method: 'POST',
         headers: {

@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../lib/supabase';
+import { API_ORIGIN } from '../lib/apiOrigin';
 
 interface StoryEditorProps {
   isOpen: boolean;
@@ -84,7 +85,7 @@ export default function StoryEditor({ isOpen, onClose, onPublished, content }: S
         }
       }
 
-      const response = await fetch('/api/stories', {
+      const response = await fetch(`${API_ORIGIN}/api/stories`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

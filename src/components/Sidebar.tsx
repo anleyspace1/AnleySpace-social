@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { NavLink } from 'react-router-dom';
 import { motion } from 'motion/react';
 import { 
@@ -17,15 +17,63 @@ import { cn } from '../lib/utils';
 import { MOCK_USER } from '../constants';
 import { useAuth } from '../contexts/AuthContext';
 import { ResponsiveImage } from './ResponsiveImage';
+import { supabase } from '../lib/supabase';
 
 export default function Sidebar({ onClose, darkMode, setDarkMode }: { onClose?: () => void; darkMode: boolean; setDarkMode: (val: boolean) => void }) {
-  const { user, profile, signOut } = useAuth();
-  
-  const displayUser = {
-    displayName: profile?.full_name || user?.user_metadata?.full_name || user?.user_metadata?.display_name || 'User',
-    username: profile?.username || user?.user_metadata?.username || user?.email?.split('@')[0] || 'user',
-    avatar: profile?.avatar_url || user?.user_metadata?.avatar_url || user?.user_metadata?.avatar || MOCK_USER.avatar
-  };
+  const { user, signOut } = useAuth();
+  const [displayUser, setDisplayUser] = useState({
+    displayName: 'Unknown User',
+    username: 'Unknown User',
+    avatar: MOCK_USER.avatar as string,
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadProfile = async () => {
+      const { data: authData } = await supabase.auth.getUser();
+      const uid = authData.user?.id;
+      if (!uid) {
+        if (!cancelled) {
+          setDisplayUser({
+            displayName: 'Unknown User',
+            username: 'Unknown User',
+            avatar: MOCK_USER.avatar as string,
+          });
+        }
+        return;
+      }
+
+      const { data: profileRow, error } = await supabase
+        .from('profiles')
+        .select('username, avatar_url')
+        .eq('id', uid)
+        .maybeSingle();
+
+      if (cancelled) return;
+
+      if (error || !profileRow) {
+        setDisplayUser({
+          displayName: 'Unknown User',
+          username: 'Unknown User',
+          avatar: MOCK_USER.avatar as string,
+        });
+        return;
+      }
+
+      const uname = (profileRow.username || '').trim() || 'Unknown User';
+      setDisplayUser({
+        displayName: uname,
+        username: uname,
+        avatar: profileRow.avatar_url || (MOCK_USER.avatar as string),
+      });
+    };
+
+    loadProfile();
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id]);
 
   return (
     <div className="space-y-6">

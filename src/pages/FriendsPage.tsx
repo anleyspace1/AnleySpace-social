@@ -20,12 +20,15 @@ export default function FriendsPage() {
   const [followingStatus, setFollowingStatus] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
-    if (user) {
-      fetchFollowing();
-      fetchFollowers();
-      fetchSuggested();
+    if (!user?.id) {
+      setFollowing([]);
+      setFollowers([]);
+      setLoading(false);
+      return;
     }
-  }, [user]);
+    setLoading(true);
+    Promise.all([fetchFollowing(), fetchFollowers(), fetchSuggested()]).finally(() => setLoading(false));
+  }, [user?.id]);
 
   useEffect(() => {
     if (activeTab === 'suggested' && searchQuery.trim()) {
@@ -38,58 +41,144 @@ export default function FriendsPage() {
     }
   }, [searchQuery, activeTab]);
 
+  const mapProfileRow = (p: any) => ({
+    ...p,
+    full_name: p.full_name || p.display_name || p.username,
+    display_name: p.display_name || p.full_name || p.username,
+  });
+
   const fetchFollowing = async () => {
-    if (!user) return;
+    if (!user?.id) return;
     try {
-      const { data, error } = await supabase
+      const { data: rows, error } = await supabase
         .from('follows')
-        .select(`
-          following_id,
-          profiles:following_id (
-            id,
-            username,
-            full_name,
-            avatar_url,
-            followers_count
-          )
-        `)
+        .select('following_id')
         .eq('follower_id', user.id);
-      
+
+      console.log('[FriendsPage] following: follows table (follower_id = current user)', {
+        rowCount: rows?.length,
+        rows,
+        error: error?.message,
+      });
       if (error) throw error;
-      const followingData = data.map((f: any) => Array.isArray(f.profiles) ? f.profiles[0] : f.profiles).filter(Boolean);
+      const ids = (rows || []).map((r: any) => r.following_id).filter(Boolean);
+      console.log('[FriendsPage] following: ids from follows', ids);
+
+      let followingData: any[] = [];
+      if (ids.length > 0) {
+        const { data: profiles, error: pErr } = await supabase
+          .from('profiles')
+          .select('*')
+          .in('id', ids);
+
+        console.log('[FriendsPage] following: profiles .in(id)', {
+          count: profiles?.length,
+          error: pErr?.message,
+        });
+        if (pErr) throw pErr;
+        followingData = (profiles || []).map(mapProfileRow);
+      }
+
+      if (followingData.length === 0) {
+        const res = await fetch(`/api/users/${encodeURIComponent(user.id)}/following-list`);
+        if (res.ok) {
+          const list = await res.json();
+          followingData = Array.isArray(list) ? list.map(mapProfileRow) : [];
+          console.log('[FriendsPage] following: SQLite API fallback count', followingData.length);
+        }
+      }
+
       setFollowing(followingData);
-      
-      const status: Record<string, boolean> = {};
-      followingData.forEach((f: any) => { status[f.id] = true; });
-      setFollowingStatus(prev => ({ ...prev, ...status }));
+
+      setFollowingStatus((prev) => {
+        const next = { ...prev };
+        followingData.forEach((f: any) => {
+          next[f.id] = true;
+        });
+        return next;
+      });
     } catch (err) {
       console.error('Error fetching following:', err);
-    } finally {
-      setLoading(false);
+      try {
+        const res = await fetch(`/api/users/${encodeURIComponent(user!.id)}/following-list`);
+        if (res.ok) {
+          const list = await res.json();
+          const followingData = Array.isArray(list) ? list.map(mapProfileRow) : [];
+          console.log('[FriendsPage] following: error path SQLite fallback count', followingData.length);
+          setFollowing(followingData);
+          setFollowingStatus((prev) => {
+            const next = { ...prev };
+            followingData.forEach((f: any) => {
+              next[f.id] = true;
+            });
+            return next;
+          });
+          return;
+        }
+      } catch (e) {
+        console.error('Following SQLite fallback failed:', e);
+      }
+      setFollowing([]);
     }
   };
 
   const fetchFollowers = async () => {
-    if (!user) return;
+    if (!user?.id) return;
     try {
-      const { data, error } = await supabase
+      const { data: rows, error } = await supabase
         .from('follows')
-        .select(`
-          follower_id,
-          profiles:follower_id (
-            id,
-            username,
-            full_name,
-            avatar_url,
-            followers_count
-          )
-        `)
+        .select('follower_id')
         .eq('following_id', user.id);
-      
+
+      console.log('[FriendsPage] followers: follows table (following_id = current user)', {
+        rowCount: rows?.length,
+        rows,
+        error: error?.message,
+      });
       if (error) throw error;
-      setFollowers(data.map((f: any) => Array.isArray(f.profiles) ? f.profiles[0] : f.profiles).filter(Boolean));
+      const ids = (rows || []).map((r: any) => r.follower_id).filter(Boolean);
+      console.log('[FriendsPage] followers: ids from follows', ids);
+
+      let followersData: any[] = [];
+      if (ids.length > 0) {
+        const { data: profiles, error: pErr } = await supabase
+          .from('profiles')
+          .select('*')
+          .in('id', ids);
+
+        console.log('[FriendsPage] followers: profiles .in(id)', {
+          count: profiles?.length,
+          error: pErr?.message,
+        });
+        if (pErr) throw pErr;
+        followersData = (profiles || []).map(mapProfileRow);
+      }
+
+      if (followersData.length === 0) {
+        const res = await fetch(`/api/users/${encodeURIComponent(user.id)}/followers-list`);
+        if (res.ok) {
+          const list = await res.json();
+          followersData = Array.isArray(list) ? list.map(mapProfileRow) : [];
+          console.log('[FriendsPage] followers: SQLite API fallback count', followersData.length);
+        }
+      }
+
+      setFollowers(followersData);
     } catch (err) {
       console.error('Error fetching followers:', err);
+      try {
+        const res = await fetch(`/api/users/${encodeURIComponent(user!.id)}/followers-list`);
+        if (res.ok) {
+          const list = await res.json();
+          const followersData = Array.isArray(list) ? list.map(mapProfileRow) : [];
+          console.log('[FriendsPage] followers: error path SQLite fallback count', followersData.length);
+          setFollowers(followersData);
+          return;
+        }
+      } catch (e) {
+        console.error('Followers SQLite fallback failed:', e);
+      }
+      setFollowers([]);
     }
   };
 
@@ -163,11 +252,11 @@ export default function FriendsPage() {
   };
 
   const filteredFollowing = following.filter(f => 
-    (f.display_name || f.username || '').toLowerCase().includes((searchQuery || '').toLowerCase())
+    (f.display_name || f.full_name || f.username || '').toLowerCase().includes((searchQuery || '').toLowerCase())
   );
 
   const filteredFollowers = followers.filter(f => 
-    (f.display_name || f.username || '').toLowerCase().includes((searchQuery || '').toLowerCase())
+    (f.display_name || f.full_name || f.username || '').toLowerCase().includes((searchQuery || '').toLowerCase())
   );
 
   return (

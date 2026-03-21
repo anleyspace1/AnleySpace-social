@@ -220,6 +220,34 @@ db.exec(`
     FOREIGN KEY(user_id) REFERENCES users(id)
   );
 
+  CREATE TABLE IF NOT EXISTS reel_likes (
+    reel_id TEXT,
+    user_id TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (reel_id, user_id),
+    FOREIGN KEY(reel_id) REFERENCES reels(id) ON DELETE CASCADE,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS reel_comments (
+    id TEXT PRIMARY KEY,
+    reel_id TEXT,
+    user_id TEXT,
+    text TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(reel_id) REFERENCES reels(id) ON DELETE CASCADE,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS reel_views (
+    reel_id TEXT,
+    user_id TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (reel_id, user_id),
+    FOREIGN KEY(reel_id) REFERENCES reels(id) ON DELETE CASCADE,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  );
+
   CREATE TABLE IF NOT EXISTS stories (
     id TEXT PRIMARY KEY,
     user_id TEXT,
@@ -229,6 +257,37 @@ db.exec(`
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     expires_at DATETIME,
     FOREIGN KEY(user_id) REFERENCES users(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS story_replies (
+    id TEXT PRIMARY KEY,
+    story_id TEXT NOT NULL,
+    from_user_id TEXT,
+    from_username TEXT,
+    body TEXT NOT NULL,
+    receiver_id TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(story_id) REFERENCES stories(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS story_views (
+    id TEXT PRIMARY KEY,
+    story_id TEXT NOT NULL,
+    viewer_id TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (story_id, viewer_id),
+    FOREIGN KEY(story_id) REFERENCES stories(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS notifications (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    actor_id TEXT,
+    story_id TEXT,
+    message TEXT,
+    read INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 `);
 
@@ -245,6 +304,21 @@ try { db.exec("ALTER TABLE group_messages ADD COLUMN audio_url TEXT"); } catch (
 try { db.exec("ALTER TABLE group_messages ADD COLUMN image_url TEXT"); } catch (e) {}
 try { db.exec("ALTER TABLE groups ADD COLUMN cover_image TEXT"); } catch (e) {}
 try { db.exec("ALTER TABLE calls ADD COLUMN group_id TEXT"); } catch (e) {}
+try { db.exec("ALTER TABLE stories ADD COLUMN media_url TEXT"); } catch (e) {}
+try { db.exec("ALTER TABLE stories ADD COLUMN media_type TEXT"); } catch (e) {}
+try { db.exec("ALTER TABLE story_replies ADD COLUMN receiver_id TEXT"); } catch (e) {}
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS story_views (
+      id TEXT PRIMARY KEY,
+      story_id TEXT NOT NULL,
+      viewer_id TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (story_id, viewer_id),
+      FOREIGN KEY(story_id) REFERENCES stories(id) ON DELETE CASCADE
+    );
+  `);
+} catch (e) {}
 
 // Seed mock groups
 const seedGroup = db.prepare('INSERT OR IGNORE INTO groups (id, name, description, image, type, creator_id) VALUES (?, ?, ?, ?, ?, ?)');

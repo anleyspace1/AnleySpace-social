@@ -24,6 +24,12 @@ import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import { ResponsiveImage } from '../components/ResponsiveImage';
 
+const resolveProfileUsername = (username?: string | null) => {
+  const value = (username || '').trim();
+  if (!value) return 'Unknown User';
+  return value;
+};
+
 // Mock Data
 const LIVE_STREAMS = [
   { id: '1', name: 'GamerMax', viewers: '2.1K', image: 'https://picsum.photos/seed/gamer/400/250', color: 'bg-blue-500', username: 'gamer_max' },
@@ -98,15 +104,10 @@ export default function ExplorePage() {
     if (!searchQuery.trim()) return;
     setSearching(true);
     try {
-      console.log(`DEBUG: Searching for ${searchQuery}`);
-      const { data, error } = await supabase
-        .from('profiles')
-        .select('id, username, display_name, avatar_url')
-        .or(`username.ilike.%${searchQuery}%,display_name.ilike.%${searchQuery}%`)
-        .limit(20);
-
-      if (error) throw error;
-      console.log('DEBUG: Search results:', data);
+      const response = await fetch(`/api/users/search?q=${encodeURIComponent(searchQuery)}`);
+      if (!response.ok) throw new Error('Search request failed');
+      const data = await response.json();
+      console.log('[Explore] /api/users/search sample', Array.isArray(data) ? data.slice(0, 1) : data);
       
       if (data && user) {
         // Check following status for each
@@ -124,7 +125,10 @@ export default function ExplorePage() {
         setFollowing(prev => ({ ...prev, ...followingMap }));
       }
       
-      setRealCreators(data || []);
+      setRealCreators((data || []).map((creator: any) => ({
+        ...creator,
+        username: resolveProfileUsername(creator.username)
+      })));
     } catch (err) {
       console.error('DEBUG: Error searching profiles:', err);
     } finally {
@@ -260,12 +264,12 @@ export default function ExplorePage() {
                       {searchResults.creators.map(creator => (
                         <div 
                           key={creator.id} 
-                          onClick={() => navigate(`/profile/${creator.username}`)}
+                          onClick={() => navigate(`/profile/${creator.id}`)}
                           className="bg-[#1a1c26] p-3 rounded-2xl flex items-center gap-3 group cursor-pointer"
                         >
                           <ResponsiveImage src={creator.avatar_url || `https://picsum.photos/seed/${creator.id}/100/100`} width={40} height={40} className="w-10 h-10 rounded-full object-cover" alt="" />
                           <div className="flex-1">
-                            <h3 className="text-sm font-bold">{creator.display_name || creator.username}</h3>
+                            <h3 className="text-sm font-bold">{resolveProfileUsername(creator.username)}</h3>
                             <p className="text-[10px] text-gray-500">{creator.followers_count || 0} followers</p>
                           </div>
                           <button 

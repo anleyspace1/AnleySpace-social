@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import { User } from '@supabase/supabase-js';
-import { supabase, isSupabaseConfigured } from '../lib/supabase';
+import { supabase, isSupabaseConfigured, invalidateSessionCache } from '../lib/supabase';
 
 interface AuthContextType {
   user: User | null;
@@ -68,17 +68,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    // Check active sessions and sets the user
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setUser(session?.user ?? null);
-      if (session?.user) {
-        fetchProfile(session.user.id);
-      }
-      setLoading(false);
-    });
-
-    // Listen for changes on auth state (logged in, signed out, etc.)
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    // Single auth listener — includes INITIAL_SESSION (avoids a second getSession() racing
+    // onAuthStateChange and reduces duplicate work under React StrictMode).
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((event, session) => {
+      console.log('SUPABASE SESSION CHECK', event, session?.user?.id ?? '(no user)');
       const currentUser = session?.user ?? null;
       setUser(currentUser);
       if (currentUser) {
@@ -94,6 +89,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const signOut = async () => {
     if (!isSupabaseConfigured) return;
+    invalidateSessionCache();
     await supabase.auth.signOut();
   };
 

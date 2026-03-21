@@ -155,10 +155,8 @@ export default function GroupChatPage() {
   };
 
   useEffect(() => {
-    if (socketRef.current && id) {
-      socketRef.current.emit('join_group', id);
-      fetchMessages();
-    }
+    // Load chat history even before the socket is ready.
+    fetchMessages();
   }, [id]);
 
   useEffect(() => {
@@ -178,6 +176,11 @@ export default function GroupChatPage() {
       console.log('DEBUG: Received group history:', history?.length, 'messages');
       setMessages(history || []);
     });
+
+    if (id) {
+      // Join the group room and request history (after listeners are attached).
+      socket.emit('join_group', id);
+    }
 
     socket.on('call:started', (data: any) => {
       // If I'm not in a call, show the incoming call notification or just join
@@ -229,7 +232,7 @@ export default function GroupChatPage() {
     return () => {
       socket.disconnect();
     };
-  }, []);
+  }, [id]);
 
   useEffect(() => {
     fetchGroupInfo();
@@ -273,11 +276,15 @@ export default function GroupChatPage() {
       }
 
       const messageData = {
+        // Server supports both camelCase and snake_case payloads.
+        groupId: id,
+        userId: user.id,
         group_id: id,
         user_id: user.id,
         username: profile?.username || user.email?.split('@')[0],
         text: inputText.trim(),
         type: imageUrl ? 'image' : 'text',
+        imageUrl: imageUrl,
         image_url: imageUrl,
         timestamp: new Date().toISOString()
       };
@@ -382,11 +389,14 @@ export default function GroupChatPage() {
         .getPublicUrl(filePath);
 
       const messageData = {
+        groupId: id,
+        userId: user.id,
         group_id: id,
         user_id: user.id,
         username: profile?.username || user.email?.split('@')[0],
         text: 'Voice message',
         type: 'audio',
+        audioUrl: publicUrl,
         audio_url: publicUrl,
         timestamp: new Date().toISOString()
       };

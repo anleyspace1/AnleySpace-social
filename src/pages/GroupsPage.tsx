@@ -15,6 +15,7 @@ export default function GroupsPage() {
   const [suggestedGroups, setSuggestedGroups] = useState<any[]>([]);
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
+  const [createError, setCreateError] = useState<string | null>(null);
   const navigate = useNavigate();
 
   const fetchGroups = async () => {
@@ -72,20 +73,35 @@ export default function GroupsPage() {
     }
   };
 
+  // Updated handleCreateGroup according to prompt
   const handleCreateGroup = async (groupData: any) => {
     if (!user) return;
+    setCreateError(null);
     try {
       const res = await fetch('/api/groups', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...groupData, creatorId: user.id })
+        body: JSON.stringify({
+          ...groupData,
+          user_id: user.id, // as per prompt: include user_id
+        })
       });
-      if (res.ok) {
-        setIsCreateModalOpen(false);
-        fetchGroups();
+      if (!res.ok) {
+        let msg: string;
+        try {
+          const errData = await res.json();
+          msg = errData?.message || (errData?.error ?? "Failed to create group.");
+        } catch {
+          msg = "Failed to create group.";
+        }
+        setCreateError(msg);
+        return;
       }
+      setIsCreateModalOpen(false);
+      fetchGroups();
     } catch (err) {
       console.error("Error creating group:", err);
+      setCreateError("Unexpected error creating group.");
     }
   };
 
@@ -111,7 +127,7 @@ export default function GroupsPage() {
             </button>
           )}
           <button 
-            onClick={() => setIsCreateModalOpen(true)}
+            onClick={() => { setCreateError(null); setIsCreateModalOpen(true); }}
             className="bg-indigo-600 text-white px-4 py-2 rounded-xl font-bold text-sm shadow-lg shadow-indigo-500/20 flex items-center gap-2 hover:bg-indigo-700 transition-all"
           >
             <Plus size={18} />
@@ -183,6 +199,7 @@ export default function GroupsPage() {
           <CreateGroupModal 
             onClose={() => setIsCreateModalOpen(false)}
             onConfirm={handleCreateGroup}
+            error={createError}
           />
         )}
       </AnimatePresence>
@@ -190,10 +207,26 @@ export default function GroupsPage() {
   );
 }
 
-function CreateGroupModal({ onClose, onConfirm }: { onClose: () => void; onConfirm: (data: any) => void }) {
+function CreateGroupModal({
+  onClose,
+  onConfirm,
+  error,
+}: {
+  onClose: () => void;
+  onConfirm: (data: any) => void;
+  error?: string | null;
+}) {
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [type, setType] = useState<'Public' | 'Private'>('Public');
+  const [pending, setPending] = useState(false);
+
+  const handleSubmit = async () => {
+    if (!name.trim()) return;
+    setPending(true);
+    await onConfirm({ name, description, type });
+    setPending(false);
+  };
 
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
@@ -226,6 +259,7 @@ function CreateGroupModal({ onClose, onConfirm }: { onClose: () => void; onConfi
               onChange={(e) => setName(e.target.value)}
               placeholder="Enter group name"
               className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl py-4 px-4 focus:ring-2 focus:ring-indigo-500 transition-all font-bold"
+              disabled={pending}
             />
           </div>
 
@@ -237,6 +271,7 @@ function CreateGroupModal({ onClose, onConfirm }: { onClose: () => void; onConfi
               placeholder="What is this group about?"
               rows={3}
               className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl py-4 px-4 focus:ring-2 focus:ring-indigo-500 transition-all font-bold resize-none"
+              disabled={pending}
             />
           </div>
 
@@ -249,6 +284,7 @@ function CreateGroupModal({ onClose, onConfirm }: { onClose: () => void; onConfi
                   "py-3 rounded-2xl font-bold border flex items-center justify-center gap-2 transition-all",
                   type === 'Public' ? "bg-indigo-600 border-indigo-600 text-white" : "bg-gray-50 dark:bg-gray-800 border-gray-100 dark:border-gray-700"
                 )}
+                disabled={pending}
               >
                 <Globe size={18} />
                 Public
@@ -259,6 +295,7 @@ function CreateGroupModal({ onClose, onConfirm }: { onClose: () => void; onConfi
                   "py-3 rounded-2xl font-bold border flex items-center justify-center gap-2 transition-all",
                   type === 'Private' ? "bg-indigo-600 border-indigo-600 text-white" : "bg-gray-50 dark:bg-gray-800 border-gray-100 dark:border-gray-700"
                 )}
+                disabled={pending}
               >
                 <Lock size={18} />
                 Private
@@ -266,14 +303,20 @@ function CreateGroupModal({ onClose, onConfirm }: { onClose: () => void; onConfi
             </div>
           </div>
 
+          {error && (
+            <div className="bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200 rounded-xl px-3 py-2 text-xs font-bold mb-1">
+              {error}
+            </div>
+          )}
+
           <motion.button 
             whileHover={{ scale: 1.02 }}
             whileTap={{ scale: 0.98 }}
-            disabled={!name.trim()}
-            onClick={() => onConfirm({ name, description, type })}
+            disabled={!name.trim() || pending}
+            onClick={handleSubmit}
             className="w-full bg-indigo-600 disabled:bg-gray-300 dark:disabled:bg-gray-800 text-white py-4 rounded-2xl font-bold shadow-lg shadow-indigo-500/20 transition-all"
           >
-            Create Group
+            {pending ? 'Creating...' : 'Create Group'}
           </motion.button>
         </div>
       </motion.div>

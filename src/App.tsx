@@ -51,6 +51,7 @@ import HashtagPage from './pages/HashtagPage';
 import NotificationsPage from './pages/NotificationsPage';
 import EditProfilePage from './pages/EditProfilePage';
 import CreateReelPage from './pages/CreateReelPage';
+import StoryPage from './pages/StoryPage';
 import { MOCK_USER } from './constants';
 
 import { AuthProvider, useAuth } from './contexts/AuthContext';
@@ -367,7 +368,7 @@ function AppContent() {
                 <Route path="/saved" element={<ProtectedRoute><SavedPage /></ProtectedRoute>} />
                 <Route path="/messages" element={<ProtectedRoute><MessagesPage /></ProtectedRoute>} />
                 <Route path="/profile" element={<ProtectedRoute><ProfilePage /></ProtectedRoute>} />
-                <Route path="/profile/:username" element={<ProtectedRoute><ProfilePage /></ProtectedRoute>} />
+                <Route path="/profile/:id" element={<ProtectedRoute><ProfilePage /></ProtectedRoute>} />
                 <Route path="/profile/edit" element={<ProtectedRoute><EditProfilePage /></ProtectedRoute>} />
                 <Route path="/wallet" element={<ProtectedRoute><WalletPage /></ProtectedRoute>} />
                 <Route path="/invite" element={<ProtectedRoute><InviteEarnPage /></ProtectedRoute>} />
@@ -378,6 +379,7 @@ function AppContent() {
                 <Route path="/groups/:id" element={<ProtectedRoute><GroupDetailPage /></ProtectedRoute>} />
                 <Route path="/groups/:id/chat" element={<ProtectedRoute><GroupChatPage /></ProtectedRoute>} />
                 <Route path="/hashtag/:tag" element={<ProtectedRoute><HashtagPage /></ProtectedRoute>} />
+                <Route path="/story/:id" element={<ProtectedRoute><StoryPage /></ProtectedRoute>} />
                 <Route path="/notifications" element={<ProtectedRoute><NotificationsPage /></ProtectedRoute>} />
               </Routes>
             </AnimatePresence>
@@ -388,6 +390,7 @@ function AppContent() {
               <Routes>
                 <Route path="/" element={<RightSidebar />} />
                 <Route path="/explore" element={<RightSidebar />} />
+                <Route path="*" element={null} />
               </Routes>
             </div>
           )}

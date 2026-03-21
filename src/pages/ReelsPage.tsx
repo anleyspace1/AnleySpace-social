@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Heart, 
@@ -44,8 +44,15 @@ import ShareModal from '../components/ShareModal';
 import StoryEditor from '../components/StoryEditor';
 import { ResponsiveImage } from '../components/ResponsiveImage';
 
+const resolveProfileUsername = (username?: string | null) => {
+  const value = (username || '').trim();
+  if (!value) return 'Unknown User';
+  return value;
+};
+
 export default function ReelsPage() {
   const navigate = useNavigate();
+  const location = useLocation();
   const { user } = useAuth();
   const [videos, setVideos] = useState(MOCK_VIDEOS.map((v, i) => ({
     ...v,
@@ -57,6 +64,8 @@ export default function ReelsPage() {
   const [activeVideoId, setActiveVideoId] = useState<string | null>(MOCK_VIDEOS[0].id);
   const [preselectedSound, setPreselectedSound] = useState<any>(null);
   const [activeNav, setActiveNav] = useState<string>('for-you');
+  const [reelsLoaded, setReelsLoaded] = useState(false);
+  const feedRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const fetchReels = async () => {
@@ -70,35 +79,98 @@ export default function ReelsPage() {
               url: r.url,
               thumbnail: r.thumbnail,
               user: {
-                username: r.username,
-                avatar: r.avatar || `https://picsum.photos/seed/${r.username}/100/100`
+                username: resolveProfileUsername(r.username),
+                avatar: r.avatar || `https://picsum.photos/seed/${r.user_id || r.id}/100/100`
               },
               caption: r.caption,
-              likes: r.likes,
-              comments: r.comments,
+              likes: r.likes || 0,
+              comments: r.comments || 0,
+              views: r.views || 0,
               shares: r.shares,
               saves: r.saves,
               coins: r.coins,
               sound: r.sound_title ? { title: r.sound_title, artist: r.sound_artist } : null
             }));
             
-            setVideos(prev => {
-              const existingIds = new Set(prev.map(v => v.id));
-              const newReels = formattedReels.filter((r: any) => !existingIds.has(r.id));
-              return [...newReels, ...prev];
-            });
+            setVideos(formattedReels);
           }
         }
       } catch (err) {
         console.error('Failed to fetch reels:', err);
+      } finally {
+        setReelsLoaded(true);
       }
     };
 
     fetchReels();
   }, []);
 
+  useEffect(() => {
+    const state = location.state as any;
+    if (!state || videos.length === 0) return;
+    console.log('[Reels] open state', { videoId: state.videoId, postId: state.postId, index: state.index, videoUrl: state.videoUrl });
+
+    // Primary selection: exact reel id from navigation state.
+    if (state.videoId) {
+      const matched = videos.find((v) => v.id === state.videoId);
+      if (matched) {
+        console.log('[Reels] matched by videoId', { videoId: state.videoId, matchedIndex: videos.findIndex(v => v.id === matched.id) });
+        setActiveVideoId(matched.id);
+        return;
+      }
+
+      // Don't choose a fallback until reels data has been loaded at least once.
+      if (!reelsLoaded) {
+        console.log('[Reels] waiting for reels load before fallback', { videoId: state.videoId, videosCount: videos.length });
+        return;
+      }
+    }
+
+    // Secondary selection: exact video URL from navigation state.
+    if (state.videoUrl) {
+      const normalizeUrl = (url: string) => {
+        try {
+          const parsed = new URL(url);
+          return `${parsed.origin}${parsed.pathname}`;
+        } catch {
+          return url;
+        }
+      };
+      const targetUrl = normalizeUrl(state.videoUrl);
+      const byUrl = videos.find((v) => normalizeUrl(v.url) === targetUrl);
+      if (byUrl) {
+        console.log('[Reels] matched by videoUrl', { videoId: byUrl.id });
+        setActiveVideoId(byUrl.id);
+        return;
+      }
+    }
+
+    // Fallback: index from navigation state.
+    if (typeof state.index === 'number' && state.index >= 0 && state.index < videos.length) {
+      console.log('[Reels] fallback by index', { index: state.index, selectedId: videos[state.index].id });
+      setActiveVideoId(videos[state.index].id);
+    }
+  }, [location.state, videos, reelsLoaded]);
+
+  useEffect(() => {
+    if (!activeVideoId || !feedRef.current) return;
+    const target = feedRef.current.querySelector(`[data-reel-id="${activeVideoId}"]`) as HTMLElement | null;
+    if (target) {
+      target.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    }
+  }, [activeVideoId]);
+
+  const updateVideoCounts = (
+    videoId: string,
+    patch: Partial<{ likes: number; comments: number; views: number }>
+  ) => {
+    setVideos(prev => prev.map(v => (v.id === videoId ? { ...v, ...patch } : v)));
+  };
+
   const handleUpload = (newVideo: any) => {
     setVideos([newVideo, ...videos]);
+    setActiveVideoId(newVideo.id);
+    navigate('/reels');
     setIsUploadModalOpen(false);
     setPreselectedSound(null);
   };
@@ -141,6 +213,13 @@ export default function ReelsPage() {
         </div>
 
         <div className="flex items-center gap-4 w-20 justify-end">
+          <button
+            onClick={() => navigate('/reels/create')}
+            className="text-white/80 hover:text-white transition-colors"
+            title="Create Reel"
+          >
+            <Plus size={22} />
+          </button>
           <button className="text-white/80 hover:text-white transition-colors">
             <Search size={22} />
           </button>
@@ -160,13 +239,14 @@ export default function ReelsPage() {
         <div className={cn(
           "relative flex-1 transition-all duration-500 ease-in-out h-full overflow-y-scroll snap-y snap-mandatory no-scrollbar",
           isCommentsOpen ? "lg:mr-0" : ""
-        )}>
+        )} ref={feedRef}>
           {videos.map((video) => (
-            <div key={video.id} className="h-full w-full snap-start relative">
+            <div key={video.id} data-reel-id={video.id} className="h-full w-full snap-start relative">
               <VideoPost 
                 video={video} 
                 onToggleComments={() => setIsCommentsOpen(!isCommentsOpen)}
                 onActive={() => setActiveVideoId(video.id)}
+                onCountsChange={updateVideoCounts}
                 onUseSound={(sound) => {
                   setPreselectedSound(sound);
                   setIsUploadModalOpen(true);
@@ -184,6 +264,7 @@ export default function ReelsPage() {
           <div className="flex-1 overflow-y-auto no-scrollbar">
             <CommentsSection 
               video={activeVideo} 
+              onCountsChange={updateVideoCounts}
               onClose={() => setIsCommentsOpen(false)} 
             />
             <SuggestedReels videos={videos} onSelect={(id) => setActiveVideoId(id)} />
@@ -203,6 +284,7 @@ export default function ReelsPage() {
           >
             <CommentsSection 
               video={activeVideo} 
+              onCountsChange={updateVideoCounts}
               onClose={() => setIsCommentsOpen(false)} 
             />
           </motion.div>
@@ -227,7 +309,7 @@ export default function ReelsPage() {
 
 function UploadReelModal({ onClose, onUpload, initialSound }: { onClose: () => void; onUpload: (video: any) => void; initialSound?: any }) {
   const navigate = useNavigate();
-  const { user } = useAuth();
+  const { user, profile } = useAuth();
   const [mode, setMode] = useState<'select' | 'record' | 'edit'>('select');
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
@@ -328,34 +410,27 @@ function UploadReelModal({ onClose, onUpload, initialSound }: { onClose: () => v
     setIsUploading(true);
 
     try {
-      // 1. Ensure bucket exists (attempt to create if missing)
-      const { data: buckets } = await supabase.storage.listBuckets();
-      const bucketExists = buckets?.some(b => b.name === 'reels');
-      
-      if (!bucketExists) {
-        await supabase.storage.createBucket('reels', { public: true }).catch(err => {
-          console.warn('Auto-bucket creation failed (expected with anon key):', err);
-        });
-      }
-
-      // 2. Upload to Supabase Storage
+      // Upload directly to the "reels" bucket.
+      // This avoids false negatives when listBuckets is restricted for anon keys.
       const fileName = `${Date.now()}-${file.name.replace(/[^a-zA-Z0-9.]/g, '_')}`;
       const { data: uploadData, error: uploadError } = await supabase.storage
         .from('reels')
         .upload(fileName, file);
 
       if (uploadError) {
-        if (uploadError.message.includes('Bucket not found')) {
+        if (uploadError.message.includes('Bucket not found') || uploadError.message.includes('not found')) {
           throw new Error('The "reels" storage bucket was not found in your Supabase project. Please create a public bucket named "reels" in your Supabase Storage dashboard.');
         }
         throw uploadError;
       }
 
+      const uploadedPath = uploadData?.path || fileName;
       const { data: { publicUrl } } = supabase.storage
         .from('reels')
-        .getPublicUrl(fileName);
+        .getPublicUrl(uploadedPath);
+      if (!publicUrl) throw new Error('Failed to generate public URL for uploaded reel');
 
-      // 2. Save to our backend
+      // Save reel metadata to backend
       const response = await fetch('/api/reels', {
         method: 'POST',
         headers: {
@@ -367,6 +442,8 @@ function UploadReelModal({ onClose, onUpload, initialSound }: { onClose: () => v
           caption,
           soundTitle: selectedSound?.title,
           soundArtist: selectedSound?.artist,
+          username: resolveProfileUsername(profile?.username),
+          avatar: profile?.avatar_url || MOCK_USER.avatar,
         }),
       });
 
@@ -377,12 +454,13 @@ function UploadReelModal({ onClose, onUpload, initialSound }: { onClose: () => v
         id: result.id,
         url: publicUrl,
         user: {
-          username: MOCK_USER.username,
-          avatar: MOCK_USER.avatar
+          username: resolveProfileUsername(profile?.username),
+          avatar: profile?.avatar_url || MOCK_USER.avatar
         },
         caption: caption || 'New Reel!',
         likes: 0,
         comments: 0,
+        views: 0,
         shares: 0,
         saves: 0,
         coins: 0,
@@ -752,8 +830,9 @@ function SoundSelector({ onClose, onSelect, selectedSoundId }: { onClose: () => 
   );
 }
 
-function VideoPost({ video, onToggleComments, onActive, onUseSound }: { video: any; onToggleComments: () => void; onActive: () => void; onUseSound: (sound: any) => void; key?: React.Key }) {
+function VideoPost({ video, onToggleComments, onActive, onUseSound, onCountsChange }: { video: any; onToggleComments: () => void; onActive: () => void; onUseSound: (sound: any) => void; onCountsChange: (videoId: string, patch: Partial<{ likes: number; comments: number; views: number }>) => void; key?: React.Key }) {
   const navigate = useNavigate();
+  const { user } = useAuth();
   const [isPlaying, setIsPlaying] = useState(false);
   const [isLiked, setIsLiked] = useState(false);
   const [isSaved, setIsSaved] = useState(false);
@@ -773,8 +852,26 @@ function VideoPost({ video, onToggleComments, onActive, onUseSound }: { video: a
     { id: 'g6', icon: '🌹', price: 50 },
   ];
 
-  const handleLike = () => {
+  const handleLike = async () => {
+    const userId = user?.id || MOCK_USER.id;
+    const previous = isLiked;
     setIsLiked(!isLiked);
+    try {
+      const response = await fetch(`/api/reels/${video.id}/like`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId })
+      });
+      if (!response.ok) throw new Error('Failed to like reel');
+      const data = await response.json();
+      if (typeof data.likes === 'number') {
+        onCountsChange(video.id, { likes: data.likes });
+      }
+      setIsLiked(!!data.liked);
+    } catch (err) {
+      console.error('Failed to toggle reel like:', err);
+      setIsLiked(previous);
+    }
     const newHearts = Array.from({ length: 5 }).map((_, i) => ({
       id: Date.now() + i,
       x: Math.random() * 60 - 30,
@@ -807,9 +904,21 @@ function VideoPost({ video, onToggleComments, onActive, onUseSound }: { video: a
         entries.forEach(async (entry) => {
           if (entry.isIntersecting) {
             onActive();
+            fetch(`/api/reels/${video.id}/view`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ userId: user?.id })
+            })
+              .then(r => r.ok ? r.json() : null)
+              .then(data => {
+                if (data && typeof data.views === 'number') {
+                  onCountsChange(video.id, { views: data.views });
+                }
+              })
+              .catch(() => {});
             try {
               if (videoRef.current) {
-                videoRef.current.muted = true;
+                videoRef.current.muted = false;
                 await videoRef.current.play();
                 setIsPlaying(true);
               }
@@ -827,7 +936,7 @@ function VideoPost({ video, onToggleComments, onActive, onUseSound }: { video: a
 
     if (videoRef.current) observer.observe(videoRef.current);
     return () => observer.disconnect();
-  }, []);
+  }, [onActive, onCountsChange, user?.id, video.id]);
 
   return (
     <div className="relative h-full w-full bg-black overflow-hidden group">
@@ -836,8 +945,9 @@ function VideoPost({ video, onToggleComments, onActive, onUseSound }: { video: a
         ref={videoRef}
         src={video.url}
         className="h-full w-full object-cover"
+        controls
         loop
-        muted
+        muted={false}
         playsInline
         onClick={togglePlay}
       />
@@ -852,7 +962,7 @@ function VideoPost({ video, onToggleComments, onActive, onUseSound }: { video: a
             <div className="w-1.5 h-1.5 bg-white rounded-full animate-pulse" />
             LIVE
           </div>
-          <span className="text-white text-[10px] font-bold drop-shadow-md">{video.viewerCount} views</span>
+          <span className="text-white text-[10px] font-bold drop-shadow-md">{video.views || video.viewerCount || 0} views</span>
         </div>
       )}
 
@@ -860,12 +970,12 @@ function VideoPost({ video, onToggleComments, onActive, onUseSound }: { video: a
       <div className="absolute right-4 top-1/2 -translate-y-1/2 flex flex-col items-center gap-6 z-10">
         <ActionButton 
           icon={<Heart className={cn("transition-all duration-300", isLiked ? "text-red-500 fill-red-500 scale-125" : "text-white")} size={30} />} 
-          label={isLiked ? "15.3K" : "15.2K"}
+          label={video.likes || 0}
           onClick={handleLike}
         />
         <ActionButton 
           icon={<MessageCircle className="text-white" size={30} />} 
-          label="620" 
+          label={video.comments || 0} 
           onClick={onToggleComments}
         />
         <ActionButton 
@@ -943,7 +1053,9 @@ function VideoPost({ video, onToggleComments, onActive, onUseSound }: { video: a
 
           <div className="flex items-center gap-2 bg-white/5 backdrop-blur-md w-fit px-3 py-1.5 rounded-full border border-white/10">
             <Music size={12} className="text-white animate-spin-slow" />
-            <span className="text-white text-[10px] font-bold">Party Time Remix</span>
+              <span className="text-white text-[10px] font-bold">
+                {video.sound?.title || 'Original Audio'}
+              </span>
           </div>
         </div>
       </div>
@@ -1089,27 +1201,84 @@ function SuggestedReels({ videos, onSelect }: { videos: any[]; onSelect: (id: st
   );
 }
 
-function CommentsSection({ video, onClose }: { video: any; onClose: () => void }) {
-  const [comments, setComments] = useState([
-    { id: 1, user: 'alexinho22', text: 'This looks so fun! 😂', avatar: 'https://picsum.photos/seed/alex/100/100', time: '2m', likes: '1.2K' },
-    { id: 2, user: 'sunshine_20', text: 'Love your hat! 🤠✨', avatar: 'https://picsum.photos/seed/sun/100/100', time: '5m', likes: '1.2K' },
-    { id: 3, user: 'david_gamer', text: 'Crazy moment! 🚀', avatar: 'https://picsum.photos/seed/david/100/100', time: '10m', likes: '499' },
-  ]);
+function CommentsSection({ video, onClose, onCountsChange }: { video: any; onClose: () => void; onCountsChange: (videoId: string, patch: Partial<{ likes: number; comments: number; views: number }>) => void }) {
+  const { user, profile } = useAuth();
+  const [comments, setComments] = useState<any[]>([]);
   const [newComment, setNewComment] = useState('');
 
-  const handleAddComment = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newComment.trim()) return;
-    const comment = {
-      id: Date.now(),
-      user: MOCK_USER.username,
-      text: newComment,
-      avatar: MOCK_USER.avatar,
-      time: 'now',
-      likes: '0'
+  useEffect(() => {
+    const loadComments = async () => {
+      if (!video?.id) return;
+      try {
+        const res = await fetch(`/api/reels/${video.id}/comments`);
+        if (!res.ok) return;
+        const data = await res.json();
+        setComments((data || []).map((c: any) => ({
+          id: c.id,
+          user: resolveProfileUsername(c.username),
+          text: c.text,
+          avatar: c.avatar || `https://picsum.photos/seed/${c.user_id}/100/100`,
+          time: c.created_at ? new Date(c.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'now',
+          likes: '0'
+        })));
+      } catch (err) {
+        console.error('Failed to fetch reel comments:', err);
+      }
     };
-    setComments([comment, ...comments]);
+    loadComments();
+  }, [video?.id]);
+
+  const handleAddComment = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!user?.id || !video?.id) {
+      console.error('Cannot post comment: missing authenticated user or reel id', { userId: user?.id, reelId: video?.id });
+      return;
+    }
+    if (!newComment.trim()) return;
+    const text = newComment.trim();
     setNewComment('');
+    try {
+      const res = await fetch(`/api/reels/${video.id}/comments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: user.id,
+          user_id: user.id,
+          reel_id: video.id,
+          content: text,
+          username: resolveProfileUsername(profile?.username),
+          avatar: profile?.avatar_url || MOCK_USER.avatar,
+          text
+        })
+      });
+      if (!res.ok) throw new Error('Failed to save comment');
+      const data = await res.json();
+      if (Array.isArray(data?.commentsList)) {
+        setComments(data.commentsList.map((c: any) => ({
+          id: c.id,
+          user: resolveProfileUsername(c.username),
+          text: c.text,
+          avatar: c.avatar || `https://picsum.photos/seed/${c.user_id}/100/100`,
+          time: c.created_at ? new Date(c.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'now',
+          likes: '0'
+        })));
+      } else if (data?.comment) {
+        setComments(prev => [{
+          id: data.comment.id,
+          user: resolveProfileUsername(data.comment.username || profile?.username),
+          text: data.comment.text,
+          avatar: data.comment.avatar || profile?.avatar_url || MOCK_USER.avatar,
+          time: 'now',
+          likes: '0'
+        }, ...prev]);
+      }
+      if (typeof data?.comments === 'number') {
+        onCountsChange(video.id, { comments: data.comments });
+      }
+    } catch (err) {
+      console.error('Failed to add reel comment:', err);
+      setNewComment(text);
+    }
   };
 
   return (
