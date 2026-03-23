@@ -46,7 +46,7 @@ import { ResponsiveImage } from '../components/ResponsiveImage';
 
 const resolveProfileUsername = (username?: string | null) => {
   const value = (username || '').trim();
-  if (!value) return 'Unknown User';
+  if (!value) return 'User';
   return value;
 };
 

@@ -77,10 +77,7 @@ export default function StoryPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const selectedUserId = (location.state as { userId?: string; storyIndex?: string } | null)?.userId;
-  const effectiveUserId =
-    selectedUserId && id && String(selectedUserId).trim() === String(id).trim()
-      ? String(selectedUserId).trim()
-      : undefined;
+  const effectiveUserId = selectedUserId ? String(selectedUserId).trim() : undefined;
   const { user, profile } = useAuth();
   const skipResetAfterOpenLastRef = useRef(false);
   /** Synchronous guard so two submits in the same tick cannot both call fetch before replySending updates. */
@@ -120,6 +117,12 @@ export default function StoryPage() {
     }
     if (skipResetAfterOpenLastRef.current) {
       skipResetAfterOpenLastRef.current = false;
+      return;
+    }
+    // Route param `id` may be a story UUID (e.g. from Messages) — open that slide, not the first.
+    const storyIdx = stories.findIndex((s: any) => String(s?.id ?? '') === String(id ?? ''));
+    if (storyIdx >= 0) {
+      setCurrentIndex(storyIdx);
       return;
     }
     setCurrentIndex(0);
@@ -252,10 +255,13 @@ export default function StoryPage() {
         } else {
           const byStoryId = validStories.find((s: any) => s.id === id);
           if (byStoryId && byStoryId.user_id) {
-            matched = validStories.filter((s: any) => s.user_id === byStoryId.user_id);
-          } else {
             matched = validStories.filter(
-              (s: any) => s.user_id === id || s.username === id
+              (s: any) => String(s.user_id || '').trim() === String(byStoryId.user_id).trim()
+            );
+          } else {
+            // Match by author id only (no username fallback — avoids wrong stories).
+            matched = validStories.filter(
+              (s: any) => String(s.user_id || '').trim() === String(id || '').trim()
             );
           }
         }

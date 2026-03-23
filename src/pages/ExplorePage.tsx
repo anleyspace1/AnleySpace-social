@@ -20,14 +20,21 @@ import {
 } from 'lucide-react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { cn } from '../lib/utils';
+import { API_ORIGIN } from '../lib/apiOrigin';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import { ResponsiveImage } from '../components/ResponsiveImage';
 
 const resolveProfileUsername = (username?: string | null) => {
   const value = (username || '').trim();
-  if (!value) return 'Unknown User';
+  if (!value) return 'User';
   return value;
+};
+
+const resolveCreatorDisplayName = (profile: { display_name?: string | null; username?: string | null }) => {
+  const displayName = String(profile?.display_name || '').trim();
+  if (displayName && !displayName.toLowerCase().startsWith('user_')) return displayName;
+  return resolveProfileUsername(profile?.username);
 };
 
 // Mock Data
@@ -160,7 +167,7 @@ export default function ExplorePage() {
     setFollowing(prev => ({ ...prev, [creatorId]: !wasFollowing }));
 
     try {
-      const endpoint = wasFollowing ? '/api/users/unfollow' : '/api/users/follow';
+      const endpoint = wasFollowing ? `${API_ORIGIN}/api/users/unfollow` : `${API_ORIGIN}/api/users/follow`;
       const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -176,7 +183,10 @@ export default function ExplorePage() {
       if (wasFollowing) {
         await supabase.from('follows').delete().eq('follower_id', user.id).eq('following_id', creatorId);
       } else {
-        await supabase.from('follows').insert({ follower_id: user.id, following_id: creatorId });
+        const { error: followInsertErr } = await supabase
+          .from('follows')
+          .insert({ follower_id: user.id, following_id: creatorId });
+        if (followInsertErr && followInsertErr.code !== '23505') throw followInsertErr;
       }
     } catch (err) {
       console.error('Error toggling follow:', err);
@@ -269,7 +279,7 @@ export default function ExplorePage() {
                         >
                           <ResponsiveImage src={creator.avatar_url || `https://picsum.photos/seed/${creator.id}/100/100`} width={40} height={40} className="w-10 h-10 rounded-full object-cover" alt="" />
                           <div className="flex-1">
-                            <h3 className="text-sm font-bold">{resolveProfileUsername(creator.username)}</h3>
+                            <h3 className="text-sm font-bold">{resolveCreatorDisplayName(creator)}</h3>
                             <p className="text-[10px] text-gray-500">{creator.followers_count || 0} followers</p>
                           </div>
                           <button 

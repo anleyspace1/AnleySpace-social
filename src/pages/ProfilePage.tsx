@@ -28,6 +28,7 @@ import { NavLink, useParams, useNavigate, useSearchParams } from 'react-router-d
 import { MOCK_USER, MOCK_VIDEOS } from '../constants';
 import { cn } from '../lib/utils';
 import { Post, Video } from '../types';
+import { API_ORIGIN } from '../lib/apiOrigin';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import ShareModal from '../components/ShareModal';
@@ -89,13 +90,14 @@ export default function ProfilePage() {
 
         const formattedProfile = {
           id: profileData.id,
-          username: profileData.username,
-          displayName: profileData.display_name || profileData.username,
+          username: profileData.username || profileData.display_name || profileData.email?.split('@')[0] || `user_${String(profileData.id || '').slice(0, 6)}`,
+          displayName: profileData.display_name || profileData.username || profileData.email?.split('@')[0] || 'User',
           avatar: profileData.avatar_url || `https://picsum.photos/seed/${profileData.id}/200/200`,
           bio: localData.bio || profileData.bio || 'Digital creator and enthusiast. Sharing my journey on AnleySpace! ✨',
           coins: profileData.coins || 0,
-          followers: localData.followers_count || 0,
-          following: localData.following_count || 0,
+          // Counts are sourced from follows table via refreshFollowCounts().
+          followers: 0,
+          following: 0,
           isVerified: profileData.is_verified || false,
         };
         setUserProfile(formattedProfile);
@@ -211,8 +213,8 @@ export default function ProfilePage() {
   }, [user?.id, isOwnProfile]);
 
   const displayUser = userProfile || {
-    username: 'Unknown User',
-    displayName: 'Unknown User',
+    username: myProfile?.username || user?.email?.split('@')[0] || `user_${String(profileIdParam || user?.id || 'user').slice(0, 6)}`,
+    displayName: myProfile?.display_name || myProfile?.full_name || myProfile?.username || user?.email?.split('@')[0] || 'User',
     avatar: `https://picsum.photos/seed/${profileIdParam || 'unknown-user'}/200/200`,
     bio: '',
     coins: 0,
@@ -236,12 +238,42 @@ export default function ProfilePage() {
   const [followingCount, setFollowingCount] = useState(0);
   const [isFollowersModalOpen, setIsFollowersModalOpen] = useState(false);
   const [isFollowingModalOpen, setIsFollowingModalOpen] = useState(false);
-  const [isStoryOpen, setIsStoryOpen] = useState(false);
   const [isVerified, setIsVerified] = useState(false);
   const [isVerifying, setIsVerifying] = useState(false);
   const [activeTab, setActiveTab] = useState<'Posts' | 'Videos' | 'Saved'>('Posts');
   const [selectedPost, setSelectedPost] = useState<Post | null>(null);
   const [selectedVideo, setSelectedVideo] = useState<Video | null>(null);
+
+  const refreshFollowCounts = useCallback(async (profileId: string) => {
+    if (!profileId) return;
+    try {
+      const [{ data: followersRows, error: followersErr }, { data: followingRows, error: followingErr }] = await Promise.all([
+        supabase
+          .from('follows')
+          .select('follower_id')
+          .eq('following_id', profileId),
+        supabase
+          .from('follows')
+          .select('following_id')
+          .eq('follower_id', profileId),
+      ]);
+
+      if (followersErr) throw followersErr;
+      if (followingErr) throw followingErr;
+
+      const nextFollowers = new Set((followersRows || []).map((r: any) => String(r?.follower_id || '').trim()).filter(Boolean)).size;
+      const nextFollowing = new Set((followingRows || []).map((r: any) => String(r?.following_id || '').trim()).filter(Boolean)).size;
+      console.log('[ProfilePage] DB follow counts', {
+        profileId,
+        followersDb: nextFollowers,
+        followingDb: nextFollowing,
+      });
+      setFollowersCount(nextFollowers);
+      setFollowingCount(nextFollowing);
+    } catch (err) {
+      console.error('[ProfilePage] refreshFollowCounts failed:', err);
+    }
+  }, []);
 
   useEffect(() => {
     if (activeTab === 'Saved' && isOwnProfile && user?.id) {
@@ -251,14 +283,13 @@ export default function ProfilePage() {
 
   useEffect(() => {
     if (userProfile) {
-      setFollowersCount(userProfile.followers);
-      setFollowingCount(userProfile.following);
+      void refreshFollowCounts(userProfile.id);
       setIsVerified(userProfile.isVerified);
       if (user && userProfile.id !== user.id) {
         checkIfFollowing();
       }
     }
-  }, [userProfile, user]);
+  }, [userProfile, user, refreshFollowCounts]);
 
   const checkIfFollowing = async () => {
     if (!user || !userProfile) return;
@@ -279,10 +310,8 @@ export default function ProfilePage() {
 
     const wasFollowing = isFollowing;
     setIsFollowing(!wasFollowing);
-    setFollowersCount(prev => wasFollowing ? Math.max(0, prev - 1) : prev + 1);
-
     try {
-      const endpoint = wasFollowing ? '/api/users/unfollow' : '/api/users/follow';
+      const endpoint = wasFollowing ? `${API_ORIGIN}/api/users/unfollow` : `${API_ORIGIN}/api/users/follow`;
       const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -298,12 +327,16 @@ export default function ProfilePage() {
       if (wasFollowing) {
         await supabase.from('follows').delete().eq('follower_id', user.id).eq('following_id', userProfile.id);
       } else {
-        await supabase.from('follows').insert({ follower_id: user.id, following_id: userProfile.id });
+        const { error: followInsertErr } = await supabase
+          .from('follows')
+          .insert({ follower_id: user.id, following_id: userProfile.id });
+        if (followInsertErr && followInsertErr.code !== '23505') throw followInsertErr;
       }
+      await refreshFollowCounts(userProfile.id);
     } catch (err) {
       console.error('Error toggling follow:', err);
       setIsFollowing(wasFollowing);
-      setFollowersCount(prev => wasFollowing ? prev + 1 : Math.max(0, prev - 1));
+      await refreshFollowCounts(userProfile.id);
     }
   };
 
@@ -326,6 +359,13 @@ export default function ProfilePage() {
   const [followersList, setFollowersList] = useState<any[]>([]);
   const [followingList, setFollowingList] = useState<any[]>([]);
   const [loadingList, setLoadingList] = useState(false);
+  const mapModalProfile = (p: any, myFollowingIds: string[]) => ({
+    id: p.id,
+    username: p.username || p.id,
+    name: p.full_name || p.display_name || p.username,
+    avatar: p.avatar_url || `https://picsum.photos/seed/${p.id}/100/100`,
+    isFollowing: myFollowingIds.includes(p.id),
+  });
 
   useEffect(() => {
     if (isFollowersModalOpen) {
@@ -343,22 +383,27 @@ export default function ProfilePage() {
     if (!userProfile) return;
     setLoadingList(true);
     try {
-      const { data, error } = await supabase
+      const { data: rows, error } = await supabase
         .from('follows')
-        .select(`
-          follower_id,
-          profiles:follower_id (
-            id,
-            username,
-            full_name,
-            avatar_url
-          )
-        `)
+        .select('follower_id')
         .eq('following_id', userProfile.id);
+      console.log("FOLLOWERS QUERY", userProfile.id, rows);
       
       if (error) throw error;
-      
-      const followers = data.map((f: any) => Array.isArray(f.profiles) ? f.profiles[0] : f.profiles).filter(Boolean);
+      const followerIds = Array.from(
+        new Set((rows || []).map((f: any) => f.follower_id).filter(Boolean))
+      );
+
+      if (followerIds.length === 0) {
+        setFollowersList([]);
+        return;
+      }
+
+      const { data: profiles, error: profilesErr } = await supabase
+        .from('profiles')
+        .select('id, username, full_name, display_name, avatar_url')
+        .in('id', followerIds);
+      if (profilesErr) throw profilesErr;
       
       let followingIds: string[] = [];
       if (user) {
@@ -369,15 +414,43 @@ export default function ProfilePage() {
         followingIds = myFollowing?.map(f => f.following_id) || [];
       }
 
-      setFollowersList(followers.map(p => ({
-        id: p.id,
-        username: p.username,
-        name: p.full_name || p.username,
-        avatar: p.avatar_url || `https://picsum.photos/seed/${p.id}/100/100`,
-        isFollowing: followingIds.includes(p.id)
-      })).filter((v, i, a) => a.findIndex(t => t.id === v.id) === i));
+      let resolvedProfiles = profiles || [];
+      // Keep profile counts/list source consistent: if Supabase rows are empty, fallback to local API list.
+      if (resolvedProfiles.length === 0) {
+        const res = await fetch(`${API_ORIGIN}/api/users/${encodeURIComponent(userProfile.id)}/followers-list`);
+        if (res.ok) {
+          const list = await res.json();
+          resolvedProfiles = Array.isArray(list) ? list : [];
+        }
+      }
+
+      setFollowersList(resolvedProfiles
+        .map((p: any) => mapModalProfile(p, followingIds))
+        .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i));
     } catch (err) {
       console.error('Error fetching followers:', err);
+      try {
+        const res = await fetch(`${API_ORIGIN}/api/users/${encodeURIComponent(userProfile.id)}/followers-list`);
+        if (res.ok) {
+          const list = await res.json();
+          let followingIds: string[] = [];
+          if (user) {
+            const { data: myFollowing } = await supabase
+              .from('follows')
+              .select('following_id')
+              .eq('follower_id', user.id);
+            followingIds = myFollowing?.map(f => f.following_id) || [];
+          }
+          const fallbackProfiles = Array.isArray(list) ? list : [];
+          setFollowersList(fallbackProfiles
+            .map((p: any) => mapModalProfile(p, followingIds))
+            .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i));
+          return;
+        }
+      } catch (fallbackErr) {
+        console.error('Error fetching followers fallback:', fallbackErr);
+      }
+      setFollowersList([]);
     } finally {
       setLoadingList(false);
     }
@@ -387,22 +460,26 @@ export default function ProfilePage() {
     if (!userProfile) return;
     setLoadingList(true);
     try {
-      const { data, error } = await supabase
+      const { data: rows, error } = await supabase
         .from('follows')
-        .select(`
-          following_id,
-          profiles:following_id (
-            id,
-            username,
-            full_name,
-            avatar_url
-          )
-        `)
+        .select('following_id')
         .eq('follower_id', userProfile.id);
       
       if (error) throw error;
-      
-      const following = data.map((f: any) => Array.isArray(f.profiles) ? f.profiles[0] : f.profiles).filter(Boolean);
+      const followedIds = Array.from(
+        new Set((rows || []).map((f: any) => f.following_id).filter(Boolean))
+      );
+
+      if (followedIds.length === 0) {
+        setFollowingList([]);
+        return;
+      }
+
+      const { data: profiles, error: profilesErr } = await supabase
+        .from('profiles')
+        .select('id, username, full_name, display_name, avatar_url')
+        .in('id', followedIds);
+      if (profilesErr) throw profilesErr;
       
       let myFollowingIds: string[] = [];
       if (user) {
@@ -413,51 +490,137 @@ export default function ProfilePage() {
         myFollowingIds = myFollowing?.map(f => f.following_id) || [];
       }
 
-      setFollowingList(following.map(p => ({
-        id: p.id,
-        username: p.username,
-        name: p.full_name || p.username,
-        avatar: p.avatar_url || `https://picsum.photos/seed/${p.id}/100/100`,
-        isFollowing: myFollowingIds.includes(p.id)
-      })).filter((v, i, a) => a.findIndex(t => t.id === v.id) === i));
+      let resolvedProfiles = profiles || [];
+      // Keep profile counts/list source consistent: if Supabase rows are empty, fallback to local API list.
+      if (resolvedProfiles.length === 0) {
+        const res = await fetch(`${API_ORIGIN}/api/users/${encodeURIComponent(userProfile.id)}/following-list`);
+        if (res.ok) {
+          const list = await res.json();
+          resolvedProfiles = Array.isArray(list) ? list : [];
+        }
+      }
+
+      setFollowingList(resolvedProfiles
+        .map((p: any) => mapModalProfile(p, myFollowingIds))
+        .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i));
     } catch (err) {
       console.error('Error fetching following:', err);
+      try {
+        const res = await fetch(`${API_ORIGIN}/api/users/${encodeURIComponent(userProfile.id)}/following-list`);
+        if (res.ok) {
+          const list = await res.json();
+          let myFollowingIds: string[] = [];
+          if (user) {
+            const { data: myFollowing } = await supabase
+              .from('follows')
+              .select('following_id')
+              .eq('follower_id', user.id);
+            myFollowingIds = myFollowing?.map(f => f.following_id) || [];
+          }
+          const fallbackProfiles = Array.isArray(list) ? list : [];
+          setFollowingList(fallbackProfiles
+            .map((p: any) => mapModalProfile(p, myFollowingIds))
+            .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i));
+          return;
+        }
+      } catch (fallbackErr) {
+        console.error('Error fetching following fallback:', fallbackErr);
+      }
+      setFollowingList([]);
     } finally {
       setLoadingList(false);
     }
   };
 
-  const handleToggleFollowUser = async (targetUserId: string) => {
+  const handleToggleFollowUser = async (targetUserId: string, mode?: 'followers' | 'following') => {
     if (!user) return;
     
     const targetInFollowers = followersList.find(u => u.id === targetUserId);
     const targetInFollowing = followingList.find(u => u.id === targetUserId);
-    const target = targetInFollowers || targetInFollowing;
+    const target = mode === 'following'
+      ? targetInFollowing
+      : (targetInFollowers || targetInFollowing);
     
     if (!target) return;
 
-    const wasFollowing = target.isFollowing;
-    
+    const shouldUnfollow = mode === 'following' ? true : Boolean(target.isFollowing);
+    const prevFollowersList = followersList;
+    const prevFollowingList = followingList;
+
     // Optimistic update
-    const updateList = (list: any[]) => list.map(u => u.id === targetUserId ? { ...u, isFollowing: !wasFollowing } : u);
-    setFollowersList(updateList);
-    setFollowingList(updateList);
+    if (mode === 'following') {
+      setFollowingList(prev => prev.filter(u => u.id !== targetUserId));
+      setFollowersList(prev => prev.map(u => u.id === targetUserId ? { ...u, isFollowing: false } : u));
+    } else {
+      const updateList = (list: any[]) =>
+        list.map(u => u.id === targetUserId ? { ...u, isFollowing: !shouldUnfollow } : u);
+      setFollowersList(updateList);
+      setFollowingList(updateList);
+    }
 
     try {
-      if (wasFollowing) {
+      if (shouldUnfollow) {
         await supabase.from('follows').delete().eq('follower_id', user.id).eq('following_id', targetUserId);
       } else {
-        await supabase.from('follows').insert({ follower_id: user.id, following_id: targetUserId });
+        const { error: followInsertErr } = await supabase
+          .from('follows')
+          .insert({ follower_id: user.id, following_id: targetUserId });
+        if (followInsertErr && followInsertErr.code !== '23505') throw followInsertErr;
       }
-      
-      if (isOwnProfile) {
-        setFollowingCount(prev => wasFollowing ? prev - 1 : prev + 1);
+
+      if (userProfile?.id) {
+        await refreshFollowCounts(userProfile.id);
       }
     } catch (err) {
       console.error('Error toggling follow in list:', err);
-      const rollbackList = (list: any[]) => list.map(u => u.id === targetUserId ? { ...u, isFollowing: wasFollowing } : u);
-      setFollowersList(rollbackList);
-      setFollowingList(rollbackList);
+      setFollowersList(prevFollowersList);
+      setFollowingList(prevFollowingList);
+      if (userProfile?.id) {
+        await refreshFollowCounts(userProfile.id);
+      }
+    }
+  };
+
+  const handleOpenMessage = async () => {
+    if (!user || isOwnProfile || !displayUser?.id) return;
+    const currentUserId = user.id;
+    const targetUserId = String(displayUser.id).trim();
+    if (!targetUserId) return;
+
+    try {
+      // Check whether a thread already exists between both users.
+      const { data: existingMessages, error } = await supabase
+        .from('messages')
+        .select('id')
+        .or(
+          `and(sender_id.eq.${currentUserId},receiver_id.eq.${targetUserId}),and(sender_id.eq.${targetUserId},receiver_id.eq.${currentUserId})`
+        )
+        .limit(1);
+      if (error) throw error;
+
+      // No existing thread yet: ensure target user is present in local cache so Messages page can open immediately.
+      if (!existingMessages || existingMessages.length === 0) {
+        try {
+          await fetch('/api/users/sync', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              id: targetUserId,
+              username: displayUser.username || targetUserId,
+              full_name: displayUser.displayName || displayUser.username || null,
+              avatar: displayUser.avatar || null,
+            }),
+          });
+        } catch (syncErr) {
+          console.warn('Message sync fallback failed:', syncErr);
+        }
+      }
+
+      navigate(`/messages?userId=${encodeURIComponent(targetUserId)}`);
+    } catch (err) {
+      console.error('Error opening message thread:', err);
+      // Safe fallback: still open Messages page to avoid dead-end click.
+      navigate(`/messages?userId=${encodeURIComponent(targetUserId)}`);
     }
   };
 
@@ -489,7 +652,12 @@ export default function ProfilePage() {
       <div className="flex flex-col md:flex-row items-center md:items-start gap-8 mb-12 px-4 lg:px-0 pt-4 lg:pt-0">
         <div className="relative">
           <div 
-            onClick={() => setIsStoryOpen(true)}
+            onClick={() => {
+              const uid = userProfile?.id || profileIdParam || user?.id;
+              if (!uid) return;
+              const userId = String(uid).trim();
+              navigate(`/story/${encodeURIComponent(userId)}`, { state: { userId } });
+            }}
             className="w-32 h-32 md:w-40 md:h-40 rounded-full p-1 bg-gradient-to-tr from-yellow-400 via-red-500 to-purple-600 cursor-pointer hover:scale-105 transition-transform active:scale-95 group"
           >
             <div className="w-full h-full rounded-full border-4 border-white dark:border-black overflow-hidden relative">
@@ -548,7 +716,7 @@ export default function ProfilePage() {
                     {isFollowing ? 'Following' : 'Follow'}
                   </button>
                   <button 
-                    onClick={() => navigate(`/messages?user=${displayUser.username}`)}
+                    onClick={handleOpenMessage}
                     className="bg-gray-100 dark:bg-gray-900 px-6 py-2 rounded-xl font-bold hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors flex items-center gap-2"
                   >
                     <MessageCircle size={18} />
@@ -698,6 +866,7 @@ export default function ProfilePage() {
         {(isFollowersModalOpen || isFollowingModalOpen) && (
           <UserListModal 
             title={isFollowersModalOpen ? "Followers" : "Following"}
+            mode={isFollowersModalOpen ? "followers" : "following"}
             users={isFollowersModalOpen ? followersList : followingList}
             onToggleFollow={handleToggleFollowUser}
             loading={loadingList}
@@ -705,12 +874,6 @@ export default function ProfilePage() {
               setIsFollowersModalOpen(false);
               setIsFollowingModalOpen(false);
             }}
-          />
-        )}
-        {isStoryOpen && (
-          <StoryViewerModal 
-            user={displayUser} 
-            onClose={() => setIsStoryOpen(false)} 
           />
         )}
       </AnimatePresence>
@@ -737,7 +900,7 @@ function Stat({ label, value, icon, onClick }: { label: string; value: number; i
   );
 }
 
-function UserListModal({ title, users, onToggleFollow, onClose, loading }: { title: string; users: any[]; onToggleFollow: (id: string) => void; onClose: () => void; loading?: boolean }) {
+function UserListModal({ title, mode, users, onToggleFollow, onClose, loading }: { title: string; mode: 'followers' | 'following'; users: any[]; onToggleFollow: (id: string, mode: 'followers' | 'following') => void; onClose: () => void; loading?: boolean }) {
   const [searchQuery, setSearchQuery] = useState('');
   const navigate = useNavigate();
 
@@ -811,15 +974,17 @@ function UserListModal({ title, users, onToggleFollow, onClose, loading }: { tit
                   </div>
                 </div>
                 <button 
-                  onClick={() => onToggleFollow(user.id)}
+                  onClick={() => onToggleFollow(user.id, mode)}
                   className={cn(
                     "px-4 py-1.5 rounded-xl text-xs font-bold transition-all",
-                    user.isFollowing 
+                    mode === 'following'
+                      ? "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700"
+                      : user.isFollowing 
                       ? "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700" 
                       : "bg-indigo-600 text-white shadow-lg shadow-indigo-500/20 hover:bg-indigo-700"
                   )}
                 >
-                  {user.isFollowing ? 'Following' : 'Follow'}
+                  {mode === 'following' ? 'Unfollow' : (user.isFollowing ? 'Following' : 'Follow Back')}
                 </button>
               </div>
             ))
@@ -1053,68 +1218,3 @@ function VideoPlayerModal({ video, onClose }: { video: Video; onClose: () => voi
   );
 }
 
-function StoryViewerModal({ user, onClose }: { user: any; onClose: () => void }) {
-  return (
-    <div className="fixed inset-0 z-[150] flex items-center justify-center bg-black">
-      <motion.div 
-        initial={{ opacity: 0, scale: 0.9 }}
-        animate={{ opacity: 1, scale: 1 }}
-        exit={{ opacity: 0, scale: 0.9 }}
-        className="relative w-full h-full max-w-md md:h-[90vh] md:rounded-3xl overflow-hidden bg-gray-900 shadow-2xl"
-      >
-        {/* Progress Bar */}
-        <div className="absolute top-4 left-4 right-4 z-20 flex gap-1">
-          <div className="h-1 flex-1 bg-white/30 rounded-full overflow-hidden">
-            <motion.div 
-              initial={{ width: 0 }}
-              animate={{ width: '100%' }}
-              transition={{ duration: 5, ease: "linear" }}
-              onAnimationComplete={onClose}
-              className="h-full bg-white"
-            />
-          </div>
-        </div>
-
-        {/* Header */}
-        <div className="absolute top-8 left-4 right-4 z-20 flex items-center justify-between text-white">
-          <div className="flex items-center gap-3">
-            <img src={user.avatar} alt="" className="w-10 h-10 rounded-full border-2 border-white shadow-lg" />
-            <div>
-              <h4 className="font-bold text-sm drop-shadow-md">@{user.username}</h4>
-              <p className="text-[10px] opacity-80 drop-shadow-md">2h ago</p>
-            </div>
-          </div>
-          <button onClick={onClose} className="p-2 hover:bg-white/10 rounded-full transition-colors">
-            <X size={24} />
-          </button>
-        </div>
-
-        {/* Content */}
-        <div className="w-full h-full flex items-center justify-center">
-          <img 
-            src={`https://picsum.photos/seed/${user.username}_story/1080/1920`} 
-            alt="Story" 
-            className="w-full h-full object-cover"
-          />
-        </div>
-
-        {/* Interaction */}
-        <div className="absolute bottom-8 left-4 right-4 z-20 flex items-center gap-4">
-          <div className="flex-1 bg-white/10 backdrop-blur-md border border-white/20 rounded-full px-4 py-3">
-            <input 
-              type="text" 
-              placeholder="Send message..." 
-              className="w-full bg-transparent border-none focus:ring-0 text-white placeholder-white/60 text-sm"
-            />
-          </div>
-          <button className="p-3 bg-white/10 backdrop-blur-md border border-white/20 rounded-full text-white hover:bg-white/20 transition-colors">
-            <Heart size={24} />
-          </button>
-          <button className="p-3 bg-white/10 backdrop-blur-md border border-white/20 rounded-full text-white hover:bg-white/20 transition-colors">
-            <Send size={24} />
-          </button>
-        </div>
-      </motion.div>
-    </div>
-  );
-}

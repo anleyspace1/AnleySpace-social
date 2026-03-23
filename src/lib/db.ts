@@ -285,6 +285,7 @@ db.exec(`
     type TEXT NOT NULL,
     actor_id TEXT,
     story_id TEXT,
+    entity_id TEXT,
     message TEXT,
     read INTEGER DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -307,6 +308,7 @@ try { db.exec("ALTER TABLE calls ADD COLUMN group_id TEXT"); } catch (e) {}
 try { db.exec("ALTER TABLE stories ADD COLUMN media_url TEXT"); } catch (e) {}
 try { db.exec("ALTER TABLE stories ADD COLUMN media_type TEXT"); } catch (e) {}
 try { db.exec("ALTER TABLE story_replies ADD COLUMN receiver_id TEXT"); } catch (e) {}
+try { db.exec("ALTER TABLE notifications ADD COLUMN entity_id TEXT"); } catch (e) {}
 try {
   db.exec(`
     CREATE TABLE IF NOT EXISTS story_views (

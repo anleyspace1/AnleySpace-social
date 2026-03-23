@@ -38,16 +38,100 @@ import {
 import { MOCK_CHATS, MOCK_USER } from '../constants';
 import { Message } from '../types';
 import { cn } from '../lib/utils';
+import { API_ORIGIN } from '../lib/apiOrigin';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import io from 'socket.io-client';
 import Peer from 'simple-peer';
 
+function isStoryMediaVideo(url: string, mediaType?: string | null) {
+  if (mediaType && String(mediaType).toLowerCase().includes('video')) return true;
+  const u = url.toLowerCase();
+  return /\.(mp4|webm|mov|m4v)(\?|$)/i.test(u) || u.includes('/video');
+}
+
+/** Triggers SQLite + socket notification for the receiver (server verifies the Supabase row). */
+async function notifyInboxMessageRealtime(messageId: string, senderId: string, receiverId: string) {
+  try {
+    const res = await fetch(`${API_ORIGIN}/api/notifications/dm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messageId, senderId, receiverId }),
+    });
+    if (!res.ok) {
+      console.warn('notifyInboxMessageRealtime:', res.status);
+    }
+  } catch (e) {
+    console.warn('notifyInboxMessageRealtime failed', e);
+  }
+}
+
+/** Map Supabase `messages` row → UI Message (keeps normal messages unchanged). */
+function formatMessageFromDb(m: any): Message {
+  const content = m.content || m.text || '';
+  const rawType = m.type != null ? String(m.type).trim().toLowerCase() : '';
+  const isStoryReply =
+    rawType === 'story_reply' ||
+    Boolean(m.story_id) ||
+    Boolean(m.story_media);
+  if (isStoryReply) {
+    console.log('[Messages] story_reply row', { story_id: m.story_id, story_media: m.story_media });
+    return {
+      id: m.id,
+      senderId: m.sender_id,
+      receiverId: m.receiver_id,
+      message_type: m.message_type != null ? String(m.message_type) : (m.type != null ? String(m.type) : undefined),
+      content,
+      timestamp: new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      type: 'story_reply',
+      storyId: m.story_id ?? undefined,
+      storyMedia: m.story_media ?? undefined,
+      storyMediaType: m.story_media_type ?? null,
+      isSeen: m.is_seen === true,
+    };
+  }
+  // Voice files use the same `posts` bucket as images (`/posts/...`), so URL heuristics must detect voice BEFORE image.
+  const isVoiceUrl = content.startsWith('http') && content.includes('/voice-messages/');
+  const isImageUrl = content.startsWith('http') && !isVoiceUrl && (content.includes('/chat/') || content.includes('/posts/'));
+
+  let resolvedType: Message['type'];
+  if (rawType === 'audio' || rawType === 'voice') {
+    resolvedType = rawType === 'audio' ? 'audio' : 'voice';
+  } else if (isVoiceUrl) {
+    resolvedType = 'audio';
+  } else if (rawType === 'image') {
+    resolvedType = 'image';
+  } else if (isImageUrl) {
+    resolvedType = 'image';
+  } else if (rawType === 'text' || rawType === 'video') {
+    resolvedType = rawType as Message['type'];
+  } else {
+    resolvedType = 'text';
+  }
+
+  const isAudioLike = resolvedType === 'audio' || resolvedType === 'voice' || isVoiceUrl;
+
+  return {
+    id: m.id,
+    senderId: m.sender_id,
+    receiverId: m.receiver_id,
+    message_type: m.message_type != null ? String(m.message_type) : (m.type != null ? String(m.type) : undefined),
+    content: (isImageUrl || isVoiceUrl) ? '' : content,
+    timestamp: new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    type: resolvedType,
+    audioUrl: m.audio_url || (isAudioLike ? content : undefined),
+    imageUrl: m.image_url || (!isAudioLike && resolvedType === 'image' && isImageUrl ? content : undefined),
+    isSeen: m.is_seen === true,
+  };
+}
+
 export default function MessagesPage() {
   const { user, profile } = useAuth();
+  const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const location = useLocation();
   const targetUser = searchParams.get('user');
+  const targetUserId = searchParams.get('userId');
   
   const [chats, setChats] = useState<any[]>([]);
   const [selectedChat, setSelectedChat] = useState<any>(null);
@@ -79,7 +163,7 @@ export default function MessagesPage() {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [user]);
+  }, [user, targetUser, targetUserId]);
 
   useEffect(() => {
     if (location.state?.openCall && user) {
@@ -127,6 +211,7 @@ export default function MessagesPage() {
 
       const contactIds = new Set<string>();
       const lastMessagesMap = new Map<string, { content: string, created_at: string }>();
+      const injectedProfiles = new Map<string, { id: string; username: string; full_name: string | null; avatar_url: string | null; bio?: string | null }>();
 
       allMessages?.forEach(m => {
         const contactId = m.sender_id === authUser.id ? m.receiver_id : m.sender_id;
@@ -138,30 +223,76 @@ export default function MessagesPage() {
         }
       });
 
-      // If there's a targetUser in URL, ensure they are in the list even if no messages yet
+      // If there's a targetUser (username) or targetUserId in URL, ensure they are in the list
+      const ensureContact = async (targetProfile: { id: string; username: string; full_name: string | null; avatar_url: string | null } | null) => {
+        if (!targetProfile || targetProfile.id === authUser.id) return;
+        contactIds.add(targetProfile.id);
+        if (!injectedProfiles.has(targetProfile.id)) {
+          injectedProfiles.set(targetProfile.id, targetProfile);
+        }
+        try {
+          await fetch('/api/users/sync', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              id: targetProfile.id,
+              username: targetProfile.username,
+              full_name: targetProfile.full_name,
+              avatar: targetProfile.avatar_url
+            })
+          });
+        } catch (e) {
+          console.error('Error syncing target user:', e);
+        }
+      };
+
       if (targetUser) {
         const { data: targetProfile, error: targetError } = await supabase
           .from('profiles')
           .select('id, username, full_name, avatar_url')
           .eq('username', targetUser)
           .maybeSingle();
-        
-        if (!targetError && targetProfile && targetProfile.id !== authUser.id) {
-          contactIds.add(targetProfile.id);
-          // Sync target user to local DB
+        if (!targetError && targetProfile) await ensureContact(targetProfile);
+      }
+
+      if (targetUserId) {
+        const { data: targetProfileById, error: targetErr2 } = await supabase
+          .from('profiles')
+          .select('id, username, full_name, avatar_url')
+          .eq('id', targetUserId.trim())
+          .maybeSingle();
+        if (!targetErr2 && targetProfileById) {
+          await ensureContact(targetProfileById);
+        } else {
+          // Safe fallback for newly created users not fully synced in profiles yet.
           try {
-            await fetch('/api/users/sync', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                id: targetProfile.id,
-                username: targetProfile.username,
-                full_name: targetProfile.full_name,
-                avatar: targetProfile.avatar_url
-              })
+            const res = await fetch(`/api/user/${encodeURIComponent(targetUserId.trim())}`);
+            if (res.ok) {
+              const localUser = await res.json();
+              const fallbackProfile = {
+                id: targetUserId.trim(),
+                username: localUser?.username || targetUserId.trim(),
+                full_name: localUser?.full_name || null,
+                avatar_url: localUser?.avatar || null,
+                bio: localUser?.bio || null,
+              };
+              await ensureContact(fallbackProfile);
+            } else {
+              await ensureContact({
+                id: targetUserId.trim(),
+                username: targetUserId.trim(),
+                full_name: null,
+                avatar_url: null,
+              });
+            }
+          } catch (fallbackErr) {
+            console.error('Error resolving target user fallback:', fallbackErr);
+            await ensureContact({
+              id: targetUserId.trim(),
+              username: targetUserId.trim(),
+              full_name: null,
+              avatar_url: null,
             });
-          } catch (e) {
-            console.error('Error syncing target user:', e);
           }
         }
       }
@@ -179,24 +310,52 @@ export default function MessagesPage() {
       
       if (profilesError) throw profilesError;
 
-      const formattedChats = profiles.map(p => {
+      const profileList = [...(profiles || [])];
+      injectedProfiles.forEach((p) => {
+        if (!profileList.find((row: any) => row.id === p.id)) {
+          profileList.push({
+            id: p.id,
+            username: p.username,
+            full_name: p.full_name,
+            avatar_url: p.avatar_url,
+            bio: p.bio || null,
+          });
+        }
+      });
+
+      const formattedChats = profileList.map((p: any) => {
         const lastMsg = lastMessagesMap.get(p.id);
         return {
           id: p.id,
           user: {
             id: p.id,
-            username: p.username,
-            displayName: p.full_name || p.username,
+            username: p.username || `user_${String(p.id).slice(0, 6)}`,
+            displayName: p.full_name || p.username || 'User',
             avatar: p.avatar_url || `https://picsum.photos/seed/${p.id}/100/100`,
             bio: p.bio,
             online: true 
           },
           lastMessage: lastMsg ? (
-            (lastMsg.content.startsWith('http') && (lastMsg.content.includes('/chat/') || lastMsg.content.includes('/posts/'))) 
-            ? '📷 Photo' 
-            : (lastMsg.content.startsWith('http') && lastMsg.content.includes('/voice-messages/'))
-            ? '🎤 Voice message'
-            : lastMsg.content
+            (() => {
+              const lm = lastMsg as { content?: string; type?: string | null };
+              const lmType = lm.type != null ? String(lm.type).trim().toLowerCase() : '';
+              if (lmType === 'audio' || lmType === 'voice') return '🎤 Voice message';
+              if (
+                lm.content &&
+                lm.content.startsWith('http') &&
+                lm.content.includes('/voice-messages/')
+              ) {
+                return '🎤 Voice message';
+              }
+              if (
+                lm.content &&
+                lm.content.startsWith('http') &&
+                (lm.content.includes('/chat/') || lm.content.includes('/posts/'))
+              ) {
+                return '📷 Photo';
+              }
+              return lm.content || '';
+            })()
           ) : 'Start a conversation',
           timestamp: lastMsg ? new Date(lastMsg.created_at).toLocaleDateString() === new Date().toLocaleDateString()
             ? new Date(lastMsg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
@@ -219,6 +378,13 @@ export default function MessagesPage() {
   };
 
   useEffect(() => {
+    if (targetUserId && chats.length > 0) {
+      const byId = chats.find(c => c.user.id === targetUserId.trim());
+      if (byId) {
+        setSelectedChat(byId);
+        return;
+      }
+    }
     if (targetUser && chats.length > 0) {
       const existingChat = chats.find(c => c.user.username === targetUser);
       if (existingChat) {
@@ -227,12 +393,68 @@ export default function MessagesPage() {
     } else if (!selectedChat && chats.length > 0) {
       setSelectedChat(chats[0]);
     }
-  }, [targetUser, chats]);
+  }, [targetUser, targetUserId, chats]);
+
+  const fetchMessages = async () => {
+    if (!selectedChat || !user) return;
+    try {
+      const { data, error } = await supabase
+        .from('messages')
+        .select('*')
+        .or(`and(sender_id.eq.${user.id},receiver_id.eq.${selectedChat.user.id}),and(sender_id.eq.${selectedChat.user.id},receiver_id.eq.${user.id})`)
+        .order('created_at', { ascending: true });
+      
+      if (error) throw error;
+
+      const formattedMessages: Message[] = (data || []).map(formatMessageFromDb);
+      setMessages(formattedMessages);
+    } catch (err) {
+      console.error('Error fetching messages:', err);
+    }
+  };
+
+  /** Mark messages from the other user to me as read; server emits `messages_seen` so sender UI updates instantly. */
+  const markConversationAsSeen = async () => {
+    if (!selectedChat || !user) return;
+    try {
+      const res = await fetch(`${API_ORIGIN}/api/messages/mark-seen`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          receiverId: user.id,
+          senderId: selectedChat.user.id,
+        }),
+      });
+      if (!res.ok) {
+        const { error } = await supabase
+          .from("messages")
+          .update({ is_seen: true })
+          .eq("receiver_id", user.id)
+          .eq("sender_id", selectedChat.user.id);
+        if (error) console.error("markConversationAsSeen fallback:", error);
+      }
+    } catch (e) {
+      console.error("markConversationAsSeen:", e);
+      try {
+        const { error } = await supabase
+          .from("messages")
+          .update({ is_seen: true })
+          .eq("receiver_id", user.id)
+          .eq("sender_id", selectedChat.user.id);
+        if (error) console.error("markConversationAsSeen fallback:", error);
+      } catch (e2) {
+        console.error("markConversationAsSeen fallback:", e2);
+      }
+    }
+  };
 
   useEffect(() => {
     if (!selectedChat || !user) return;
 
-    fetchMessages();
+    void (async () => {
+      await fetchMessages();
+      await markConversationAsSeen();
+    })();
 
     // Subscribe to real-time messages for this conversation
     const channel = supabase
@@ -250,20 +472,23 @@ export default function MessagesPage() {
           // Check if message already exists (to avoid duplicates from optimistic updates)
           setMessages(prev => {
             if (prev.find(m => m.id === newMessage.id)) return prev;
-            const content = newMessage.content || newMessage.text || '';
-            const isImage = content.startsWith('http') && (content.includes('/chat/') || content.includes('/posts/'));
-            const isVoice = content.startsWith('http') && content.includes('/voice-messages/');
-            
-            return [...prev, {
-              id: newMessage.id,
-              senderId: newMessage.sender_id,
-              content: (isImage || isVoice) ? '' : content,
-              timestamp: new Date(newMessage.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-              type: (newMessage.type as any) || (isImage ? 'image' : isVoice ? 'voice' : 'text'),
-              audioUrl: newMessage.audio_url || (isVoice ? content : undefined),
-              imageUrl: newMessage.image_url || (isImage ? content : undefined)
-            }];
+            return [...prev, formatMessageFromDb(newMessage)];
           });
+        }
+      })
+      .on('postgres_changes', {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'messages',
+      }, (payload) => {
+        const row = payload.new as Record<string, unknown>;
+        const isRelevant =
+          (row.sender_id === user.id && row.receiver_id === selectedChat.user.id) ||
+          (row.sender_id === selectedChat.user.id && row.receiver_id === user.id);
+        if (isRelevant) {
+          setMessages(prev =>
+            prev.map(m => (m.id === row.id ? formatMessageFromDb(row) : m))
+          );
         }
       })
       .subscribe();
@@ -273,37 +498,6 @@ export default function MessagesPage() {
     };
   }, [selectedChat, user]);
 
-  const fetchMessages = async () => {
-    if (!selectedChat || !user) return;
-    try {
-      const { data, error } = await supabase
-        .from('messages')
-        .select('*')
-        .or(`and(sender_id.eq.${user.id},receiver_id.eq.${selectedChat.user.id}),and(sender_id.eq.${selectedChat.user.id},receiver_id.eq.${user.id})`)
-        .order('created_at', { ascending: true });
-      
-      if (error) throw error;
-
-      const formattedMessages: Message[] = data.map(m => {
-        const content = m.content || m.text || '';
-        const isImage = content.startsWith('http') && (content.includes('/chat/') || content.includes('/posts/'));
-        const isVoice = content.startsWith('http') && content.includes('/voice-messages/');
-        
-        return {
-          id: m.id,
-          senderId: m.sender_id,
-          content: (isImage || isVoice) ? '' : content,
-          timestamp: new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          type: (m.type as any) || (isImage ? 'image' : isVoice ? 'voice' : 'text'),
-          audioUrl: m.audio_url || (isVoice ? content : undefined),
-          imageUrl: m.image_url || (isImage ? content : undefined)
-        };
-      });
-      setMessages(formattedMessages);
-    } catch (err) {
-      console.error('Error fetching messages:', err);
-    }
-  };
 
   useEffect(() => {
     scrollToBottom();
@@ -337,6 +531,12 @@ export default function MessagesPage() {
   const socketRef = useRef<any>(null);
   const peersRef = useRef<any[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
+  /** Partner in open chat — used so `messages_seen` only updates the active thread. */
+  const selectedChatPartnerIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    selectedChatPartnerIdRef.current = selectedChat?.user?.id ?? null;
+  }, [selectedChat?.user?.id]);
 
   useEffect(() => {
     socketRef.current = io();
@@ -420,6 +620,33 @@ export default function MessagesPage() {
       socketRef.current?.disconnect();
     };
   }, []);
+
+  useEffect(() => {
+    const socket = socketRef.current;
+    if (!socket || !user?.id) return;
+    const onMessagesSeen = (payload: { senderId: string; receiverId: string }) => {
+      try {
+        const { senderId, receiverId } = payload;
+        if (user.id !== senderId) return;
+        const activeChatUserId = selectedChatPartnerIdRef.current;
+        if (!activeChatUserId || activeChatUserId !== receiverId) return;
+        setMessages((prev) =>
+          prev.map((msg) =>
+            msg.senderId === user.id &&
+            msg.receiverId === activeChatUserId
+              ? { ...msg, isSeen: true }
+              : msg
+          )
+        );
+      } catch (e) {
+        console.error("messages_seen handler:", e);
+      }
+    };
+    socket.on("messages_seen", onMessagesSeen);
+    return () => {
+      socket.off("messages_seen", onMessagesSeen);
+    };
+  }, [user?.id]);
 
   const handleStartCall = async (type: 'audio' | 'video') => {
     if (!user) return;
@@ -605,10 +832,11 @@ export default function MessagesPage() {
       }
 
       // Use only columns confirmed by the user: id, sender_id, receiver_id, content, created_at
-      const messageData = {
+      const messageData: Record<string, string | boolean> = {
         sender_id: user.id,
         receiver_id: selectedChat.user.id,
         content: imageUrl || message.trim(),
+        is_seen: false,
       };
 
       const { data, error } = await supabase
@@ -627,15 +855,18 @@ export default function MessagesPage() {
         const newMessage: Message = {
           id: savedMsg.id,
           senderId: savedMsg.sender_id,
+          receiverId: savedMsg.receiver_id,
           content: imageUrl ? '' : savedMsg.content,
           timestamp: new Date(savedMsg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
           type: imageUrl ? 'image' : 'text',
-          imageUrl: imageUrl || undefined
+          imageUrl: imageUrl || undefined,
+          isSeen: savedMsg.is_seen === true,
         };
         setMessages(prev => [...prev, newMessage]);
         setSelectedImage(null);
         setSelectedFile(null);
         setMessage('');
+        void notifyInboxMessageRealtime(savedMsg.id, user.id, selectedChat.user.id);
       }
     } catch (err: any) {
       console.error('Error in handleSendMessage:', err);
@@ -751,7 +982,9 @@ export default function MessagesPage() {
         .insert([{
           sender_id: user.id,
           receiver_id: selectedChat.user.id,
-          content: publicUrl
+          content: publicUrl,
+          is_seen: false,
+          type: 'audio',
         }])
         .select();
       
@@ -766,12 +999,16 @@ export default function MessagesPage() {
         const newMessage: Message = {
           id: savedMsg.id,
           senderId: savedMsg.sender_id,
+          receiverId: savedMsg.receiver_id,
+          message_type: savedMsg.type != null ? String(savedMsg.type) : 'audio',
           content: '',
           timestamp: new Date(savedMsg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          type: 'voice',
-          audioUrl: savedMsg.content
+          type: 'audio',
+          audioUrl: savedMsg.content,
+          isSeen: savedMsg.is_seen === true,
         };
         setMessages(prev => [...prev, newMessage]);
+        void notifyInboxMessageRealtime(savedMsg.id, user.id, selectedChat.user.id);
       }
     } catch (err: any) {
       console.error('Error sending voice message:', err);
@@ -785,6 +1022,53 @@ export default function MessagesPage() {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
     return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  const handleViewProfileFromInfo = () => {
+    const targetUserId = selectedChat?.user?.id;
+    if (!targetUserId) return;
+    navigate(`/profile/${targetUserId}`);
+  };
+
+  const handleBlockUserFromInfo = async () => {
+    if (!user?.id || !selectedChat?.user?.id) return;
+    const blockerId = user.id;
+    const blockedId = selectedChat.user.id;
+    try {
+      const { error } = await supabase
+        .from('blocked_users')
+        .insert([{ blocker_id: blockerId, blocked_id: blockedId }]);
+      if (error && !String(error.message || '').toLowerCase().includes('duplicate')) {
+        throw error;
+      }
+
+      // Remove this conversation locally and close info/chat view.
+      setChats(prev => prev.filter((chat) => chat.user?.id !== blockedId));
+      setSelectedChat(null);
+      setMessages([]);
+      setIsInfoOpen(false);
+      console.log('User blocked successfully:', blockedId);
+    } catch (err) {
+      console.error('Error blocking user:', err);
+      alert('Failed to block user. Please try again.');
+    }
+  };
+
+  const handleReportUserFromInfo = async () => {
+    if (!user?.id || !selectedChat?.user?.id) return;
+    const reporterId = user.id;
+    const reportedId = selectedChat.user.id;
+    try {
+      const { error } = await supabase
+        .from('reports')
+        .insert([{ reporter_id: reporterId, reported_id: reportedId, reason: 'chat report' }]);
+      if (error) throw error;
+      console.log('User reported successfully:', reportedId);
+      alert('User reported.');
+    } catch (err) {
+      console.error('Error reporting user:', err);
+      alert('Failed to report user. Please try again.');
+    }
   };
 
   return (
@@ -907,7 +1191,9 @@ export default function MessagesPage() {
                 <span className="text-xs bg-gray-200 dark:bg-gray-800 text-gray-500 px-3 py-1 rounded-full">Today</span>
               </div>
               
-              {messages.map((msg) => (
+              {messages.map((msg) => {
+                console.log("Rendering message type:", msg.type);
+                return (
                 <div 
                   key={msg.id} 
                   className={cn(
@@ -928,11 +1214,11 @@ export default function MessagesPage() {
                       ? "bg-indigo-600 text-white rounded-tr-none" 
                       : "bg-gray-100 dark:bg-gray-800 text-black dark:text-white rounded-tl-none"
                   )}>
-                    {msg.type === 'voice' ? (
+                    {msg.type === 'voice' || msg.type === 'audio' ? (
                       <div className="flex items-center gap-3 min-w-[160px] py-1">
                         <button 
                           onClick={() => {
-                            const audio = new Audio(msg.audioUrl);
+                            const audio = new Audio(msg.audioUrl || '');
                             audio.play();
                           }}
                           className={cn(
@@ -949,7 +1235,49 @@ export default function MessagesPage() {
                         </div>
                         <span className="text-[10px] font-bold opacity-70">Voice</span>
                       </div>
-                    ) : msg.type === 'image' || msg.imageUrl ? (
+                    ) : msg.type === 'story_reply' ? (
+                      <div className="space-y-2 min-w-0">
+                        <p
+                          className={cn(
+                            "text-xs mb-1.5",
+                            msg.senderId === user?.id
+                              ? "text-indigo-100/90"
+                              : "text-gray-500 dark:text-gray-400"
+                          )}
+                        >
+                          Replied to your story
+                        </p>
+                        {msg.storyMedia ? (
+                          <button
+                            type="button"
+                            className="group block p-0 m-0 border-0 bg-transparent cursor-pointer rounded-lg focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400 disabled:opacity-50"
+                            disabled={!msg.storyId}
+                            onClick={() => {
+                              if (msg.storyId) navigate(`/story/${msg.storyId}`);
+                            }}
+                            aria-label="Open story"
+                          >
+                            {isStoryMediaVideo(msg.storyMedia, msg.storyMediaType) ? (
+                              <video
+                                src={msg.storyMedia}
+                                className="pointer-events-none block h-24 w-[200px] max-w-[200px] rounded-lg object-cover bg-black/20"
+                                playsInline
+                                muted
+                              />
+                            ) : (
+                              <img
+                                src={msg.storyMedia}
+                                alt=""
+                                className="block h-24 w-[200px] max-w-[200px] rounded-lg object-cover cursor-pointer transition-all duration-200 group-hover:opacity-[0.85]"
+                              />
+                            )}
+                          </button>
+                        ) : null}
+                        {msg.content ? (
+                          <p className="text-sm break-words">{msg.content}</p>
+                        ) : null}
+                      </div>
+                    ) : msg.type === 'image' || (msg.imageUrl && msg.type !== 'story_reply' && msg.type !== 'voice' && msg.type !== 'audio') ? (
                       <div className="py-1">
                         <img 
                           src={msg.imageUrl || msg.content} 
@@ -961,15 +1289,31 @@ export default function MessagesPage() {
                     ) : (
                       <p className="text-sm">{msg.content}</p>
                     )}
-                    <span className={cn(
-                      "text-[10px] mt-1 block",
-                      msg.senderId === user?.id ? "text-indigo-200" : "text-gray-400"
-                    )}>
-                      {msg.timestamp}
-                    </span>
+                    {msg.senderId === user?.id ? (
+                      <div
+                        className="message-footer mt-1 flex items-center justify-end gap-1.5 text-[11px] sm:text-[12px] opacity-80"
+                        title={msg.isSeen ? 'Seen' : 'Delivered'}
+                      >
+                        <span className="time shrink-0 text-indigo-100/90">{msg.timestamp}</span>
+                        <span
+                          className={cn(
+                            'status shrink-0 select-none leading-none tracking-tight',
+                            msg.isSeen ? 'text-sky-300' : 'text-indigo-200/75'
+                          )}
+                          aria-hidden
+                        >
+                          {msg.isSeen ? '✓✓' : '✓'}
+                        </span>
+                      </div>
+                    ) : (
+                      <span className="text-[10px] sm:text-[11px] mt-1 block text-gray-400">
+                        {msg.timestamp}
+                      </span>
+                    )}
                   </div>
                 </div>
-              ))}
+                );
+              })}
               <div ref={messagesEndRef} />
             </div>
 
@@ -1103,15 +1447,15 @@ export default function MessagesPage() {
               </div>
 
               <div className="w-full space-y-3">
-                <button className="w-full py-3 bg-indigo-600 text-white rounded-xl font-bold flex items-center justify-center gap-2 hover:bg-indigo-700 transition-colors">
+                <button onClick={handleViewProfileFromInfo} className="w-full py-3 bg-indigo-600 text-white rounded-xl font-bold flex items-center justify-center gap-2 hover:bg-indigo-700 transition-colors">
                   <UserIcon size={18} />
                   View Profile
                 </button>
-                <button className="w-full py-3 bg-gray-100 dark:bg-gray-800 text-red-500 rounded-xl font-bold flex items-center justify-center gap-2 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors">
+                <button onClick={handleBlockUserFromInfo} className="w-full py-3 bg-gray-100 dark:bg-gray-800 text-red-500 rounded-xl font-bold flex items-center justify-center gap-2 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors">
                   <Ban size={18} />
                   Block User
                 </button>
-                <button className="w-full py-3 text-gray-500 rounded-xl font-bold flex items-center justify-center gap-2 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors">
+                <button onClick={handleReportUserFromInfo} className="w-full py-3 text-gray-500 rounded-xl font-bold flex items-center justify-center gap-2 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors">
                   <Flag size={18} />
                   Report
                 </button>

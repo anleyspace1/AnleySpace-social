@@ -17,38 +17,92 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [profile, setProfile] = useState<any | null>(null);
   const [loading, setLoading] = useState(true);
 
+  const deriveUsername = (u: User) => {
+    const fromMeta = String(u.user_metadata?.username || '').trim().toLowerCase().replace(/\s+/g, '_');
+    if (fromMeta) return fromMeta;
+    const fromEmail = String(u.email || '').split('@')[0]?.trim().toLowerCase().replace(/\s+/g, '_');
+    if (fromEmail) return fromEmail;
+    return `user_${u.id.slice(0, 6)}`;
+  };
+
+  const ensureProfileExists = async (u: User) => {
+    try {
+      const { data: existingProfile } = await supabase
+        .from('profiles')
+        .select('id, username, display_name, full_name, avatar_url')
+        .eq('id', u.id)
+        .maybeSingle();
+
+      // Preserve real username when it already exists; fallback is used only when missing.
+      const username = (existingProfile?.username || deriveUsername(u)).trim();
+      const displayName =
+        (existingProfile?.display_name ||
+          existingProfile?.full_name ||
+          String(u.user_metadata?.full_name || u.user_metadata?.display_name || '').trim()) || null;
+      const avatarUrl =
+        existingProfile?.avatar_url || String(u.user_metadata?.avatar_url || '').trim() || null;
+
+      await supabase.from('profiles').upsert(
+        {
+          id: u.id,
+          username,
+          display_name: displayName,
+          full_name: displayName,
+          avatar_url: avatarUrl,
+        },
+        { onConflict: 'id' }
+      );
+    } catch (err) {
+      console.warn('ensureProfileExists failed:', err);
+    }
+  };
+
   const fetchProfile = async (userId: string) => {
     try {
       const { data, error } = await supabase
         .from('profiles')
         .select('*')
         .eq('id', userId)
-        .single();
+        .maybeSingle();
       
-      if (error) {
+      if (error && !String(error.message || '').toLowerCase().includes('no rows')) {
         console.warn('Error fetching profile:', error.message);
         return;
       }
-      setProfile(data);
+      let profileRow = data;
+      if (!profileRow) {
+        const { data: authUserData } = await supabase.auth.getUser();
+        if (authUserData?.user) {
+          await ensureProfileExists(authUserData.user);
+          const { data: ensuredProfile } = await supabase
+            .from('profiles')
+            .select('*')
+            .eq('id', userId)
+            .maybeSingle();
+          profileRow = ensuredProfile;
+        }
+      }
+      if (!profileRow) return;
+      setProfile(profileRow);
       
       // Sync with local SQLite DB
       try {
-        console.log(`AUTH: Syncing profile for ${data.username} (${data.id}) to local DB`);
+        console.log(`AUTH: Syncing profile for ${profileRow.username} (${profileRow.id}) to local DB`);
         const syncRes = await fetch('/api/users/sync', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            id: data.id,
-            username: data.username,
-            full_name: data.display_name,
-            avatar: data.avatar_url
+            id: profileRow.id,
+            username: profileRow.username,
+            full_name: profileRow.display_name || profileRow.full_name,
+            avatar: profileRow.avatar_url
           })
         });
         if (syncRes.ok) {
-          console.log(`AUTH: Local DB sync successful for ${data.username}`);
+          console.log(`AUTH: Local DB sync successful for ${profileRow.username}`);
         } else {
           const errData = await syncRes.json();
-          console.error(`AUTH: Local DB sync failed for ${data.username}:`, errData);
+          console.error(`AUTH: Local DB sync failed for ${profileRow.username}:`, errData);
         }
       } catch (err) {
         console.error('AUTH: Failed to sync user to local DB:', err);

@@ -22,8 +22,8 @@ import { supabase } from '../lib/supabase';
 export default function Sidebar({ onClose, darkMode, setDarkMode }: { onClose?: () => void; darkMode: boolean; setDarkMode: (val: boolean) => void }) {
   const { user, signOut } = useAuth();
   const [displayUser, setDisplayUser] = useState({
-    displayName: 'Unknown User',
-    username: 'Unknown User',
+    displayName: 'User',
+    username: 'user',
     avatar: MOCK_USER.avatar as string,
   });
 
@@ -36,8 +36,8 @@ export default function Sidebar({ onClose, darkMode, setDarkMode }: { onClose?: 
       if (!uid) {
         if (!cancelled) {
           setDisplayUser({
-            displayName: 'Unknown User',
-            username: 'Unknown User',
+            displayName: 'User',
+            username: 'user',
             avatar: MOCK_USER.avatar as string,
           });
         }
@@ -54,14 +54,14 @@ export default function Sidebar({ onClose, darkMode, setDarkMode }: { onClose?: 
 
       if (error || !profileRow) {
         setDisplayUser({
-          displayName: 'Unknown User',
-          username: 'Unknown User',
+          displayName: 'User',
+          username: uid ? `user_${uid.slice(0, 6)}` : 'user',
           avatar: MOCK_USER.avatar as string,
         });
         return;
       }
 
-      const uname = (profileRow.username || '').trim() || 'Unknown User';
+      const uname = (profileRow.username || '').trim() || (uid ? `user_${uid.slice(0, 6)}` : 'user');
       setDisplayUser({
         displayName: uname,
         username: uname,

@@ -31,7 +31,7 @@ import {
 } from 'lucide-react';
 import { useNavigate, useSearchParams, useLocation } from 'react-router-dom';
 import { cn } from '../lib/utils';
-import { API_ORIGIN } from '../lib/apiOrigin';
+import { apiUrl } from '../lib/apiOrigin';
 import { fetchActiveStories, filterActiveStories } from '../lib/activeStories';
 import { MOCK_USER } from '../constants';
 import { supabase } from '../lib/supabase';
@@ -42,7 +42,7 @@ import { ResponsiveImage } from '../components/ResponsiveImage';
 
 const resolveProfileUsername = (username?: string | null) => {
   const value = (username || '').trim();
-  if (!value) return 'Unknown User';
+  if (!value) return 'User';
   return value;
 };
 
@@ -311,8 +311,7 @@ function Stories() {
         username,
       });
 
-      const API = import.meta.env.VITE_API_ORIGIN || '';
-      const res = await fetch(`${API}/api/stories`, {
+      const res = await fetch(apiUrl('/api/stories'), {
         method: 'POST',
         body: formData,
       });
@@ -358,10 +357,9 @@ function Stories() {
 
   // If clicking story avatar, navigate to /story/:id (user_id or username for StoryPage)
   function handleAvatarClick(story: any) {
-    const target = story.user_id?.trim() || story.user || (story as any).username;
-    const userId = story.user_id?.trim() || target;
-    if (target) {
-      navigate(`/story/${encodeURIComponent(target)}`, {
+    const userId = typeof story.user_id === 'string' ? story.user_id.trim() : '';
+    if (userId) {
+      navigate(`/story/${encodeURIComponent(userId)}`, {
         state: { userId },
       });
     }
@@ -894,6 +892,12 @@ function PostItem({
   // Video player ref for intersection observer
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
+  /** Prevent overlapping like/comment API calls (avoids aborted requests / race on server). */
+  const likeRequestInFlightRef = useRef(false);
+  const commentRequestInFlightRef = useRef(false);
+  /** Latest handleLike for double-tap (avoids stale closure + duplicate triggers). */
+  const handleLikeRef = useRef<() => Promise<void>>(async () => {});
+
   // Track if post video is visible
   const [videoVisible, setVideoVisible] = useState(false);
 
@@ -905,7 +909,7 @@ function PostItem({
     ? post.profiles[0]
     : post.profiles;
 
-  const displayUsername = postProfile?.username || post.username || 'Unknown User';
+  const displayUsername = postProfile?.username || post.username || (post.user_id ? `user_${String(post.user_id).slice(0, 6)}` : 'User');
   const displayAvatar =
     postProfile?.avatar_url ||
     post.avatar_url ||
@@ -939,28 +943,24 @@ function PostItem({
       : post.user_id != null && post.user_id !== ''
         ? String(post.user_id).trim()
         : '';
-  const storyTarget =
-    storyUid || (post as { user?: string }).user || post.username || '';
-  const storyUserIdForState = storyUid || storyTarget;
-
-  const hasActiveStory = !!(userStoriesMap[storyTarget]?.length);
+  const hasActiveStory = !!(storyUid && userStoriesMap[storyUid]?.length);
 
   const handleAvatarClick = useCallback(() => {
-    if (hasActiveStory && storyTarget) {
-      navigate(`/story/${encodeURIComponent(storyTarget)}`, {
-        state: { userId: storyUserIdForState },
+    if (hasActiveStory && storyUid) {
+      navigate(`/story/${encodeURIComponent(storyUid)}`, {
+        state: { userId: storyUid },
       });
     } else if (postUser.user_id) {
       navigate(`/profile/${postUser.user_id}`);
     }
-  }, [hasActiveStory, storyTarget, storyUserIdForState, postUser.user_id, navigate]);
+  }, [hasActiveStory, storyUid, postUser.user_id, navigate]);
 
-  // Double tap to like
+  // Double tap to like — call latest handler via ref (avoids stale closure + duplicate in-flight calls)
   const handleDoubleTap = useCallback(() => {
     setShowHeart(true);
-    if (!isLiked) handleLike();
+    if (!isLiked) void handleLikeRef.current();
     setTimeout(() => setShowHeart(false), 800);
-  }, [isLiked]); // eslint-disable-line
+  }, [isLiked]);
 
   // Intersection observer for video autoplay (desktop/mobile)
   useEffect(() => {
@@ -992,6 +992,8 @@ function PostItem({
     };
   }, [videoUrl, videoRef]);
 
+  // Keep like/saved/counts sync separate from comments toggle — re-running checkIfLiked when
+  // opening comments used to overwrite optimistic isLiked when RLS blocked anon reads.
   useEffect(() => {
     checkIfSaved();
     fetchLikesCount();
@@ -999,10 +1001,13 @@ function PostItem({
     if (user) {
       checkIfLiked();
     }
+  }, [post.id, post.likes_count, post.comments_count, user]);
+
+  useEffect(() => {
     if (showComments) {
       fetchComments();
     }
-  }, [post.id, post.likes_count, post.comments_count, user, showComments]);
+  }, [showComments, post.id]);
 
   const fetchLikesCount = async () => {
     if (!post?.id) return;
@@ -1045,11 +1050,12 @@ function PostItem({
       .eq('user_id', user.id)
       .maybeSingle();
 
-    if (!error && data) {
-      setIsLiked(true);
-    } else {
-      setIsLiked(false);
+    if (error) {
+      // Don't overwrite UI when RLS/network prevents reading likes (would flash "unliked").
+      console.warn('[PostItem] checkIfLiked:', error.message);
+      return;
     }
+    setIsLiked(!!data);
   };
 
   const checkIfSaved = async () => {
@@ -1128,12 +1134,33 @@ function PostItem({
       alert('Please login to like posts');
       return;
     }
+    if (likeRequestInFlightRef.current) {
+      return;
+    }
+    console.log('LIKE action:', post.id, user.id);
+    likeRequestInFlightRef.current = true;
 
     const wasLiked = isLiked;
     setIsLiked(!wasLiked);
     setLikesCount((prev) => (wasLiked ? prev - 1 : prev + 1));
 
+    const jsonHeaders = { 'Content-Type': 'application/json' } as const;
+    const likePayload = JSON.stringify({ userId: user.id, postId: post.id });
+
     try {
+      const apiRes = await fetch(apiUrl('/api/feed/post-like'), {
+        method: 'POST',
+        headers: jsonHeaders,
+        body: likePayload,
+      });
+      if (apiRes.ok) {
+        const data = await apiRes.json();
+        // Server may return only { success: true }; keep optimistic isLiked/likesCount unless server sends fields.
+        if (typeof data.liked === 'boolean') setIsLiked(data.liked);
+        if (typeof data.likesCount === 'number') setLikesCount(data.likesCount);
+        return;
+      }
+      // Fallback: direct Supabase (e.g. server without service role / feed routes unavailable)
       if (wasLiked) {
         const { error } = await supabase
           .from('likes')
@@ -1149,13 +1176,27 @@ function PostItem({
             user_id: user.id,
           });
         if (error) throw error;
+        try {
+          const notifyRes = await fetch(apiUrl('/api/notifications/from-feed-like'), {
+            method: 'POST',
+            headers: jsonHeaders,
+            body: likePayload,
+          });
+          await notifyRes.text();
+        } catch {
+          /* non-fatal */
+        }
       }
     } catch (err) {
       console.error('Error toggling like:', err);
       setIsLiked(wasLiked);
       setLikesCount((prev) => (wasLiked ? prev + 1 : prev - 1));
+    } finally {
+      likeRequestInFlightRef.current = false;
     }
   };
+
+  handleLikeRef.current = handleLike;
 
   const handleAddComment = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1164,23 +1205,62 @@ function PostItem({
       return;
     }
     if (!newComment.trim()) return;
+    if (commentRequestInFlightRef.current) {
+      return;
+    }
+    console.log('COMMENT action:', post.id, user.id);
+    commentRequestInFlightRef.current = true;
 
     const commentText = newComment.trim();
     setNewComment('');
 
-    try {
-      const { data, error } = await supabase
-        .from('comments')
-        .insert({
-          post_id: post.id,
-          user_id: user.id,
-          content: commentText,
-          created_at: new Date(),
-        })
-        .select('id, user_id, content, created_at')
-        .single();
+    const jsonHeaders = { 'Content-Type': 'application/json' } as const;
 
-      if (error) throw error;
+    try {
+      const commentPayload = JSON.stringify({
+        userId: user.id,
+        postId: post.id,
+        content: commentText,
+      });
+      const apiRes = await fetch(apiUrl('/api/feed/post-comment'), {
+        method: 'POST',
+        headers: jsonHeaders,
+        body: commentPayload,
+      });
+      let data: { id: string; user_id: string; content: string; created_at?: string } | null = null;
+      if (apiRes.ok) {
+        const payload = await apiRes.json();
+        data = payload?.comment ?? null;
+      }
+      if (!data) {
+        const { data: ins, error } = await supabase
+          .from('comments')
+          .insert({
+            post_id: post.id,
+            user_id: user.id,
+            content: commentText,
+            created_at: new Date(),
+          })
+          .select('id, user_id, content, created_at')
+          .single();
+        if (error) throw error;
+        data = ins;
+        try {
+          const notifyPayload = JSON.stringify({
+            userId: user.id,
+            postId: post.id,
+            commentId: ins.id,
+          });
+          const notifyRes = await fetch(apiUrl('/api/notifications/from-feed-comment'), {
+            method: 'POST',
+            headers: jsonHeaders,
+            body: notifyPayload,
+          });
+          await notifyRes.text();
+        } catch {
+          /* non-fatal */
+        }
+      }
 
       const newCommentObj = {
         id: data.id,
@@ -1196,6 +1276,8 @@ function PostItem({
       console.error('Error adding comment:', err);
       setNewComment(commentText);
       alert('Failed to add comment');
+    } finally {
+      commentRequestInFlightRef.current = false;
     }
   };
 
@@ -1271,6 +1353,7 @@ function PostItem({
     }
 
     const wasSaved = isSaved;
+    console.log('SAVE action:', post.id, userId);
     console.log('[PostItem] handleSaveToggle', {
       postId: post.id,
       userId,
@@ -1493,9 +1576,18 @@ function PostItem({
 
         <div className="flex items-center justify-between pt-4 border-t border-gray-100 dark:border-gray-800">
           <FeedAction
-            icon={<Heart size={20} className={cn("transition-colors", isLiked && "text-red-500 fill-red-500")} />}
+            icon={
+              <Heart
+                size={20}
+                className={cn(
+                  'transition-colors shrink-0',
+                  isLiked && '!text-red-600 !fill-red-600 stroke-red-600'
+                )}
+              />
+            }
             label="Like"
             active={isLiked}
+            activeVariant="danger"
             onClick={handleLike}
           />
           <FeedAction
@@ -1588,7 +1680,7 @@ function PostItem({
         content={{
           image: imageUrl || post.image_url,
           user: {
-            username: (postUser.username || 'unknown').toLowerCase().replace(/\s+/g, '_'),
+            username: (postUser.username || (post.user_id ? `user_${String(post.user_id).slice(0, 6)}` : 'user')).toLowerCase().replace(/\s+/g, '_'),
             avatar: postUser.avatar,
           }
         }}
@@ -1684,14 +1776,31 @@ export function RightSidebar() {
   );
 }
 
-function FeedAction({ icon, label, active, onClick }: { icon: React.ReactNode; label: string; active?: boolean; onClick?: () => void }) {
+function FeedAction({
+  icon,
+  label,
+  active,
+  onClick,
+  activeVariant = 'default',
+}: {
+  icon: React.ReactNode;
+  label: string;
+  active?: boolean;
+  onClick?: () => void;
+  /** "danger" = red highlight when active (e.g. Like). */
+  activeVariant?: 'default' | 'danger';
+}) {
   return (
     <button
       type="button"
       onClick={onClick}
       className={cn(
-        "flex-1 flex items-center justify-center gap-2 py-2 rounded-xl transition-all text-gray-500",
-        active ? "text-indigo-600 bg-indigo-50 dark:bg-indigo-900/20" : "hover:bg-gray-100 dark:hover:bg-gray-800 hover:text-indigo-600"
+        'flex-1 flex items-center justify-center gap-2 py-2 rounded-xl transition-all text-gray-500',
+        active
+          ? activeVariant === 'danger'
+            ? 'text-red-600 bg-red-50 dark:bg-red-950/30 dark:text-red-400'
+            : 'text-indigo-600 bg-indigo-50 dark:bg-indigo-900/20'
+          : 'hover:bg-gray-100 dark:hover:bg-gray-800 hover:text-indigo-600'
       )}
     >
       {icon}

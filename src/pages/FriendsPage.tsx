@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { motion } from 'motion/react';
 import { UserPlus, UserMinus, Check, X, Search, MoreHorizontal, Loader2 } from 'lucide-react';
 import { cn } from '../lib/utils';
+import { API_ORIGIN } from '../lib/apiOrigin';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import { useNavigate } from 'react-router-dom';
@@ -14,6 +15,8 @@ export default function FriendsPage() {
   
   const [following, setFollowing] = useState<any[]>([]);
   const [followers, setFollowers] = useState<any[]>([]);
+  const [followingIds, setFollowingIds] = useState<string[]>([]);
+  const [followerIds, setFollowerIds] = useState<string[]>([]);
   const [suggested, setSuggested] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [searching, setSearching] = useState(false);
@@ -23,6 +26,8 @@ export default function FriendsPage() {
     if (!user?.id) {
       setFollowing([]);
       setFollowers([]);
+      setFollowingIds([]);
+      setFollowerIds([]);
       setLoading(false);
       return;
     }
@@ -43,9 +48,71 @@ export default function FriendsPage() {
 
   const mapProfileRow = (p: any) => ({
     ...p,
+    id: p.id ?? p.user_id ?? p.profile_id ?? p.uid ?? p.userId ?? p.profileId,
     full_name: p.full_name || p.display_name || p.username,
     display_name: p.display_name || p.full_name || p.username,
+    followers_count: p.followers_count ?? 0,
   });
+
+  const normalizeId = (value: unknown) => String(value ?? '').trim();
+  const resolvePersonId = (person: any) =>
+    normalizeId(person?.id ?? person?.user_id ?? person?.profile_id ?? person?.uid ?? person?.userId ?? person?.profileId);
+
+  const getCurrentFollowingIds = async () => {
+    if (!user?.id) return [] as string[];
+    try {
+      const { data, error } = await supabase
+        .from('follows')
+        .select('following_id')
+        .eq('follower_id', user.id);
+      if (error) {
+        console.error('[FriendsPage] getCurrentFollowingIds failed:', error.message);
+        return [];
+      }
+      return Array.from(
+        new Set((data || []).map((row: any) => normalizeId(row?.following_id)).filter(Boolean))
+      );
+    } catch (err) {
+      console.error('[FriendsPage] getCurrentFollowingIds error:', err);
+      return [];
+    }
+  };
+
+  const attachFollowerCounts = async (users: any[]) => {
+    if (!users.length) return users;
+    try {
+      const ids = Array.from(new Set(users.map((u) => resolvePersonId(u)).filter(Boolean)));
+      if (!ids.length) return users;
+
+      const { data: followRows, error } = await supabase
+        .from('follows')
+        .select('following_id, follower_id')
+        .in('following_id', ids);
+      if (error) {
+        console.error('[FriendsPage] follower count query failed:', error.message);
+        return users;
+      }
+
+      const uniqueFollowersByUser = new Map<string, Set<string>>();
+      (followRows || []).forEach((row: any) => {
+        const followedUserId = normalizeId(row?.following_id);
+        const followerId = normalizeId(row?.follower_id);
+        if (!followedUserId || !followerId) return;
+        const set = uniqueFollowersByUser.get(followedUserId) || new Set<string>();
+        set.add(followerId);
+        uniqueFollowersByUser.set(followedUserId, set);
+      });
+
+      return users.map((u) => {
+        const id = resolvePersonId(u);
+        if (!id) return u;
+        return { ...u, followers_count: uniqueFollowersByUser.get(id)?.size ?? 0 };
+      });
+    } catch (err) {
+      console.error('[FriendsPage] attachFollowerCounts failed:', err);
+      return users;
+    }
+  };
 
   const fetchFollowing = async () => {
     if (!user?.id) return;
@@ -61,7 +128,8 @@ export default function FriendsPage() {
         error: error?.message,
       });
       if (error) throw error;
-      const ids = (rows || []).map((r: any) => r.following_id).filter(Boolean);
+      const ids = Array.from(new Set((rows || []).map((r: any) => normalizeId(r.following_id)).filter(Boolean)));
+      setFollowingIds(ids);
       console.log('[FriendsPage] following: ids from follows', ids);
 
       let followingData: any[] = [];
@@ -88,27 +156,30 @@ export default function FriendsPage() {
         }
       }
 
-      setFollowing(followingData);
+      const followingWithCounts = await attachFollowerCounts(followingData);
+      setFollowing(followingWithCounts);
 
       setFollowingStatus((prev) => {
         const next = { ...prev };
-        followingData.forEach((f: any) => {
+        followingWithCounts.forEach((f: any) => {
           next[f.id] = true;
         });
         return next;
       });
     } catch (err) {
       console.error('Error fetching following:', err);
+      setFollowingIds([]);
       try {
         const res = await fetch(`/api/users/${encodeURIComponent(user!.id)}/following-list`);
         if (res.ok) {
           const list = await res.json();
           const followingData = Array.isArray(list) ? list.map(mapProfileRow) : [];
           console.log('[FriendsPage] following: error path SQLite fallback count', followingData.length);
-          setFollowing(followingData);
+          const followingWithCounts = await attachFollowerCounts(followingData);
+          setFollowing(followingWithCounts);
           setFollowingStatus((prev) => {
             const next = { ...prev };
-            followingData.forEach((f: any) => {
+            followingWithCounts.forEach((f: any) => {
               next[f.id] = true;
             });
             return next;
@@ -129,6 +200,7 @@ export default function FriendsPage() {
         .from('follows')
         .select('follower_id')
         .eq('following_id', user.id);
+      console.log("FOLLOWERS QUERY", user.id, rows);
 
       console.log('[FriendsPage] followers: follows table (following_id = current user)', {
         rowCount: rows?.length,
@@ -136,7 +208,8 @@ export default function FriendsPage() {
         error: error?.message,
       });
       if (error) throw error;
-      const ids = (rows || []).map((r: any) => r.follower_id).filter(Boolean);
+      const ids = Array.from(new Set((rows || []).map((r: any) => normalizeId(r.follower_id)).filter(Boolean)));
+      setFollowerIds(ids);
       console.log('[FriendsPage] followers: ids from follows', ids);
 
       let followersData: any[] = [];
@@ -163,7 +236,10 @@ export default function FriendsPage() {
         }
       }
 
-      setFollowers(followersData);
+      // Followers tab must only include IDs from follows(following_id = current user).
+      const filteredByFollowerIds = followersData.filter((person) => ids.includes(resolvePersonId(person)));
+      const followersWithCounts = await attachFollowerCounts(filteredByFollowerIds);
+      setFollowers(followersWithCounts);
     } catch (err) {
       console.error('Error fetching followers:', err);
       try {
@@ -172,12 +248,21 @@ export default function FriendsPage() {
           const list = await res.json();
           const followersData = Array.isArray(list) ? list.map(mapProfileRow) : [];
           console.log('[FriendsPage] followers: error path SQLite fallback count', followersData.length);
-          setFollowers(followersData);
+          const fallbackFollowerIds = Array.from(
+            new Set(followersData.map((person) => resolvePersonId(person)).filter(Boolean))
+          );
+          setFollowerIds(fallbackFollowerIds);
+          const filteredByFollowerIds = followersData.filter((person) =>
+            fallbackFollowerIds.includes(resolvePersonId(person))
+          );
+          const followersWithCounts = await attachFollowerCounts(filteredByFollowerIds);
+          setFollowers(followersWithCounts);
           return;
         }
       } catch (e) {
         console.error('Followers SQLite fallback failed:', e);
       }
+      setFollowerIds([]);
       setFollowers([]);
     }
   };
@@ -192,7 +277,16 @@ export default function FriendsPage() {
         .limit(8);
       
       if (error) throw error;
-      setSuggested(data);
+      const suggestedBase = (data || []).map((p: any) => ({
+        ...mapProfileRow(p),
+        username: p?.username || resolvePersonId(p),
+      }));
+      const suggestedWithCounts = await attachFollowerCounts(suggestedBase);
+      const followingIds = await getCurrentFollowingIds();
+      const filteredSuggested = suggestedWithCounts.filter(
+        (person) => !followingIds.includes(resolvePersonId(person))
+      );
+      setSuggested(filteredSuggested);
     } catch (err) {
       console.error('Error fetching suggested:', err);
     }
@@ -209,7 +303,16 @@ export default function FriendsPage() {
         .limit(10);
       
       if (error) throw error;
-      setSuggested(data || []);
+      const suggestedBase = (data || []).map((p: any) => ({
+        ...mapProfileRow(p),
+        username: p?.username || resolvePersonId(p),
+      }));
+      const suggestedWithCounts = await attachFollowerCounts(suggestedBase);
+      const followingIds = await getCurrentFollowingIds();
+      const filteredSuggested = suggestedWithCounts.filter(
+        (person) => !followingIds.includes(resolvePersonId(person))
+      );
+      setSuggested(filteredSuggested);
     } catch (err) {
       console.error('Error searching people:', err);
     } finally {
@@ -224,11 +327,25 @@ export default function FriendsPage() {
 
     try {
       if (wasFollowing) {
+        const res = await fetch(`${API_ORIGIN}/api/users/unfollow`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ followerId: user.id, followingId: creatorId }),
+        });
+        if (!res.ok) throw new Error('Failed to unfollow');
         await supabase.from('follows').delete().eq('follower_id', user.id).eq('following_id', creatorId);
         setFollowing(prev => prev.filter(f => f.id !== creatorId));
       } else {
-        await supabase.from('follows').insert({ follower_id: user.id, following_id: creatorId });
-        // Refresh both lists to ensure consistency
+        const res = await fetch(`${API_ORIGIN}/api/users/follow`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ followerId: user.id, followingId: creatorId }),
+        });
+        if (!res.ok) throw new Error('Failed to follow');
+        const { error: followInsertErr } = await supabase
+          .from('follows')
+          .insert({ follower_id: user.id, following_id: creatorId });
+        if (followInsertErr && followInsertErr.code !== '23505') throw followInsertErr;
         fetchFollowing();
         fetchFollowers();
       }
@@ -242,8 +359,15 @@ export default function FriendsPage() {
     if (!user) return;
     if (window.confirm('Are you sure you want to unfollow this user?')) {
       try {
+        const res = await fetch(`${API_ORIGIN}/api/users/unfollow`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ followerId: user.id, followingId: id }),
+        });
+        if (!res.ok) throw new Error('Failed to unfollow');
         await supabase.from('follows').delete().eq('follower_id', user.id).eq('following_id', id);
         setFollowing(prev => prev.filter(f => f.id !== id));
+        setFollowingIds(prev => prev.filter(followingId => followingId !== id));
         setFollowingStatus(prev => ({ ...prev, [id]: false }));
       } catch (err) {
         console.error('Error unfollowing:', err);
@@ -251,13 +375,23 @@ export default function FriendsPage() {
     }
   };
 
-  const filteredFollowing = following.filter(f => 
+  const normalizedFollowingIds = followingIds.map(normalizeId).filter(Boolean);
+  const normalizedFollowerIds = followerIds.map(normalizeId).filter(Boolean);
+
+  const filteredFollowing = following.filter((f) =>
+    normalizedFollowingIds.includes(resolvePersonId(f)) &&
     (f.display_name || f.full_name || f.username || '').toLowerCase().includes((searchQuery || '').toLowerCase())
   );
 
-  const filteredFollowers = followers.filter(f => 
+  const filteredFollowers = followers.filter((f) =>
+    normalizedFollowerIds.includes(resolvePersonId(f)) &&
     (f.display_name || f.full_name || f.username || '').toLowerCase().includes((searchQuery || '').toLowerCase())
   );
+
+  const handleFollowBack = async (creatorId: string) => {
+    if (followingStatus[creatorId]) return;
+    await handleFollow(creatorId);
+  };
 
   return (
     <motion.div 
@@ -311,9 +445,9 @@ export default function FriendsPage() {
               <FriendCard 
                 key={person.id} 
                 friend={person} 
-                type="suggested" 
+                type="follower" 
                 isFollowing={followingStatus[person.id]}
-                onAction={() => handleFollow(person.id)} 
+                onAction={() => handleFollowBack(person.id)}
               />
             ))
           ) : (
@@ -358,13 +492,14 @@ function TabButton({ active, onClick, label, count }: { active: boolean; onClick
 interface FriendCardProps {
   key?: React.Key;
   friend: any;
-  type: 'friend' | 'request' | 'suggested';
+  type: 'friend' | 'request' | 'suggested' | 'follower';
   isFollowing?: boolean;
   onAction?: (action?: any) => void;
 }
 
 function FriendCard({ friend, type, isFollowing, onAction }: FriendCardProps) {
   const navigate = useNavigate();
+  const resolveUserId = (u: any) => u?.id || u?.user_id || u?.profile_id;
   return (
     <motion.div 
       layout
@@ -375,7 +510,10 @@ function FriendCard({ friend, type, isFollowing, onAction }: FriendCardProps) {
     >
       <div 
         className="relative mb-3 cursor-pointer"
-        onClick={() => navigate(`/profile/${friend.username}`)}
+        onClick={() => {
+          const id = resolveUserId(friend);
+          if (id) navigate(`/profile/${id}`);
+        }}
       >
         <img src={friend.avatar_url || `https://picsum.photos/seed/${friend.id}/100/100`} alt="" className="w-16 h-16 sm:w-20 sm:h-20 rounded-full object-cover border-2 border-transparent group-hover:border-indigo-500 transition-all" />
         <div className="absolute bottom-0 right-0 w-4 h-4 bg-green-500 border-2 border-white dark:border-black rounded-full"></div>
@@ -426,6 +564,20 @@ function FriendCard({ friend, type, isFollowing, onAction }: FriendCardProps) {
           >
             {isFollowing ? <UserMinus size={14} /> : <UserPlus size={14} />}
             {isFollowing ? 'Unfollow' : 'Follow'}
+          </button>
+        )}
+        {type === 'follower' && (
+          <button
+            onClick={() => onAction?.()}
+            className={cn(
+              "w-full py-2 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all shadow-md flex items-center justify-center gap-1.5",
+              isFollowing
+                ? "bg-gray-100 dark:bg-gray-800 text-gray-500 hover:bg-gray-200 dark:hover:bg-gray-700"
+                : "bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-500/10"
+            )}
+          >
+            {isFollowing ? <Check size={14} /> : <UserPlus size={14} />}
+            {isFollowing ? 'Following' : 'Follow Back'}
           </button>
         )}
       </div>

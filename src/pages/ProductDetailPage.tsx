@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { Product } from '../types';
 import { cn } from '../lib/utils';
+import { API_ORIGIN } from '../lib/apiOrigin';
 import { MOCK_USER } from '../constants';
 import { useAuth } from '../contexts/AuthContext';
 
@@ -77,7 +78,7 @@ export default function ProductDetailPage() {
     }
     setBuying(true);
     try {
-      const res = await fetch('/api/marketplace/buy', {
+      const res = await fetch(`${API_ORIGIN}/api/marketplace/buy`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

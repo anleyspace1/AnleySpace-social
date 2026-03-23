@@ -1,4 +1,4 @@
-import express from "express";
+import express, { type Request, type Response } from "express";
 import { createServer } from "http";
 import { Server } from "socket.io";
 import { createServer as createViteServer } from "vite";
@@ -14,10 +14,17 @@ dotenv.config();
 
 console.log("SERVER: Initializing...");
 
-const supabaseUrl = process.env.VITE_SUPABASE_URL;
+/** Prefer SUPABASE_URL on server; fall back to VITE_SUPABASE_URL from .env. */
+const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
 const supabaseAnonKey = process.env.VITE_SUPABASE_ANON_KEY;
+const supabaseServiceUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+console.log("USING SERVICE ROLE:", !!supabaseServiceKey);
 
 let supabase: any = null;
+/** Service role client — bypasses RLS for server-side inserts (likes, comments, messages, etc.). */
+let supabaseAdmin: any = null;
 if (supabaseUrl && supabaseAnonKey) {
   try {
     supabase = createClient(supabaseUrl, supabaseAnonKey);
@@ -27,6 +34,181 @@ if (supabaseUrl && supabaseAnonKey) {
   }
 } else {
   console.warn("SERVER: Supabase environment variables missing. Some features may not work.");
+}
+if (supabaseServiceUrl && supabaseServiceKey) {
+  try {
+    supabaseAdmin = createClient(supabaseServiceUrl, supabaseServiceKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+    console.log("SERVER: Supabase admin client initialized (service role — RLS bypass for inserts)");
+  } catch (err) {
+    console.error("SERVER: Failed to initialize Supabase service client:", err);
+  }
+} else {
+  console.warn(
+    "SERVER: SUPABASE_SERVICE_ROLE_KEY or Supabase URL missing — feed likes/comments inserts will fail until configured."
+  );
+}
+
+/** Public URL for story preview in messages (never rely on relative paths in Supabase). */
+function getRequestOrigin(req: Request): string {
+  const xfProto = req.get("x-forwarded-proto");
+  const xfHost = req.get("x-forwarded-host");
+  if (xfHost) {
+    const proto = (xfProto && xfProto.split(",")[0].trim()) || "https";
+    return `${proto}://${xfHost.split(",")[0].trim()}`;
+  }
+  const host = req.get("host");
+  if (!host) return "";
+  return `${req.protocol}://${host}`;
+}
+
+function resolveStoryMediaFullUrl(raw: string, requestOrigin: string): string {
+  const rawStr = String(raw).trim();
+  if (!rawStr) return "";
+  if (rawStr.startsWith("http://") || rawStr.startsWith("https://")) return rawStr;
+  const path = rawStr.startsWith("/") ? rawStr : `/${rawStr}`;
+  const base =
+    (process.env.APP_URL && String(process.env.APP_URL).trim()) ||
+    (process.env.VITE_API_ORIGIN && String(process.env.VITE_API_ORIGIN).trim()) ||
+    (requestOrigin && String(requestOrigin).trim()) ||
+    "";
+  if (!base) return path;
+  return `${base.replace(/\/$/, "")}${path}`;
+}
+
+function normalizeStoryMediaType(mediaTypeFromDb: string | null | undefined, mediaUrl: string): "image" | "video" {
+  const m = (mediaTypeFromDb && String(mediaTypeFromDb).toLowerCase()) || "";
+  if (m.includes("video")) return "video";
+  if (m.includes("image")) return "image";
+  const u = mediaUrl.toLowerCase();
+  if (/\.(mp4|webm|mov|m4v)(\?|$)/i.test(u) || u.includes("video")) return "video";
+  return "image";
+}
+
+/**
+ * Validated sender profile (Supabase `profiles.id` = senderId).
+ */
+async function fetchStoryReplySenderProfile(
+  senderId: string
+): Promise<{ username: string | null; avatar_url: string | null } | null> {
+  const client = supabaseAdmin || supabase;
+  if (!client) return null;
+  const { data, error } = await client
+    .from("profiles")
+    .select("username, avatar_url")
+    .eq("id", senderId)
+    .maybeSingle();
+  if (error) {
+    console.error("SERVER: fetchStoryReplySenderProfile error:", error.message);
+    return null;
+  }
+  if (!data) return null;
+  return {
+    username: data.username ?? null,
+    avatar_url: data.avatar_url ?? null,
+  };
+}
+
+/**
+ * Mirror story reply into Supabase `messages` (requires service role for RLS).
+ * Returns result object — caller decides HTTP status.
+ */
+async function insertStoryReplyIntoMessagesInbox(
+  opts: {
+    senderId: string;
+    receiverId: string;
+    storyId: string;
+    text: string;
+    /** Absolute URL for story preview (required for UI when present in DB). */
+    storyMedia: string;
+    storyMediaType: "image" | "video";
+  },
+  logToFile: (msg: string) => void
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const { senderId, receiverId, storyId, text, storyMedia, storyMediaType } = opts;
+  logToFile(
+    `SERVER: insertStoryReplyIntoMessagesInbox BEFORE insert senderId=${senderId} receiverId=${receiverId} storyId=${storyId} contentLen=${text.length} story_media=${storyMedia ? storyMedia.slice(0, 80) + (storyMedia.length > 80 ? "…" : "") : "[empty]"} story_media_type=${storyMediaType}`
+  );
+  console.log("[story-reply→messages] story_id:", storyId, "story_media:", storyMedia || null);
+  if (!supabaseAdmin) {
+    const msg =
+      "insertStoryReplyIntoMessagesInbox aborted — SUPABASE_SERVICE_ROLE_KEY not set (required to insert into messages)";
+    logToFile(`SERVER: ${msg}`);
+    console.log("[story-reply→messages] insert skipped:", msg);
+    return { ok: false, error: msg };
+  }
+  try {
+    const { data: existing, error: qErr } = await supabaseAdmin
+      .from("messages")
+      .select("id")
+      .or(
+        `and(sender_id.eq.${senderId},receiver_id.eq.${receiverId}),and(sender_id.eq.${receiverId},receiver_id.eq.${senderId})`
+      )
+      .limit(1);
+    if (qErr) {
+      logToFile(`SERVER: insertStoryReplyIntoMessagesInbox prior-messages check error: ${qErr.message}`);
+    } else {
+      logToFile(
+        `SERVER: insertStoryReplyIntoMessagesInbox conversation ${existing?.length ? "existing" : "new"} pair sender=${senderId} receiver=${receiverId}`
+      );
+    }
+
+    const buildRow = (includeStoryMedia: boolean, includeMediaType: boolean) => {
+      const row: Record<string, string> = {
+        sender_id: senderId,
+        receiver_id: receiverId,
+        content: text,
+        type: "story_reply",
+        story_id: storyId,
+      };
+      if (includeStoryMedia && storyMedia) {
+        row.story_media = storyMedia;
+      }
+      if (includeMediaType) {
+        row.story_media_type = storyMediaType;
+      }
+      return row;
+    };
+
+    // Prefer full row; only fall back by dropping optional columns — never insert as plain text-only.
+    const attempts = [
+      buildRow(true, true),
+      buildRow(true, false),
+      buildRow(false, true),
+      buildRow(false, false),
+    ];
+
+    let lastErr = "";
+    for (let i = 0; i < attempts.length; i++) {
+      const ins = await supabaseAdmin
+        .from("messages")
+        .insert([attempts[i]])
+        .select("id, story_id, story_media, story_media_type");
+      if (!ins.error && ins.data?.[0]) {
+        const row = ins.data[0] as Record<string, unknown>;
+        logToFile(
+          `SERVER: insertStoryReplyIntoMessagesInbox insert OK (attempt ${i + 1}) id=${String(row.id ?? "")} story_id=${String(row.story_id ?? "")} story_media=${row.story_media ? "[set]" : "[empty]"}`
+        );
+        console.log("[story-reply→messages] messages row inserted:", row);
+        return { ok: true };
+      }
+      lastErr = ins.error?.message ?? "unknown";
+      logToFile(
+        `SERVER: insertStoryReplyIntoMessagesInbox attempt ${i + 1} failed: ${lastErr}`
+      );
+      console.log("[story-reply→messages] message insert attempt failed:", i + 1, lastErr);
+    }
+    const errMsg = `messages insert failed after retries: ${lastErr}`;
+    logToFile(`SERVER: insertStoryReplyIntoMessagesInbox ${errMsg}`);
+    console.log("[story-reply→messages] message insert result FAILED:", lastErr);
+    return { ok: false, error: errMsg };
+  } catch (e) {
+    const errMsg = `exception: ${e}`;
+    logToFile(`SERVER: insertStoryReplyIntoMessagesInbox ${errMsg}`);
+    console.log("[story-reply→messages] message insert exception:", e);
+    return { ok: false, error: errMsg };
+  }
 }
 
 async function syncGroupMessages(groupId: string) {
@@ -129,6 +311,253 @@ async function startServer() {
   const logFile = path.join(process.cwd(), 'server.log');
   const logToFile = (msg: string) => {
     fs.appendFileSync(logFile, `${msg} - ${new Date().toISOString()}\n`);
+  };
+
+  /** Display name for notification copy (profiles.username or "Someone"). */
+  const fetchUsernameForUserId = async (userId: string): Promise<string> => {
+    const client = supabaseAdmin || supabase;
+    if (!client) return "Someone";
+    try {
+      const { data } = await client.from("profiles").select("username").eq("id", userId).maybeSingle();
+      const u = typeof data?.username === "string" ? data.username.trim() : "";
+      return u || "Someone";
+    } catch {
+      return "Someone";
+    }
+  };
+
+  /** Local SQLite row so GET /api/notifications can JOIN actor username (same idea as story_reply sender upsert). */
+  const ensureLocalUserFromSupabaseProfile = async (userId: string): Promise<void> => {
+    const u = typeof userId === "string" ? userId.trim() : "";
+    if (!u) return;
+    const client = supabaseAdmin || supabase;
+    if (!client) {
+      db.prepare("INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)").run(u, u);
+      return;
+    }
+    try {
+      const { data, error } = await client.from("profiles").select("username, avatar_url").eq("id", u).maybeSingle();
+      if (error) console.warn("SERVER: ensureLocalUserFromSupabaseProfile:", error.message);
+      const username = (data?.username && String(data.username).trim()) || u;
+      const avatar = (data?.avatar_url && String(data.avatar_url)) || null;
+      db.prepare(
+        `
+        INSERT INTO users (id, username, avatar) VALUES (?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET username = excluded.username, avatar = COALESCE(excluded.avatar, users.avatar)
+      `
+      ).run(u, username, avatar);
+    } catch (e) {
+      console.warn("SERVER: ensureLocalUserFromSupabaseProfile exception:", e);
+      db.prepare("INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)").run(u, u);
+    }
+  };
+
+  const pickPostOwnerFromRow = (row: Record<string, unknown> | null | undefined): string | null => {
+    if (!row || typeof row !== "object") return null;
+    const cand =
+      row.user_id ?? row.author_id ?? row.userId ?? row.author_user_id ?? row["userId"];
+    if (cand != null && String(cand).trim() !== "") return String(cand).trim();
+    return null;
+  };
+
+  /**
+   * Resolve feed post owner for like/comment notifications.
+   * Optional body keys (if ever sent): postOwnerId, post_user_id, ownerId, authorId.
+   * Uses service role for `posts` when available — anon reads are often blocked by RLS.
+   */
+  const getPostOwnerUserIdForFeedNotification = async (
+    postId: string,
+    raw?: Record<string, unknown>
+  ): Promise<string | null> => {
+    const b = raw || {};
+    const fromBody =
+      (typeof b.postOwnerId === "string" && b.postOwnerId.trim()) ||
+      (typeof b.post_user_id === "string" && b.post_user_id.trim()) ||
+      (typeof b.ownerId === "string" && b.ownerId.trim()) ||
+      (typeof b.authorId === "string" && b.authorId.trim()) ||
+      "";
+    if (fromBody) return fromBody;
+
+    // 1) Service role first (posts.user_id / posts.author_id)
+    if (supabaseAdmin) {
+      const adminFirst = await supabaseAdmin
+        .from("posts")
+        .select("user_id, author_id")
+        .eq("id", postId)
+        .maybeSingle();
+      if (adminFirst.error) {
+        console.error("SERVER: getPostOwnerUserId posts (service role) error:", adminFirst.error.message, adminFirst.error);
+      }
+      const idAdmin = pickPostOwnerFromRow(adminFirst.data as Record<string, unknown>);
+      if (idAdmin) return idAdmin;
+    }
+
+    // 2) Anon client fallback (when RLS allows or row visible to user)
+    if (supabase) {
+      const anonRes = await supabase
+        .from("posts")
+        .select("user_id, author_id")
+        .eq("id", postId)
+        .maybeSingle();
+      if (anonRes.error) {
+        console.error("SERVER: getPostOwnerUserId posts (anon) error:", anonRes.error.message, anonRes.error);
+      }
+      const idAnon = pickPostOwnerFromRow(anonRes.data as Record<string, unknown>);
+      if (idAnon) return idAnon;
+    }
+
+    const client = supabaseAdmin || supabase;
+    if (!client) {
+      console.warn("SERVER: getPostOwnerUserId — no Supabase client");
+      console.error("Missing ownerId for notification", postId);
+      return null;
+    }
+
+    const star = await client.from("posts").select("*").eq("id", postId).maybeSingle();
+    if (star.error) console.error("SERVER: getPostOwnerUserId posts * error:", star.error.message, star.error);
+    const idStar = pickPostOwnerFromRow(star.data as Record<string, unknown>);
+    if (idStar) return idStar;
+
+    console.error("Missing ownerId for notification", postId);
+    return null;
+  };
+
+  const recentFeedStoryNotificationExists = (
+    receiverId: string,
+    actorId: string,
+    type: string,
+    storyKey: string
+  ): boolean => {
+    const row = db
+      .prepare(
+        `
+      SELECT id FROM notifications
+      WHERE user_id = ? AND actor_id = ? AND type = ? AND story_id = ?
+        AND datetime(created_at) > datetime('now', '-25 seconds')
+      LIMIT 1
+    `
+      )
+      .get(receiverId, actorId, type, storyKey) as { id: string } | undefined;
+    return !!row;
+  };
+
+  const recentFollowNotificationExists = (receiverId: string, actorId: string): boolean => {
+    const row = db
+      .prepare(
+        `
+      SELECT id FROM notifications
+      WHERE user_id = ? AND actor_id = ? AND type = 'follow'
+        AND datetime(created_at) > datetime('now', '-25 seconds')
+      LIMIT 1
+    `
+      )
+      .get(receiverId, actorId) as { id: string } | undefined;
+    return !!row;
+  };
+
+  /** Payload shape for Socket.IO + API (optional `entity_id` persisted when column present). */
+  type RealtimeNotificationPayload = {
+    id: string;
+    type: string;
+    message: string;
+    actor_id: string | null;
+    story_id: string | null;
+    entity_id?: string | null;
+    created_at: string;
+  };
+
+  /**
+   * Emit a realtime notification to the receiver's room.
+   * Clients join `user_<userId>` via `register_user` (receiverId must be the raw user id, not socket.id).
+   */
+  /** All types: clients join room `user_<receiverUserId>` via `register_user` (not raw socket id). */
+  const emitNotificationRealtime = (receiverId: string, notificationData: RealtimeNotificationPayload) => {
+    const uid = String(receiverId).replace(/^user_/, "").trim();
+    if (!uid) return;
+    const room = `user_${uid}`;
+    io.to(room).emit("new_notification", notificationData);
+    console.log("Realtime notification sent:", notificationData);
+    logToFile(
+      `SERVER: Realtime notification sent type=${notificationData.type} room=${room} id=${notificationData.id}`
+    );
+  };
+
+  /**
+   * Insert into SQLite `notifications`, then emit Socket.IO `new_notification` to the receiver's room (all types).
+   * Optional `dedupe` for inbox_message to avoid double POST from client.
+   */
+  const insertNotificationWithRealtime = (opts: {
+    receiverId: string;
+    actorId: string | null;
+    type: string;
+    message: string;
+    storyId: string | null;
+    entityId?: string | null;
+    dedupe?: boolean;
+  }): { id: string; created_at: string } | null => {
+    try {
+      const { receiverId, actorId, type, message, storyId, entityId, dedupe } = opts;
+      if (!receiverId) return null;
+      if (actorId && receiverId === actorId) return null;
+
+      const msgTrim = message.slice(0, 500);
+
+      if (dedupe && type === "inbox_message" && actorId) {
+        const recent = db
+          .prepare(
+            `
+        SELECT created_at FROM notifications
+        WHERE user_id = ? AND type = ? AND actor_id = ? AND message = ?
+        ORDER BY datetime(created_at) DESC
+        LIMIT 1
+      `
+          )
+          .get(receiverId, type, actorId, msgTrim) as { created_at: string } | undefined;
+        if (recent?.created_at) {
+          const t = new Date(recent.created_at).getTime();
+          if (Number.isFinite(t) && Date.now() - t < 8000) {
+            logToFile(`SERVER: insertNotificationWithRealtime skipped duplicate inbox_message → ${receiverId}`);
+            return null;
+          }
+        }
+      }
+
+      const notifId = uuidv4();
+      const createdAt = new Date().toISOString();
+      const entityCol =
+        entityId != null && String(entityId).trim() !== "" ? String(entityId).trim() : null;
+      try {
+        db.prepare(`
+        INSERT INTO notifications (id, user_id, type, actor_id, story_id, entity_id, message, read, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+      `).run(notifId, receiverId, type, actorId, storyId, entityCol, msgTrim, createdAt);
+      } catch (e) {
+        console.error("Notification error:", e);
+        logToFile(`SERVER: insertNotificationWithRealtime DB error: ${e}`);
+        return null;
+      }
+
+      const payload: RealtimeNotificationPayload = {
+        id: notifId,
+        type,
+        message: msgTrim,
+        actor_id: actorId,
+        story_id: storyId,
+        created_at: createdAt,
+      };
+      if (entityCol != null) {
+        payload.entity_id = entityCol;
+      }
+      try {
+        emitNotificationRealtime(receiverId, payload);
+      } catch (e) {
+        console.error("Notification error:", e);
+      }
+      return { id: notifId, created_at: createdAt };
+    } catch (e) {
+      console.error("Notification error:", e);
+      return null;
+    }
   };
 
   console.log(`SERVER: NODE_ENV is ${process.env.NODE_ENV}`);
@@ -280,6 +709,107 @@ async function startServer() {
     res.json({ status: "ok", userCount: userCount.count });
   });
 
+  app.get("/api/notifications", (req, res) => {
+    try {
+      const userId = typeof req.query.userId === "string" ? req.query.userId.trim() : "";
+      if (!userId) {
+        return res.status(400).json({ error: "Missing userId query parameter" });
+      }
+      const rows = db
+        .prepare(
+          `
+          SELECT n.id, n.user_id, n.type, n.actor_id, n.story_id, n.entity_id, n.message,
+                 n.read AS read_flag, n.created_at,
+                 u.username AS actor_username, u.avatar AS actor_avatar
+          FROM notifications n
+          LEFT JOIN users u ON u.id = n.actor_id
+          WHERE n.user_id = ?
+          ORDER BY datetime(n.created_at) DESC
+          LIMIT 100
+        `
+        )
+        .all(userId) as {
+        id: string;
+        user_id: string;
+        type: string;
+        actor_id: string | null;
+        story_id: string | null;
+        entity_id: string | null;
+        message: string | null;
+        read_flag: number | null;
+        created_at: string;
+        actor_username: string | null;
+        actor_avatar: string | null;
+      }[];
+
+      const mapped = rows.map((r) => ({
+        id: r.id,
+        user_id: r.user_id,
+        type: r.type,
+        actor_id: r.actor_id,
+        story_id: r.story_id ?? null,
+        entity_id: (r.entity_id ?? r.story_id) ?? null,
+        message: r.message ?? null,
+        is_read: Boolean(r.read_flag),
+        created_at: r.created_at,
+        actor_username: r.actor_username ?? null,
+        actor_avatar: r.actor_avatar ?? null,
+      }));
+      res.json(mapped);
+    } catch (err) {
+      logToFile(`SERVER: GET /api/notifications error: ${err}`);
+      res.status(500).json({ error: "Failed to load notifications" });
+    }
+  });
+
+  app.patch("/api/notifications/:id/read", (req, res) => {
+    try {
+      const { id } = req.params;
+      const userId =
+        (req.body && typeof req.body.userId === "string" && req.body.userId.trim()) ||
+        (typeof req.query.userId === "string" && req.query.userId.trim()) ||
+        "";
+      if (!id || !userId) {
+        return res.status(400).json({ error: "Missing notification id or userId" });
+      }
+      const existing = db.prepare("SELECT * FROM notifications WHERE id = ?").get(id) as
+        | { id: string; user_id: string }
+        | undefined;
+      if (!existing) {
+        return res.status(404).json({ error: "Notification not found" });
+      }
+      if (String(existing.user_id) !== String(userId)) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+      db.prepare("UPDATE notifications SET read = 1 WHERE id = ?").run(id);
+      const updated = db.prepare("SELECT * FROM notifications WHERE id = ?").get(id) as {
+        id: string;
+        user_id: string;
+        type: string;
+        actor_id: string | null;
+        story_id: string | null;
+        entity_id?: string | null;
+        message: string | null;
+        read: number;
+        created_at: string;
+      };
+      res.json({
+        id: updated.id,
+        user_id: updated.user_id,
+        type: updated.type,
+        actor_id: updated.actor_id,
+        story_id: updated.story_id ?? null,
+        entity_id: (updated.entity_id ?? updated.story_id) ?? null,
+        message: updated.message ?? null,
+        is_read: true,
+        created_at: updated.created_at,
+      });
+    } catch (err) {
+      logToFile(`SERVER: PATCH /api/notifications/:id/read error: ${err}`);
+      res.status(500).json({ error: "Failed to mark notification as read" });
+    }
+  });
+
   app.get("/api/user/:id", async (req, res) => {
     logToFile(`SERVER: Fetching user ${req.params.id}`);
     let user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
@@ -327,7 +857,27 @@ async function startServer() {
       logToFile(`SERVER: User ${req.params.id} not found anywhere`);
       return res.status(404).json({ error: 'User not found' });
     }
-    
+
+    // Single source of truth for relationship counts: follows table only.
+    try {
+      const followersRows = db.prepare(
+        'SELECT DISTINCT follower_id FROM follows WHERE following_id = ?'
+      ).all(req.params.id) as { follower_id: string }[];
+      const followingRows = db.prepare(
+        'SELECT DISTINCT following_id FROM follows WHERE follower_id = ?'
+      ).all(req.params.id) as { following_id: string }[];
+      const dbFollowersCount = new Set((followersRows || []).map((r) => String(r.follower_id || '').trim()).filter(Boolean)).size;
+      const dbFollowingCount = new Set((followingRows || []).map((r) => String(r.following_id || '').trim()).filter(Boolean)).size;
+      logToFile(`SERVER: /api/user/${req.params.id} follows-counts followers=${dbFollowersCount} following=${dbFollowingCount}`);
+      user = {
+        ...(user as any),
+        followers_count: dbFollowersCount,
+        following_count: dbFollowingCount,
+      };
+    } catch (countErr) {
+      logToFile(`SERVER: /api/user/${req.params.id} follows-count fallback error: ${countErr}`);
+    }
+
     res.json(user);
   });
 
@@ -557,6 +1107,393 @@ async function startServer() {
     }
   });
 
+  const handleFeedPostLike = async (req: Request, res: Response) => {
+    try {
+      console.log("USING SERVICE ROLE:", !!process.env.SUPABASE_SERVICE_ROLE_KEY);
+      console.log("LIKE REQUEST:", req.body);
+      const raw = req.body as Record<string, unknown>;
+      const userId =
+        (typeof raw?.userId === "string" ? raw.userId.trim() : "") ||
+        (typeof raw?.user_id === "string" ? raw.user_id.trim() : "");
+      const postId =
+        (typeof raw?.postId === "string" ? raw.postId.trim() : "") ||
+        (typeof raw?.post_id === "string" ? raw.post_id.trim() : "");
+      if (!userId || !postId) {
+        return res.status(400).json({ error: "Missing userId or postId" });
+      }
+      if (!supabaseAdmin) {
+        return res.status(503).json({
+          error: "Supabase service role not configured on server (SUPABASE_SERVICE_ROLE_KEY required for likes)",
+        });
+      }
+
+      const { data: existing, error: exErr } = await supabaseAdmin
+        .from("likes")
+        .select("id")
+        .eq("post_id", postId)
+        .eq("user_id", userId)
+        .maybeSingle();
+      if (exErr) {
+        console.error("SERVER: likes lookup failed:", exErr.message, exErr);
+        return res.status(500).json({ error: exErr.message || "Like lookup failed" });
+      }
+
+      if (existing) {
+        const { data: delData, error: delErr } = await supabaseAdmin
+          .from("likes")
+          .delete()
+          .eq("post_id", postId)
+          .eq("user_id", userId)
+          .select();
+        console.log("Delete result:", delData, delErr);
+        if (delErr) {
+          console.error("SERVER: likes delete (unlike) failed:", delErr.message, delErr);
+          return res.status(500).json({ error: delErr.message || "Failed to unlike" });
+        }
+        res.status(200).json({ success: true });
+        setTimeout(() => {
+          try {
+            console.log("Insert success:", { action: "unlike", postId, userId });
+          } catch (err) {
+            console.error(err);
+          }
+        }, 0);
+        return;
+      }
+
+      const { data: insData, error: insErr } = await supabaseAdmin
+        .from("likes")
+        .insert({ post_id: postId, user_id: userId })
+        .select("id, post_id, user_id")
+        .maybeSingle();
+
+      console.log("Insert result:", insData, insErr);
+      if (insErr) {
+        console.error("SERVER: likes insert failed (check RLS or schema):", insErr.message, insErr);
+        return res.status(500).json({ error: insErr.message || "Failed to like post" });
+      }
+
+      res.status(200).json({ success: true });
+      setTimeout(() => {
+        void (async () => {
+          try {
+            console.log("Insert success:", insData);
+            const authorId = (await getPostOwnerUserIdForFeedNotification(postId, raw)) || "";
+            if (!authorId || authorId === userId) return;
+            if (recentFeedStoryNotificationExists(authorId, userId, "like", postId)) return;
+            await ensureLocalUserFromSupabaseProfile(userId);
+            await ensureLocalUserFromSupabaseProfile(authorId);
+            const name = await fetchUsernameForUserId(userId);
+            console.log("LIKE NOTIF TRIGGERED", postId, userId);
+            const inserted = insertNotificationWithRealtime({
+              receiverId: authorId,
+              actorId: userId,
+              type: "like",
+              message: `${name} liked your post`,
+              storyId: postId,
+              entityId: postId,
+            });
+            if (inserted) {
+              logToFile(
+                `SERVER: feed like notification ok notifId=${inserted.id} receiver=${authorId} actor=${userId} post=${postId}`
+              );
+            } else {
+              console.warn("SERVER: feed like notification insert returned null (self or DB)");
+            }
+          } catch (err) {
+            console.error("Notification error:", err);
+          }
+        })();
+      }, 0);
+      return;
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || "post-like failed" });
+    }
+  };
+
+  const handleFeedPostComment = async (req: Request, res: Response) => {
+    try {
+      console.log("USING SERVICE ROLE:", !!process.env.SUPABASE_SERVICE_ROLE_KEY);
+      console.log("COMMENT REQUEST:", req.body);
+      const raw = req.body as Record<string, unknown>;
+      const userId =
+        (typeof raw?.userId === "string" ? raw.userId.trim() : "") ||
+        (typeof raw?.user_id === "string" ? raw.user_id.trim() : "");
+      const postId =
+        (typeof raw?.postId === "string" ? raw.postId.trim() : "") ||
+        (typeof raw?.post_id === "string" ? raw.post_id.trim() : "");
+      const content =
+        (typeof raw?.content === "string" ? raw.content.trim() : "") ||
+        (typeof raw?.text === "string" ? raw.text.trim() : "");
+      if (!userId || !postId || !content) {
+        return res.status(400).json({ error: "Missing userId, postId, or content" });
+      }
+      if (!supabaseAdmin) {
+        return res.status(503).json({
+          error: "Supabase service role not configured on server (SUPABASE_SERVICE_ROLE_KEY required for comments)",
+        });
+      }
+
+      const { data: inserted, error: insErr } = await supabaseAdmin
+        .from("comments")
+        .insert({ post_id: postId, user_id: userId, content })
+        .select("id, post_id, user_id, content, created_at")
+        .single();
+
+      console.log("Insert result:", inserted, insErr);
+      if (insErr) {
+        console.error("SERVER: comments insert failed (check RLS or schema):", insErr.message, insErr);
+        return res.status(500).json({ error: insErr.message || "Failed to add comment" });
+      }
+      if (!inserted) {
+        console.error("SERVER: comments insert returned no row (RLS may hide select after insert)");
+        return res.status(500).json({ error: "Failed to add comment" });
+      }
+
+      // Include `comment` so existing clients do not fall back to a second insert (frontend unchanged).
+      res.status(200).json({ success: true, comment: inserted });
+      setTimeout(() => {
+        void (async () => {
+          try {
+            console.log("Insert success:", inserted);
+            const authorId = (await getPostOwnerUserIdForFeedNotification(postId, raw)) || "";
+            if (!authorId || authorId === userId) return;
+            if (recentFeedStoryNotificationExists(authorId, userId, "comment", postId)) return;
+            await ensureLocalUserFromSupabaseProfile(userId);
+            await ensureLocalUserFromSupabaseProfile(authorId);
+            const name = await fetchUsernameForUserId(userId);
+            console.log("COMMENT NOTIF TRIGGERED", postId, userId);
+            const n = insertNotificationWithRealtime({
+              receiverId: authorId,
+              actorId: userId,
+              type: "comment",
+              message: `${name} commented on your post`,
+              storyId: postId,
+              entityId: postId,
+            });
+            if (n) {
+              logToFile(
+                `SERVER: feed comment notification ok notifId=${n.id} receiver=${authorId} actor=${userId} post=${postId}`
+              );
+            } else {
+              console.warn("SERVER: feed comment notification insert returned null (self or DB)");
+            }
+          } catch (err) {
+            console.error("Notification error:", err);
+          }
+        })();
+      }, 0);
+      return;
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || "post-comment failed" });
+    }
+  };
+
+  app.post("/api/feed/post-like", handleFeedPostLike);
+  app.post("/api/likes", handleFeedPostLike);
+  app.post("/api/feed/post-comment", handleFeedPostComment);
+  app.post("/api/comments", handleFeedPostComment);
+
+  /**
+   * When the client used Supabase directly for a like (feed API unavailable), still persist + realtime notify.
+   */
+  app.post("/api/notifications/from-feed-like", async (req, res) => {
+    try {
+      const userId = typeof req.body?.userId === "string" ? req.body.userId.trim() : "";
+      const postId = typeof req.body?.postId === "string" ? req.body.postId.trim() : "";
+      if (!userId || !postId) {
+        return res.status(400).json({ error: "Missing userId or postId" });
+      }
+      if (!supabaseAdmin) {
+        return res.status(503).json({ error: "Supabase service role not configured on server" });
+      }
+
+      const { data: like, error: likeErr } = await supabaseAdmin
+        .from("likes")
+        .select("id")
+        .eq("post_id", postId)
+        .eq("user_id", userId)
+        .maybeSingle();
+      if (likeErr) {
+        console.error("SERVER: from-feed-like likes read failed:", likeErr.message, likeErr);
+      }
+      if (!like) {
+        return res.status(400).json({ error: "Like not found in database" });
+      }
+
+      const authorId = (await getPostOwnerUserIdForFeedNotification(postId, req.body as Record<string, unknown>)) || "";
+      if (!authorId || authorId === userId) {
+        return res.json({ ok: true, skipped: true });
+      }
+
+      if (recentFeedStoryNotificationExists(authorId, userId, "like", postId)) {
+        return res.json({ ok: true, deduped: true });
+      }
+
+      await ensureLocalUserFromSupabaseProfile(userId);
+      await ensureLocalUserFromSupabaseProfile(authorId);
+      const name = await fetchUsernameForUserId(userId);
+      console.log("LIKE NOTIF TRIGGERED", postId, userId);
+      insertNotificationWithRealtime({
+        receiverId: authorId,
+        actorId: userId,
+        type: "like",
+        message: `${name} liked your post`,
+        storyId: postId,
+        entityId: postId,
+      });
+      return res.json({ ok: true });
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || "from-feed-like failed" });
+    }
+  });
+
+  /**
+   * When the client used Supabase directly for a comment, still persist + realtime notify.
+   */
+  app.post("/api/notifications/from-feed-comment", async (req, res) => {
+    try {
+      const userId = typeof req.body?.userId === "string" ? req.body.userId.trim() : "";
+      const postId = typeof req.body?.postId === "string" ? req.body.postId.trim() : "";
+      const commentId = typeof req.body?.commentId === "string" ? req.body.commentId.trim() : "";
+      if (!userId || !postId || !commentId) {
+        return res.status(400).json({ error: "Missing userId, postId, or commentId" });
+      }
+      if (!supabaseAdmin) {
+        return res.status(503).json({ error: "Supabase service role not configured on server" });
+      }
+
+      const { data: row, error: rowErr } = await supabaseAdmin
+        .from("comments")
+        .select("id")
+        .eq("id", commentId)
+        .eq("post_id", postId)
+        .eq("user_id", userId)
+        .maybeSingle();
+      if (rowErr) {
+        console.error("SERVER: from-feed-comment comments read failed:", rowErr.message, rowErr);
+      }
+      if (!row) {
+        return res.status(400).json({ error: "Comment not found" });
+      }
+
+      const authorId = (await getPostOwnerUserIdForFeedNotification(postId, req.body as Record<string, unknown>)) || "";
+      if (!authorId || authorId === userId) {
+        return res.json({ ok: true, skipped: true });
+      }
+
+      if (recentFeedStoryNotificationExists(authorId, userId, "comment", postId)) {
+        return res.json({ ok: true, deduped: true });
+      }
+
+      await ensureLocalUserFromSupabaseProfile(userId);
+      await ensureLocalUserFromSupabaseProfile(authorId);
+      const name = await fetchUsernameForUserId(userId);
+      console.log("COMMENT NOTIF TRIGGERED", postId, userId);
+      insertNotificationWithRealtime({
+        receiverId: authorId,
+        actorId: userId,
+        type: "comment",
+        message: `${name} commented on your post`,
+        storyId: postId,
+        entityId: postId,
+      });
+      return res.json({ ok: true });
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || "from-feed-comment failed" });
+    }
+  });
+
+  /**
+   * After a Supabase `messages` row is inserted, call this so the receiver gets a realtime inbox notification.
+   * Verifies the row exists and matches sender/receiver (service role preferred).
+   */
+  app.post("/api/notifications/dm", async (req, res) => {
+    try {
+      const messageId = typeof req.body?.messageId === "string" ? req.body.messageId.trim() : "";
+      const senderId = typeof req.body?.senderId === "string" ? req.body.senderId.trim() : "";
+      const receiverId = typeof req.body?.receiverId === "string" ? req.body.receiverId.trim() : "";
+      if (!messageId || !senderId || !receiverId || senderId === receiverId) {
+        return res.status(400).json({ error: "Invalid payload" });
+      }
+      const client = supabaseAdmin || supabase;
+      if (!client) {
+        return res.status(503).json({ error: "Supabase not configured on server" });
+      }
+
+      const { data: row, error } = await client
+        .from("messages")
+        .select("id, sender_id, receiver_id, content")
+        .eq("id", messageId)
+        .maybeSingle();
+
+      if (error || !row || String(row.sender_id) !== senderId || String(row.receiver_id) !== receiverId) {
+        return res.status(404).json({ error: "Message not found" });
+      }
+
+      const senderName = await fetchUsernameForUserId(senderId);
+      const preview = String(row.content || "").slice(0, 120);
+      const isUrl = /^https?:\/\//i.test(preview);
+      const msg =
+        !preview || isUrl
+          ? `${senderName} sent you a message`
+          : `${senderName}: ${preview}`;
+
+      insertNotificationWithRealtime({
+        receiverId,
+        actorId: senderId,
+        type: "inbox_message",
+        message: msg,
+        storyId: null,
+        entityId: messageId,
+        dedupe: true,
+      });
+
+      return res.json({ success: true });
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || "dm notification failed" });
+    }
+  });
+
+  /**
+   * Receiver opened chat: mark incoming messages from the other user as read, then notify the sender via Socket.IO.
+   * Body: { receiverId, senderId } → UPDATE messages SET is_seen=true WHERE receiver_id=receiverId AND sender_id=senderId
+   */
+  app.post("/api/messages/mark-seen", async (req, res) => {
+    try {
+      const receiverId = typeof req.body?.receiverId === "string" ? req.body.receiverId.trim() : "";
+      const senderId = typeof req.body?.senderId === "string" ? req.body.senderId.trim() : "";
+      if (!receiverId || !senderId || receiverId === senderId) {
+        return res.status(400).json({ error: "Invalid payload" });
+      }
+      if (!supabaseAdmin) {
+        return res.status(503).json({ error: "Supabase service role not configured" });
+      }
+      const { error } = await supabaseAdmin
+        .from("messages")
+        .update({ is_seen: true })
+        .eq("receiver_id", receiverId)
+        .eq("sender_id", senderId);
+      if (error) {
+        console.error("POST /api/messages/mark-seen update error:", error);
+        return res.status(500).json({ error: error.message });
+      }
+      try {
+        const uid = String(senderId).replace(/^user_/, "").trim();
+        if (uid) {
+          io.to(`user_${uid}`).emit("messages_seen", { senderId, receiverId });
+          logToFile(`SERVER: messages_seen emitted room=user_${uid} senderId=${senderId} receiverId=${receiverId}`);
+        }
+      } catch (e) {
+        console.error("messages_seen emit error:", e);
+      }
+      return res.json({ success: true });
+    } catch (err: any) {
+      console.error("POST /api/messages/mark-seen:", err);
+      return res.status(500).json({ error: err?.message || "mark-seen failed" });
+    }
+  });
+
   // Suggested people sourced from profiles table
   app.get("/api/users/suggestions", async (req, res) => {
     try {
@@ -591,11 +1528,13 @@ async function startServer() {
       db.prepare('INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)').run(followerId, followerId);
       db.prepare('INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)').run(followingId, followingId);
 
+      let newFollow = false;
       const transaction = db.transaction(() => {
         const result = db.prepare('INSERT OR IGNORE INTO follows (follower_id, following_id) VALUES (?, ?)').run(followerId, followingId);
         logToFile(`SERVER: Follow insert result changes: ${result.changes}`);
         
         if (result.changes > 0) {
+          newFollow = true;
           db.prepare('UPDATE users SET following_count = following_count + 1 WHERE id = ?').run(followerId);
           db.prepare('UPDATE users SET followers_count = followers_count + 1 WHERE id = ?').run(followingId);
         }
@@ -614,6 +1553,30 @@ async function startServer() {
         await supabase.rpc('increment_followers_count', { user_id: followingId });
       } catch (e) {
         logToFile(`SERVER: Supabase follow sync error: ${e}`);
+      }
+
+      if (newFollow) {
+        if (followerId !== followingId && !recentFollowNotificationExists(followingId, followerId)) {
+          try {
+            await ensureLocalUserFromSupabaseProfile(followerId);
+            await ensureLocalUserFromSupabaseProfile(followingId);
+            const followerName = await fetchUsernameForUserId(followerId);
+            console.log("FOLLOW NOTIF TRIGGERED", followerId, followingId);
+            const fn = insertNotificationWithRealtime({
+              receiverId: followingId,
+              actorId: followerId,
+              type: "follow",
+              message: `${followerName} started following you`,
+              storyId: null,
+              entityId: followerId,
+            });
+            if (fn) {
+              logToFile(`SERVER: follow notification ok notifId=${fn.id} receiver=${followingId} actor=${followerId}`);
+            }
+          } catch (e) {
+            console.error("Notification error:", e);
+          }
+        }
       }
 
       res.json({ success: true });
@@ -665,7 +1628,16 @@ async function startServer() {
     const id = req.params.id;
     try {
       const rows = db.prepare(`
-        SELECT u.id, u.username, u.avatar, u.full_name, u.followers_count
+        SELECT
+          u.id,
+          u.username,
+          u.avatar,
+          u.full_name,
+          (
+            SELECT COUNT(DISTINCT f2.follower_id)
+            FROM follows f2
+            WHERE f2.following_id = u.id
+          ) AS followers_count
         FROM follows f
         JOIN users u ON u.id = f.following_id
         WHERE f.follower_id = ?
@@ -690,7 +1662,16 @@ async function startServer() {
     const id = req.params.id;
     try {
       const rows = db.prepare(`
-        SELECT u.id, u.username, u.avatar, u.full_name, u.followers_count
+        SELECT
+          u.id,
+          u.username,
+          u.avatar,
+          u.full_name,
+          (
+            SELECT COUNT(DISTINCT f2.follower_id)
+            FROM follows f2
+            WHERE f2.following_id = u.id
+          ) AS followers_count
         FROM follows f
         JOIN users u ON u.id = f.follower_id
         WHERE f.following_id = ?
@@ -886,6 +1867,24 @@ async function startServer() {
       // 2. Update balances in local DB (and ideally Supabase)
       db.prepare('UPDATE users SET coins = coins - ? WHERE id = ?').run(coins, senderId);
       db.prepare('UPDATE users SET coins = coins + ? WHERE id = ?').run(coins, receiverId);
+
+      try {
+        if (receiverId && senderId && String(receiverId) !== String(senderId)) {
+          const senderName = await fetchUsernameForUserId(String(senderId));
+          const c = Number(coins) || 0;
+          insertNotificationWithRealtime({
+            receiverId: String(receiverId),
+            actorId: String(senderId),
+            type: "live",
+            message: `${senderName} sent you a gift (${c} coins)`,
+            storyId: String(id),
+            entityId: String(id),
+          });
+        }
+      } catch (e) {
+        console.error("Notification error:", e);
+        logToFile(`SERVER: live gift notification error: ${e}`);
+      }
 
       res.json({ success: true });
     } catch (err) {
@@ -1744,6 +2743,28 @@ async function startServer() {
         logToFile(`SERVER: Supabase buy sync error: ${e}`);
       }
 
+      try {
+        const sellerId = String(product.seller_id || "");
+        if (sellerId && sellerId !== String(buyerId)) {
+          await ensureLocalUserFromSupabaseProfile(buyerId);
+          await ensureLocalUserFromSupabaseProfile(sellerId);
+          const buyerName = await fetchUsernameForUserId(buyerId);
+          const title = typeof product.title === "string" ? product.title : "an item";
+          console.log("MARKETPLACE NOTIF TRIGGERED", productId, buyerId);
+          insertNotificationWithRealtime({
+            receiverId: sellerId,
+            actorId: buyerId,
+            type: "marketplace_message",
+            message: `${buyerName} purchased "${title.slice(0, 80)}"`,
+            storyId: String(productId),
+            entityId: orderId,
+          });
+        }
+      } catch (notifErr) {
+        console.error("Notification error:", notifErr);
+        logToFile(`SERVER: marketplace buy notification error: ${notifErr}`);
+      }
+
       res.json({ success: true, orderId, newStock: product.stock - 1 });
     } catch (err) {
       logToFile(`SERVER: Buy error: ${err}`);
@@ -1930,7 +2951,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/story-replies", (req, res) => {
+  app.post("/api/story-replies", async (req, res) => {
     try {
       let bodyLog = "(unavailable)";
       try {
@@ -1952,54 +2973,146 @@ async function startServer() {
         return res.status(400).json({ error: "Empty JSON body — send storyId, senderId, receiverId, message" });
       }
 
-      const { storyId, senderId, receiverId, message } = req.body as Record<string, unknown>;
+      const { storyId, senderId, receiverId: receiverIdBody, message } = req.body as Record<string, unknown>;
       const text = typeof message === "string" ? message.trim() : "";
-      if (
-        !storyId ||
-        typeof storyId !== "string" ||
-        !senderId ||
-        typeof senderId !== "string" ||
-        !receiverId ||
-        typeof receiverId !== "string" ||
-        !text
-      ) {
-        return res
-          .status(400)
-          .json({ error: "Missing or invalid storyId, senderId, receiverId, or message" });
+      if (!storyId || typeof storyId !== "string" || !senderId || typeof senderId !== "string" || !text) {
+        return res.status(400).json({ error: "Missing or invalid storyId, senderId, or message" });
       }
 
       const story = db
-        .prepare("SELECT user_id FROM stories WHERE id = ?")
-        .get(storyId) as { user_id: string | null } | undefined;
+        .prepare("SELECT id, user_id, media_url, image_url, media_type FROM stories WHERE id = ?")
+        .get(storyId) as
+        | {
+            id: string;
+            user_id: string | null;
+            media_url: string | null;
+            image_url: string | null;
+            media_type: string | null;
+          }
+        | undefined;
       if (!story) {
         return res.status(404).json({ error: "Story not found" });
       }
-      const ownerId = story.user_id != null ? String(story.user_id).trim() : "";
-      if (!ownerId || ownerId !== String(receiverId).trim()) {
+      console.log("Story:", story);
+      const receiverId =
+        story.user_id != null && String(story.user_id).trim() !== "" ? String(story.user_id).trim() : "";
+      if (!receiverId) {
+        return res.status(400).json({ error: "Story has no owner user_id" });
+      }
+      if (
+        receiverIdBody != null &&
+        typeof receiverIdBody === "string" &&
+        String(receiverIdBody).trim() !== "" &&
+        String(receiverIdBody).trim() !== receiverId
+      ) {
         return res.status(400).json({ error: "receiverId does not match story owner" });
       }
 
-      db.prepare("INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)").run(senderId, senderId);
-      const senderRow = db
-        .prepare("SELECT username FROM users WHERE id = ?")
-        .get(senderId) as { username: string | null } | undefined;
-      const fromUsername = senderRow?.username ?? null;
+      const senderProfile = await fetchStoryReplySenderProfile(senderId);
+      if (!senderProfile) {
+        logToFile(`SERVER: POST /api/story-replies rejected — sender profile not found senderId=${senderId}`);
+        console.error("SERVER: POST /api/story-replies — sender profile not found for senderId:", senderId);
+        return res.status(400).json({ error: "Invalid sender: profile not found for senderId" });
+      }
+
+      const usernameTrim =
+        typeof senderProfile.username === "string" ? senderProfile.username.trim() : "";
+      if (!usernameTrim) {
+        logToFile(`SERVER: POST /api/story-replies rejected — sender profile has empty username senderId=${senderId}`);
+        console.error("SERVER: POST /api/story-replies — sender profile has no username senderId:", senderId);
+        return res.status(400).json({ error: "Invalid sender: profile has no username" });
+      }
+
+      const actorUsername = usernameTrim;
+      const actorAvatar = senderProfile.avatar_url ?? null;
+
+      logToFile(
+        `SERVER: POST /api/story-replies BEFORE inserts senderId=${senderId} receiverId=${receiverId} storyId=${storyId} actor_username=${actorUsername} actor_avatar=${actorAvatar ? "[set]" : "[empty]"}`
+      );
+
+      db.prepare(
+        `
+        INSERT INTO users (id, username, avatar) VALUES (?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET username = excluded.username, avatar = excluded.avatar
+      `
+      ).run(senderId, actorUsername, actorAvatar ?? null);
 
       const id = uuidv4();
       const createdAt = new Date().toISOString();
       db.prepare(`
         INSERT INTO story_replies (id, story_id, from_user_id, from_username, body, receiver_id, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(id, storyId, senderId, fromUsername, text, receiverId, createdAt);
+      `).run(id, storyId, senderId, actorUsername, text, receiverId, createdAt);
 
-      const notifId = uuidv4();
-      db.prepare(`
-        INSERT INTO notifications (id, user_id, type, actor_id, story_id, message, read, created_at)
-        VALUES (?, ?, 'story_reply', ?, ?, ?, 0, ?)
-      `).run(notifId, receiverId, senderId, storyId, text.slice(0, 500), createdAt);
+      const notifMessage = `${actorUsername} replied to your story`;
+
+      console.log("senderId:", senderId);
+      console.log("receiverId:", receiverId);
+      console.log("storyId:", storyId);
+
+      try {
+        if (senderId !== receiverId) {
+          const inserted = insertNotificationWithRealtime({
+            receiverId,
+            actorId: senderId,
+            type: "story_reply",
+            message: notifMessage,
+            storyId,
+            entityId: storyId,
+          });
+          if (inserted) {
+            console.log(
+              "POST /api/story-replies notification insert OK notifId:",
+              inserted.id,
+              "message:",
+              notifMessage
+            );
+            logToFile(
+              `SERVER: POST /api/story-replies notification insert OK notifId=${inserted.id} user_id=${receiverId} actor_id=${senderId} story_id=${storyId} message=${notifMessage}`
+            );
+          }
+        }
+      } catch (notifErr) {
+        console.error("POST /api/story-replies notification insert FAILED:", notifErr);
+        logToFile(`SERVER: POST /api/story-replies notification insert FAILED: ${notifErr}`);
+        throw notifErr;
+      }
+
+      const requestOrigin = getRequestOrigin(req);
+      const rawMedia =
+        (story.media_url && String(story.media_url).trim()) ||
+        (story.image_url && String(story.image_url).trim()) ||
+        "";
+      const fullMediaUrl = resolveStoryMediaFullUrl(rawMedia, requestOrigin);
+      console.log("Story media:", fullMediaUrl);
+      const storyMediaTypeNorm = normalizeStoryMediaType(story.media_type, fullMediaUrl);
+      logToFile(
+        `SERVER: POST /api/story-replies story preview story_id=${storyId} requestOrigin=${requestOrigin} rawMedia=${rawMedia || "(none)"} fullMedia=${fullMediaUrl || "(none)"} media_type=${storyMediaTypeNorm}`
+      );
+
+      const inboxResult = await insertStoryReplyIntoMessagesInbox(
+        {
+          senderId,
+          receiverId,
+          storyId,
+          text,
+          storyMedia: fullMediaUrl,
+          storyMediaType: storyMediaTypeNorm,
+        },
+        logToFile
+      );
+      if (!inboxResult.ok) {
+        logToFile(`SERVER: POST /api/story-replies messages insert FAILED: ${inboxResult.error}`);
+        return res.status(502).json({
+          error: "Story reply saved locally but inbox delivery failed",
+          details: inboxResult.error,
+          success: false,
+          id,
+        });
+      }
 
       logToFile(
-        `SERVER: Story reply (API) id=${id} story=${storyId} sender=${senderId} receiver=${receiverId}`
+        `SERVER: Story reply (API) complete id=${id} story=${storyId} sender=${senderId} receiver=${receiverId}`
       );
       return res.json({ success: true, id });
     } catch (err) {
@@ -2067,7 +3180,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/reels/:id/like", (req, res) => {
+  app.post("/api/reels/:id/like", async (req, res) => {
     const reelId = req.params.id;
     const { userId } = req.body;
     if (!userId) return res.status(400).json({ error: 'Missing userId' });
@@ -2075,10 +3188,25 @@ async function startServer() {
     try {
       db.prepare('INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)').run(userId, userId);
       const existing = db.prepare('SELECT 1 FROM reel_likes WHERE reel_id = ? AND user_id = ?').get(reelId, userId);
+      const reelOwner = db.prepare('SELECT user_id FROM reels WHERE id = ?').get(reelId) as { user_id: string } | undefined;
+
       if (existing) {
         db.prepare('DELETE FROM reel_likes WHERE reel_id = ? AND user_id = ?').run(reelId, userId);
       } else {
         db.prepare('INSERT INTO reel_likes (reel_id, user_id) VALUES (?, ?)').run(reelId, userId);
+        if (reelOwner?.user_id && reelOwner.user_id !== userId) {
+          await ensureLocalUserFromSupabaseProfile(userId);
+          await ensureLocalUserFromSupabaseProfile(reelOwner.user_id);
+          const name = await fetchUsernameForUserId(userId);
+          insertNotificationWithRealtime({
+            receiverId: reelOwner.user_id,
+            actorId: userId,
+            type: 'like',
+            message: `${name} liked your reel`,
+            storyId: reelId,
+            entityId: reelId,
+          });
+        }
       }
 
       const row = db.prepare('SELECT COUNT(*) as count FROM reel_likes WHERE reel_id = ?').get(reelId) as any;
@@ -2192,6 +3320,21 @@ async function startServer() {
 
       db.prepare('INSERT INTO reel_comments (id, reel_id, user_id, text) VALUES (?, ?, ?, ?)')
         .run(id, reelId, userId, content.trim());
+
+      const reelOwnerRow = db.prepare('SELECT user_id FROM reels WHERE id = ?').get(reelId) as { user_id: string } | undefined;
+      if (reelOwnerRow?.user_id && reelOwnerRow.user_id !== userId) {
+        await ensureLocalUserFromSupabaseProfile(userId);
+        await ensureLocalUserFromSupabaseProfile(reelOwnerRow.user_id);
+        const name = await fetchUsernameForUserId(userId);
+        insertNotificationWithRealtime({
+          receiverId: reelOwnerRow.user_id,
+          actorId: userId,
+          type: 'comment',
+          message: `${name} commented on your reel`,
+          storyId: reelId,
+          entityId: reelId,
+        });
+      }
 
       const created = db.prepare(`
         SELECT rc.id, rc.reel_id, rc.user_id, rc.text, rc.created_at, u.username, u.avatar

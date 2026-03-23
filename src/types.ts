@@ -45,11 +45,22 @@ export type Product = {
 export type Message = {
   id: string;
   senderId: string;
+  /** DM recipient (from `receiver_id`) — used to scope seen-state updates to the open thread */
+  receiverId?: string;
   content: string;
   timestamp: string;
-  type: 'text' | 'image' | 'video' | 'voice';
+  /** Normalized UI kind; DB may store `audio` while legacy code still uses `voice` */
+  type: 'text' | 'image' | 'video' | 'voice' | 'audio' | 'story_reply';
+  /** Optional raw DB `message_type` when present (does not replace `type`) */
+  message_type?: string;
   audioUrl?: string;
   imageUrl?: string;
+  /** Story being replied to (DM story reply) */
+  storyId?: string;
+  storyMedia?: string;
+  storyMediaType?: string | null;
+  /** When current user is sender: false = Delivered, true = Seen by other party */
+  isSeen?: boolean;
 };
 
 export type Chat = {

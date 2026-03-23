@@ -18,13 +18,16 @@ export default function SignupPage() {
     setLoading(true);
     setError('');
     try {
+      const normalizedUsername = (username || '').toLowerCase().replace(/\s/g, '_');
+      const fallbackUsername = email.split('@')[0]?.toLowerCase().replace(/\s/g, '_') || '';
+      const finalUsername = normalizedUsername || fallbackUsername;
       const { data: authData, error: authError } = await supabase.auth.signUp({
         email,
         password,
         options: {
           data: {
             full_name: name,
-            username: (username || '').toLowerCase().replace(/\s/g, '_'),
+            username: finalUsername,
             avatar_url: `https://picsum.photos/seed/${username}/100/100`,
           },
         },
@@ -32,17 +35,112 @@ export default function SignupPage() {
       if (authError) throw authError;
 
       if (authData.user) {
+        const fallbackUsername = `user_${authData.user.id.slice(0, 6)}`;
+        let existingUsername = '';
+        try {
+          const { data: existingProfile } = await supabase
+            .from('profiles')
+            .select('username')
+            .eq('id', authData.user.id)
+            .maybeSingle();
+          existingUsername = String(existingProfile?.username || '').trim();
+        } catch (profileReadErr) {
+          console.warn('Could not read existing profile before username upsert:', profileReadErr);
+        }
+
+        const shouldUseEnteredUsername =
+          Boolean(finalUsername) &&
+          (!existingUsername || existingUsername.toLowerCase().startsWith('user_'));
+
         const { error: profileError } = await supabase
           .from('profiles')
-          .insert({
-            id: authData.user.id,
-            username: (username || '').toLowerCase().replace(/\s/g, '_'),
-            full_name: name,
-            avatar_url: `https://picsum.photos/seed/${username}/100/100`,
-          });
+          .upsert(
+            {
+              id: authData.user.id,
+              username: shouldUseEnteredUsername
+                ? finalUsername
+                : (existingUsername || finalUsername || fallbackUsername),
+              display_name: name || null,
+              full_name: name || null,
+              avatar_url: null,
+            },
+            { onConflict: 'id' }
+          );
         
-        if (profileError && !profileError.message.includes('duplicate key')) {
+        if (profileError && !String(profileError.message || '').includes('duplicate key')) {
           console.error('Error creating profile:', profileError);
+        }
+
+        // Authoritative signup sync: persist the real entered username/name.
+        // Keep existing safeguards; this ensures fallback user_xxx is replaced immediately.
+        const { error: profileSyncError } = await supabase
+          .from('profiles')
+          .upsert(
+            {
+              id: authData.user.id,
+              username: finalUsername || fallbackUsername,
+              display_name: name || null,
+              full_name: name || null,
+            },
+            { onConflict: 'id' }
+          );
+        if (profileSyncError) {
+          console.warn('Profile sync after signup failed:', profileSyncError);
+        }
+
+        // Defensive cleanup: keep one valid profile and remove duplicate extras.
+        try {
+          const expectedUsername = finalUsername || fallbackUsername;
+          const { data: duplicateCandidates, error: dupErr } = await supabase
+            .from('profiles')
+            .select('id, username, created_at')
+            .or(`id.eq.${authData.user.id},username.eq.${expectedUsername}`);
+
+          if (dupErr) {
+            console.warn('Profile duplicate check failed:', dupErr);
+          } else if (Array.isArray(duplicateCandidates) && duplicateCandidates.length > 1) {
+            const isFallback = (u?: string | null) => String(u || '').toLowerCase().startsWith('user_');
+            const byCreatedAtAsc = [...duplicateCandidates].sort((a: any, b: any) => {
+              const ta = a?.created_at ? new Date(a.created_at).getTime() : Number.MAX_SAFE_INTEGER;
+              const tb = b?.created_at ? new Date(b.created_at).getTime() : Number.MAX_SAFE_INTEGER;
+              return ta - tb;
+            });
+
+            const authLinked = byCreatedAtAsc.filter((p: any) => p?.id === authData.user?.id);
+            const keepProfile =
+              authLinked.find((p: any) => !isFallback(p?.username)) ||
+              authLinked[0] ||
+              byCreatedAtAsc.find((p: any) => !isFallback(p?.username)) ||
+              byCreatedAtAsc[0];
+
+            const idsToDelete = byCreatedAtAsc
+              .filter((p: any) => p?.id && p.id !== keepProfile?.id)
+              .map((p: any) => p.id);
+
+            if (idsToDelete.length > 0) {
+              const { error: deleteErr } = await supabase
+                .from('profiles')
+                .delete()
+                .in('id', idsToDelete);
+              if (deleteErr) {
+                console.warn('Profile duplicate cleanup delete failed:', deleteErr);
+              }
+            }
+          }
+          console.log("PROFILE CLEANUP DONE", authData.user.id);
+        } catch (cleanupErr) {
+          console.warn('Profile duplicate cleanup failed:', cleanupErr);
+        }
+
+        try {
+          const { data: profileAfterSignup } = await supabase
+            .from('profiles')
+            .select('id, username, display_name, full_name, avatar_url')
+            .eq('id', authData.user.id)
+            .maybeSingle();
+          console.log("PROFILE AFTER SIGNUP", profileAfterSignup);
+        } catch (logErr) {
+          console.warn('Could not fetch profile after signup:', logErr);
         }
       }
 

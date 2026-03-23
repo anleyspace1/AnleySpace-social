@@ -49,12 +49,14 @@ import GroupChatPage from './pages/GroupChatPage';
 import GroupDetailPage from './pages/GroupDetailPage';
 import HashtagPage from './pages/HashtagPage';
 import NotificationsPage from './pages/NotificationsPage';
+import PostRedirectPage from './pages/PostRedirectPage';
 import EditProfilePage from './pages/EditProfilePage';
 import CreateReelPage from './pages/CreateReelPage';
 import StoryPage from './pages/StoryPage';
 import { MOCK_USER } from './constants';
 
 import { AuthProvider, useAuth } from './contexts/AuthContext';
+import { NotificationProvider, useNotificationsOptional } from './contexts/NotificationContext';
 import ProtectedRoute from './components/ProtectedRoute';
 import LoginPage from './pages/LoginPage';
 import SignupPage from './pages/SignupPage';
@@ -75,10 +77,17 @@ function Header({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (va
   const [showResults, setShowResults] = useState(false);
   const location = useLocation();
   const navigate = useNavigate();
-  const { user } = useAuth();
+  const { user, profile } = useAuth();
+  const notifCtx = useNotificationsOptional();
+  const unreadNotifications = notifCtx?.unreadCount ?? 0;
   const isLive = location.pathname === '/live';
 
-  const userAvatar = user?.user_metadata?.avatar_url || user?.user_metadata?.avatar || MOCK_USER.avatar;
+  const userAvatar = profile?.avatar_url || user?.user_metadata?.avatar_url || user?.user_metadata?.avatar || MOCK_USER.avatar;
+  const avatarCacheKey = profile?.updated_at || profile?.avatar_url || '';
+  const userAvatarSrc =
+    typeof userAvatar === 'string' && userAvatar.startsWith('data:')
+      ? userAvatar
+      : `${userAvatar}${String(userAvatar).includes('?') ? '&' : '?'}t=${encodeURIComponent(String(avatarCacheKey))}`;
 
   useEffect(() => {
     const searchUsers = async () => {
@@ -96,7 +105,28 @@ function Header({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (va
           .limit(5);
 
         if (error) throw error;
-        setSearchResults(data || []);
+        let idMatch: any[] = [];
+        const trimmedQuery = searchQuery.trim();
+        if (trimmedQuery) {
+          const { data: byId, error: byIdError } = await supabase
+            .from('profiles')
+            .select('id, username, display_name, avatar_url')
+            .eq('id', trimmedQuery)
+            .limit(1);
+          if (!byIdError) {
+            idMatch = byId || [];
+          }
+        }
+
+        const merged = [...(data || []), ...idMatch];
+        const unique = merged.filter((row, idx, arr) => arr.findIndex((r) => r.id === row.id) === idx);
+        setSearchResults(
+          unique.map((row) => ({
+            ...row,
+            username: row.username || `user_${String(row.id).slice(0, 6)}`,
+            display_name: row.display_name || 'User',
+          }))
+        );
       } catch (err) {
         console.error('Error searching users:', err);
       } finally {
@@ -173,7 +203,7 @@ function Header({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (va
                           <button
                             key={result.id}
                             onClick={() => {
-                              navigate(`/profile/${result.username}`);
+                              navigate(`/profile/${result.id}`);
                               setShowResults(false);
                               setSearchQuery('');
                             }}
@@ -187,8 +217,8 @@ function Header({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (va
                               alt="" 
                             />
                             <div className="flex-1 min-w-0">
-                              <p className="text-sm font-bold truncate">@{result.username}</p>
-                              <p className="text-[10px] text-gray-500 truncate">{result.display_name}</p>
+                              <p className="text-sm font-bold truncate">@{result.username || `user_${String(result.id).slice(0, 6)}`}</p>
+                              <p className="text-[10px] text-gray-500 truncate">{result.display_name || 'User'}</p>
                             </div>
                           </button>
                         ))}
@@ -217,7 +247,25 @@ function Header({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (va
             <HeaderIcon to="/" icon={<Home size={20} />} label="Home" />
             <HeaderIcon to="/explore" icon={<Compass size={20} />} label="Explore" />
             <HeaderIcon to="/reels" icon={<PlaySquare size={20} />} label="Reels" />
-            <HeaderIcon to="/notifications" icon={<Bell size={20} />} label="Notifications" />
+            <NavLink
+              to="/notifications"
+              title="Notifications"
+              className={({ isActive }) =>
+                cn(
+                  'p-3 sm:p-2.5 rounded-xl transition-all relative group inline-flex items-center justify-center',
+                  isActive
+                    ? 'text-indigo-600 bg-indigo-50 dark:bg-indigo-900/20'
+                    : 'text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-900'
+                )
+              }
+            >
+              <Bell size={20} />
+              {unreadNotifications > 0 && (
+                <span className="absolute -top-0.5 -right-0.5 min-w-[18px] h-[18px] px-1 flex items-center justify-center rounded-full bg-indigo-600 text-white text-[10px] font-bold leading-none">
+                  {unreadNotifications > 99 ? '99+' : unreadNotifications}
+                </span>
+              )}
+            </NavLink>
           </div>
           
           <HeaderIcon to="/messages" icon={<MessageCircle size={20} className="sm:size-[22px]" />} label="Messages" />
@@ -235,8 +283,8 @@ function Header({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (va
             {darkMode ? <Sun size={16} /> : <Moon size={16} />}
           </button>
 
-          <NavLink to="/profile" className="w-8 h-8 sm:w-9 sm:h-9 rounded-full overflow-hidden border-2 border-gray-200 dark:border-gray-800 hover:border-indigo-500 transition-colors flex-shrink-0">
-            <img src={userAvatar} alt="Avatar" className="w-full h-full object-cover" />
+          <NavLink to={user?.id ? `/profile/${user.id}` : '/profile'} className="w-8 h-8 sm:w-9 sm:h-9 rounded-full overflow-hidden border-2 border-gray-200 dark:border-gray-800 hover:border-indigo-500 transition-colors flex-shrink-0 cursor-pointer">
+            <img src={userAvatarSrc} alt="Avatar" className="w-full h-full object-cover" />
           </NavLink>
         </div>
       </header>
@@ -297,7 +345,9 @@ export default function App() {
   return (
     <AuthProvider>
       <Router>
-        <AppContent />
+        <NotificationProvider>
+          <AppContent />
+        </NotificationProvider>
       </Router>
     </AuthProvider>
   );
@@ -381,6 +431,7 @@ function AppContent() {
                 <Route path="/hashtag/:tag" element={<ProtectedRoute><HashtagPage /></ProtectedRoute>} />
                 <Route path="/story/:id" element={<ProtectedRoute><StoryPage /></ProtectedRoute>} />
                 <Route path="/notifications" element={<ProtectedRoute><NotificationsPage /></ProtectedRoute>} />
+                <Route path="/post/:id" element={<ProtectedRoute><PostRedirectPage /></ProtectedRoute>} />
               </Routes>
             </AnimatePresence>
           </main>
