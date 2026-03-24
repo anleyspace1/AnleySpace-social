@@ -9,6 +9,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
 import multer from 'multer';
+import { registerAssetsSystem } from './assets_system/registerAssetsSystem.ts';
 
 dotenv.config();
 
@@ -312,6 +313,9 @@ async function startServer() {
   const logToFile = (msg: string) => {
     fs.appendFileSync(logFile, `${msg} - ${new Date().toISOString()}\n`);
   };
+
+  // Isolated plug-in style module registration for assets features.
+  registerAssetsSystem(app, db, logToFile);
 
   /** Display name for notification copy (profiles.username or "Someone"). */
   const fetchUsernameForUserId = async (userId: string): Promise<string> => {

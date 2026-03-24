@@ -27,7 +27,9 @@ import {
   CheckCircle2,
   Circle,
   ListTodo,
-  GripVertical
+  GripVertical,
+  Play,
+  Upload
 } from 'lucide-react';
 import { useNavigate, useSearchParams, useLocation } from 'react-router-dom';
 import { cn } from '../lib/utils';
@@ -39,6 +41,13 @@ import { useAuth } from '../contexts/AuthContext';
 import ShareModal from '../components/ShareModal';
 import StoryEditor from '../components/StoryEditor';
 import { ResponsiveImage } from '../components/ResponsiveImage';
+
+/** Home feed: white cards on #F5F6FA (see App layout when path is `/`). */
+const homeCard =
+  'bg-white rounded-[12px] shadow-[0_1px_3px_rgba(0,0,0,0.05),0_4px_14px_rgba(0,0,0,0.04)] border border-gray-100';
+
+const exploreGlassCard =
+  'bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl shadow-lg shadow-black/20 hover:scale-[1.02] transition-all duration-300 hover:shadow-xl hover:shadow-indigo-500/20';
 
 const resolveProfileUsername = (username?: string | null) => {
   const value = (username || '').trim();
@@ -142,18 +151,18 @@ export default function HomePage() {
   };
 
   return (
-    <div className="w-full lg:max-w-3xl lg:mx-auto space-y-4 lg:space-y-6">
+    <div className="w-full min-h-full lg:max-w-3xl lg:mx-auto space-y-4 lg:space-y-6">
       {category && (
-        <div className="bg-white dark:bg-gray-900 p-4 rounded-none lg:rounded-2xl shadow-sm border-b lg:border border-gray-100 dark:border-gray-800 flex items-center justify-between">
+        <div className={cn(homeCard, 'p-5 flex items-center justify-between')}>
           <div className="flex items-center gap-2">
             <span className="text-gray-500 text-sm">Category:</span>
-            <span className="bg-indigo-100 dark:bg-indigo-900/40 text-indigo-600 dark:text-indigo-400 px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider">
+            <span className="bg-indigo-50 text-indigo-700 px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider">
               {category}
             </span>
           </div>
           <button
             onClick={() => navigate('/')}
-            className="text-xs text-gray-400 hover:text-indigo-600 transition-colors font-bold"
+            className="text-xs text-indigo-600 hover:text-indigo-800 transition-colors font-bold"
           >
             Clear Filter
           </button>
@@ -172,10 +181,22 @@ function Stories() {
   const [storyUploading, setStoryUploading] = useState(false);
   const [realStories, setRealStories] = useState<any[]>([]);
   const [avatarStoriesMap, setAvatarStoriesMap] = useState<Record<string, any[]>>({});
-  const fileInputRef = React.useRef<HTMLInputElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const seenHydratedRef = React.useRef(false);
   const { user } = useAuth();
   const location = useLocation();
+
+  /** Local preview before posting (gallery or camera capture). */
+  const [previewFile, setPreviewFile] = useState<File | null>(null);
+  const [previewObjectUrl, setPreviewObjectUrl] = useState<string | null>(null);
+  const [cameraMode, setCameraMode] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const cameraStreamRef = useRef<MediaStream | null>(null);
+  const cameraVideoRef = useRef<HTMLVideoElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const discardRecordingRef = useRef(false);
+  const expectingRecorderOnStopRef = useRef(false);
 
   useEffect(() => {
     try {
@@ -270,11 +291,81 @@ function Stories() {
     return result;
   })();
 
-  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    console.log('[trace:story-upload] 1 handleFileChange entered');
-    const file = e.target.files?.[0];
-    if (!file) return;
+  const clearPreview = useCallback(() => {
+    if (previewObjectUrl) {
+      URL.revokeObjectURL(previewObjectUrl);
+    }
+    setPreviewObjectUrl(null);
+    setPreviewFile(null);
+  }, [previewObjectUrl]);
 
+  const finalizeCameraStream = useCallback(() => {
+    expectingRecorderOnStopRef.current = false;
+    mediaRecorderRef.current = null;
+    setRecording(false);
+    recordedChunksRef.current = [];
+    cameraStreamRef.current?.getTracks().forEach((t) => t.stop());
+    cameraStreamRef.current = null;
+    if (cameraVideoRef.current) {
+      cameraVideoRef.current.srcObject = null;
+    }
+    setCameraMode(false);
+  }, []);
+
+  const closeCamera = useCallback(() => {
+    const mr = mediaRecorderRef.current;
+    if (mr && mr.state !== 'inactive') {
+      discardRecordingRef.current = true;
+      expectingRecorderOnStopRef.current = true;
+      mr.stop();
+      return;
+    }
+    if (mr && mr.state === 'inactive' && expectingRecorderOnStopRef.current) {
+      return;
+    }
+    finalizeCameraStream();
+  }, [finalizeCameraStream]);
+
+  useEffect(() => {
+    return () => {
+      if (previewObjectUrl) URL.revokeObjectURL(previewObjectUrl);
+      cameraStreamRef.current?.getTracks().forEach((t) => t.stop());
+    };
+  }, [previewObjectUrl]);
+
+  useEffect(() => {
+    if (!cameraMode || !cameraStreamRef.current) return;
+    const v = cameraVideoRef.current;
+    if (v) {
+      v.srcObject = cameraStreamRef.current;
+      v.play().catch(() => {});
+    }
+    return () => {
+      if (v) v.srcObject = null;
+    };
+  }, [cameraMode]);
+
+  const onGalleryFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (!file.type.startsWith('image/') && !file.type.startsWith('video/')) {
+      alert('Please choose an image or video file.');
+      return;
+    }
+    clearPreview();
+    setPreviewFile(file);
+    setPreviewObjectUrl(URL.createObjectURL(file));
+  };
+
+  const chooseFromDevice = () => {
+    if (cameraMode) {
+      finalizeCameraStream();
+    }
+    requestAnimationFrame(() => fileInputRef.current?.click());
+  };
+
+  const uploadStoryFile = async (file: File) => {
     if (!user?.id) {
       alert('You must be logged in');
       return;
@@ -301,56 +392,133 @@ function Stories() {
     formData.append('username', username);
     formData.append('avatar', avatar);
 
+    const res = await fetch(apiUrl('/api/stories'), {
+      method: 'POST',
+      body: formData,
+    });
+
+    const text = await res.text();
+    let data: { ok?: boolean; error?: string } | undefined;
+    try {
+      data = text ? JSON.parse(text) : undefined;
+    } catch {
+      console.error('UPLOAD: non-JSON response body:', text.slice(0, 500));
+      throw new Error('Invalid server response');
+    }
+
+    if (!res.ok || data?.ok === false) {
+      throw new Error(data?.error || 'Upload failed');
+    }
+
+    await fetchStories();
+    await fetchActiveStoriesMap().then((map) => setAvatarStoriesMap(map));
+  };
+
+  const confirmStoryPost = async () => {
+    if (!previewFile || !user?.id) return;
     setStoryUploading(true);
     try {
-      console.log('[trace:story-upload] 2 FormData ready, about to fetch POST /api/stories');
-      console.log('🚀 UPLOAD START');
-      console.log('FINAL FRONTEND CHECK:', {
-        hasFile: !!file,
-        userId: user?.id,
-        username,
-      });
-
-      const res = await fetch(apiUrl('/api/stories'), {
-        method: 'POST',
-        body: formData,
-      });
-
-      console.log('[trace:story-upload] 3 fetch resolved, status=', res.status, 'ok=', res.ok);
-      console.log('STATUS:', res.status);
-
-      const text = await res.text();
-      let data: { ok?: boolean; error?: string } | undefined;
-      try {
-        data = text ? JSON.parse(text) : undefined;
-      } catch {
-        console.error('UPLOAD: non-JSON response body:', text.slice(0, 500));
-        throw new Error('Invalid server response');
-      }
-      console.log('RESPONSE:', data);
-
-      if (!res.ok || data?.ok === false) {
-        console.log(
-          '[trace:story-upload] 4 client will throw (bad response)',
-          { resOk: res.ok, dataOk: data?.ok, serverError: data?.error }
-        );
-        throw new Error(data?.error || 'Upload failed');
-      }
-
-      console.log('[trace:story-upload] 5 success path, refreshing stories');
-      console.log('✅ UPLOAD SUCCESS');
-
-      await fetchStories();
-      await fetchActiveStoriesMap().then((map) => setAvatarStoriesMap(map));
+      await uploadStoryFile(previewFile);
+      clearPreview();
     } catch (err) {
-      console.log('[trace:story-upload] 6 catch (alert path)', err);
-      console.error('❌ UPLOAD ERROR:', err);
-      alert('Failed to upload story. Please try again.');
+      console.error('Story upload error:', err);
+      alert(err instanceof Error ? err.message : 'Failed to upload story. Please try again.');
     } finally {
-      console.log('[trace:story-upload] 7 finally: clearing uploading state + input');
       setStoryUploading(false);
-      e.currentTarget.value = '';
     }
+  };
+
+  const openCamera = async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      alert('Camera is not supported in this browser.');
+      return;
+    }
+    try {
+      clearPreview();
+      expectingRecorderOnStopRef.current = false;
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user' },
+        audio: true,
+      });
+      cameraStreamRef.current = stream;
+      setCameraMode(true);
+    } catch (err) {
+      console.error(err);
+      alert('Could not access the camera. Please allow permission or use gallery.');
+    }
+  };
+
+  const capturePhotoFromCamera = () => {
+    const video = cameraVideoRef.current;
+    if (!video || video.videoWidth < 2) return;
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.drawImage(video, 0, 0);
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) return;
+        const f = new File([blob], `story-${Date.now()}.jpg`, { type: 'image/jpeg' });
+        clearPreview();
+        setPreviewFile(f);
+        setPreviewObjectUrl(URL.createObjectURL(f));
+        finalizeCameraStream();
+      },
+      'image/jpeg',
+      0.92
+    );
+  };
+
+  const startVideoRecording = () => {
+    const stream = cameraStreamRef.current;
+    if (!stream) return;
+    recordedChunksRef.current = [];
+    discardRecordingRef.current = false;
+    const mime =
+      MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+        ? 'video/webm;codecs=vp9'
+        : MediaRecorder.isTypeSupported('video/webm')
+          ? 'video/webm'
+          : 'video/mp4';
+    let mr: MediaRecorder;
+    try {
+      mr = new MediaRecorder(stream, { mimeType: mime });
+    } catch {
+      mr = new MediaRecorder(stream);
+    }
+    mediaRecorderRef.current = mr;
+    mr.ondataavailable = (ev) => {
+      if (ev.data.size) recordedChunksRef.current.push(ev.data);
+    };
+    mr.onstop = () => {
+      expectingRecorderOnStopRef.current = false;
+      if (discardRecordingRef.current) {
+        discardRecordingRef.current = false;
+        finalizeCameraStream();
+        return;
+      }
+      const blob = new Blob(recordedChunksRef.current, { type: mr.mimeType || 'video/webm' });
+      const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
+      const f = new File([blob], `story-${Date.now()}.${ext}`, { type: blob.type || 'video/webm' });
+      clearPreview();
+      setPreviewFile(f);
+      setPreviewObjectUrl(URL.createObjectURL(f));
+      finalizeCameraStream();
+    };
+    mr.start(200);
+    setRecording(true);
+  };
+
+  const stopVideoRecording = () => {
+    const mr = mediaRecorderRef.current;
+    if (mr && mr.state !== 'inactive') {
+      discardRecordingRef.current = false;
+      expectingRecorderOnStopRef.current = true;
+      mr.stop();
+    }
+    setRecording(false);
   };
 
   const navigate = useNavigate();
@@ -404,26 +572,42 @@ function Stories() {
     return storyThumbnailSrc(story);
   }
 
+  /** Valid HTTPS URL for a video file — use <video> for preview, not <img>. */
+  function storyVideoSrc(story: any): string | null {
+    const raw = typeof story.media_url_raw === 'string' ? story.media_url_raw.trim() : '';
+    const resolved = typeof story.media_url === 'string' ? story.media_url.trim() : '';
+    const img = typeof story.image_url === 'string' ? story.image_url.trim() : '';
+    const tryUrl = (u: string) => {
+      if (!u || !isValidStoryImgSrc(u)) return null;
+      if (/\.(mp4|webm|ogg)(\?|$)/i.test(u)) return u;
+      return null;
+    };
+    const fromVideo = tryUrl(raw) || tryUrl(resolved) || tryUrl(img);
+    if (fromVideo) return fromVideo;
+    if (story.media_type === 'video' && raw && isValidStoryImgSrc(raw)) return raw;
+    return null;
+  }
+
   return (
-    <div className="bg-white dark:bg-gray-900 rounded-none lg:rounded-2xl p-4 shadow-sm border-b lg:border border-gray-100 dark:border-gray-800 overflow-hidden">
+    <div className={cn(homeCard, 'p-5 overflow-hidden')}>
       <div className="flex items-center justify-between mb-4 px-1">
-        <h3 className="font-bold text-sm">Stories</h3>
+        <h3 className="text-gray-900 font-bold text-sm">Stories</h3>
         <button className="text-gray-400"><MoreHorizontal size={18} /></button>
       </div>
+      <input
+        type="file"
+        ref={fileInputRef}
+        className="hidden"
+        accept="image/*,video/*"
+        onChange={onGalleryFileChange}
+        disabled={storyUploading}
+      />
       <div className="flex items-center gap-3 overflow-x-auto no-scrollbar pb-2 px-1">
-        {/* Add Story Button */}
-        <input
-          type="file"
-          ref={fileInputRef}
-          className="hidden"
-          accept="image/*,video/*"
-          onChange={handleFileChange}
-          disabled={storyUploading}
-        />
+        {/* Add Story — tap opens device camera */}
         <button
           type="button"
-          onClick={() => !storyUploading && fileInputRef.current?.click()}
-          disabled={storyUploading}
+          onClick={() => !storyUploading && !cameraMode && void openCamera()}
+          disabled={storyUploading || cameraMode}
           className="flex flex-col items-center gap-1 flex-shrink-0 disabled:opacity-60"
         >
           <div className="relative w-14 h-14 sm:w-16 sm:h-16 rounded-full border-2 border-dashed border-gray-300 dark:border-gray-700 flex items-center justify-center text-gray-400 hover:border-indigo-500 hover:text-indigo-500 transition-all group">
@@ -433,7 +617,7 @@ function Stories() {
               <Plus size={18} className="group-hover:scale-110 transition-transform" />
             )}
           </div>
-          <span className="text-[9px] sm:text-[10px] font-bold text-gray-500 dark:text-gray-400">
+          <span className="text-[9px] sm:text-[10px] font-bold text-gray-400">
             {storyUploading ? 'Uploading…' : 'Your Story'}
           </span>
         </button>
@@ -449,6 +633,7 @@ function Stories() {
             !!(typeof story.media_url_raw === 'string' &&
               story.media_url_raw.match(/\.(mp4|webm|ogg)$/i));
           const thumbSrc = storyRowThumbSrc(story);
+          const videoSrc = storyVideoSrc(story);
           return (
             <button
               key={story.id}
@@ -462,30 +647,160 @@ function Stories() {
                 <div className="w-full h-full rounded-full border-2 border-white dark:border-black overflow-hidden bg-gray-100 dark:bg-gray-800">
                   <div className="w-full h-full rounded-full overflow-hidden">
                     <div className="relative w-full h-full">
-                      <img
-                        src={thumbSrc}
-                        alt=""
-                        className="w-full h-full object-cover rounded-full"
-                        onError={(e) => {
-                          const el = e.currentTarget;
-                          if (el.src.includes('default-story.png')) return;
-                          el.src = DEFAULT_STORY_THUMB;
-                        }}
-                      />
+                      {videoSrc ? (
+                        <video
+                          key={videoSrc}
+                          src={videoSrc}
+                          muted
+                          playsInline
+                          preload="metadata"
+                          className="absolute inset-0 h-full w-full object-cover object-center rounded-full"
+                          aria-hidden
+                          onLoadedData={(e) => {
+                            try {
+                              const v = e.currentTarget;
+                              if (v.readyState >= 2) v.currentTime = 0.001;
+                            } catch {
+                              /* ignore seek errors */
+                            }
+                          }}
+                        />
+                      ) : (
+                        <img
+                          src={thumbSrc}
+                          alt=""
+                          className="w-full h-full object-cover rounded-full"
+                          onError={(e) => {
+                            const el = e.currentTarget;
+                            if (el.src.includes('default-story.png')) return;
+                            el.src = DEFAULT_STORY_THUMB;
+                          }}
+                        />
+                      )}
                       {isVideo && (
-                        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                          <span style={{ fontSize: '18px', color: 'white' }}>▶</span>
+                        <div
+                          className="pointer-events-none absolute inset-0 flex items-center justify-center rounded-full bg-black/25"
+                          aria-hidden
+                        >
+                          <div className="flex h-9 w-9 items-center justify-center rounded-full bg-black/60 text-white shadow-lg ring-2 ring-white/40">
+                            <Play size={18} fill="currentColor" className="ml-0.5" />
+                          </div>
                         </div>
                       )}
                     </div>
                   </div>
                 </div>
               </div>
-              <span className="text-[9px] sm:text-[10px] font-bold text-gray-500 dark:text-gray-400 truncate w-14 sm:w-16 text-center">{story.user}</span>
+              <span className="text-[9px] sm:text-[10px] font-bold text-gray-400 truncate w-14 sm:w-16 text-center">{story.user}</span>
             </button>
           );
         })}
       </div>
+
+      {cameraMode && (
+        <div className="mt-4 rounded-2xl border border-gray-100 bg-gray-50 p-3 shadow-inner">
+          <div className="relative aspect-video w-full max-h-[min(280px,50vh)] overflow-hidden rounded-xl bg-black">
+            <video
+              ref={cameraVideoRef}
+              autoPlay
+              playsInline
+              muted
+              className="h-full w-full object-cover"
+            />
+            {recording && (
+              <span className="absolute left-3 top-3 flex items-center gap-1.5 rounded-full bg-red-600 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-white">
+                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white" />
+                Rec
+              </span>
+            )}
+          </div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={chooseFromDevice}
+              disabled={recording || storyUploading}
+              className="rounded-xl border border-indigo-200 bg-white px-3 py-2 text-xs font-semibold text-indigo-700 hover:bg-indigo-50 disabled:opacity-50"
+            >
+              <span className="inline-flex items-center gap-1.5">
+                <Upload size={14} />
+                Choose from device
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={capturePhotoFromCamera}
+              disabled={recording}
+              className="rounded-xl bg-indigo-600 px-3 py-2 text-xs font-semibold text-white hover:bg-indigo-700 disabled:opacity-50"
+            >
+              Capture photo
+            </button>
+            {!recording ? (
+              <button
+                type="button"
+                onClick={startVideoRecording}
+                className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-xs font-semibold text-gray-800 hover:bg-gray-50"
+              >
+                Record video
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={stopVideoRecording}
+                className="rounded-xl bg-red-600 px-3 py-2 text-xs font-semibold text-white hover:bg-red-700"
+              >
+                Stop
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={closeCamera}
+              className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-xs font-semibold text-gray-600 hover:bg-gray-50"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+
+      {previewFile && previewObjectUrl && !cameraMode && (
+        <div className="mt-4 rounded-2xl border border-indigo-100 bg-gradient-to-b from-indigo-50/80 to-white p-3">
+          <p className="mb-2 text-xs font-semibold text-gray-600">Preview before posting</p>
+          <div className="relative max-h-[min(320px,55vh)] overflow-hidden rounded-xl bg-black/5">
+            {previewFile.type.startsWith('video/') ? (
+              <video
+                src={previewObjectUrl}
+                controls
+                playsInline
+                className="mx-auto max-h-[min(320px,55vh)] w-full object-contain"
+              />
+            ) : (
+              <img
+                src={previewObjectUrl}
+                alt="Story preview"
+                className="mx-auto max-h-[min(320px,55vh)] w-full object-contain"
+              />
+            )}
+          </div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={confirmStoryPost}
+              disabled={storyUploading}
+              className="rounded-xl bg-gradient-to-r from-indigo-500 to-purple-600 px-4 py-2 text-sm font-bold text-white shadow-sm hover:opacity-95 disabled:opacity-50"
+            >
+              {storyUploading ? 'Posting…' : 'Post story'}
+            </button>
+            <button
+              type="button"
+              onClick={clearPreview}
+              disabled={storyUploading}
+              className="rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm font-semibold text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -497,26 +812,26 @@ function CreatePost({ onGoLive, onPostCreated }: { onGoLive: () => void; onPostC
 
   return (
     <>
-      <div className="bg-white dark:bg-gray-900 rounded-none lg:rounded-2xl p-4 shadow-sm border-b lg:border border-gray-100 dark:border-gray-800">
+      <div className={cn(homeCard, 'p-5')}>
         <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 mb-4">
           <div className="flex items-center gap-3 flex-1">
             <img src={profile?.avatar_url || MOCK_USER.avatar} alt="" className="w-10 h-10 rounded-full object-cover flex-shrink-0" referrerPolicy="no-referrer" />
             <button
               onClick={() => setIsModalOpen(true)}
-              className="flex-1 bg-gray-100 dark:bg-gray-800 text-gray-500 text-left px-4 py-2.5 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors text-sm truncate"
+              className="flex-1 bg-gray-50 border border-gray-100 text-gray-500 text-left px-4 py-2.5 rounded-xl hover:bg-gray-100 transition text-sm truncate"
             >
               What's on your mind, {profile?.display_name?.split(' ')[0] || 'friend'}?
             </button>
           </div>
           <button
             onClick={onGoLive}
-            className="bg-red-500 text-white px-4 py-2.5 rounded-full hover:bg-red-600 transition-all flex items-center justify-center gap-2 font-bold text-sm shadow-lg shadow-red-500/20 whitespace-nowrap"
+            className="bg-gradient-to-r from-indigo-500 to-purple-600 rounded-xl px-4 py-2 hover:opacity-90 transition text-white flex items-center justify-center gap-2 font-bold text-sm whitespace-nowrap"
           >
             <Radio size={18} className="animate-pulse" />
             <span>Go Live</span>
           </button>
         </div>
-        <div className="flex items-center justify-between pt-4 border-t border-gray-100 dark:border-gray-800 overflow-x-auto no-scrollbar gap-2">
+        <div className="flex items-center justify-between pt-4 border-t border-gray-100 overflow-x-auto no-scrollbar gap-2">
           <PostAction onClick={onGoLive} icon={<Video className="text-red-500" />} label="Live" />
           <PostAction onClick={() => setIsModalOpen(true)} icon={<ImageIcon className="text-green-500" />} label="Photo/Video" />
           <PostAction onClick={() => setIsModalOpen(true)} icon={<Smile className="text-yellow-500" />} label="Feeling/Activity" />
@@ -549,7 +864,72 @@ function CreatePostModal({
   const [content, setContent] = useState('');
   const [imageUrl, setImageUrl] = useState('');
   const [videoUrl, setVideoUrl] = useState('');
+  /** Optional paste fields — never show stored public URLs here after commit. */
+  const [imageUrlDraft, setImageUrlDraft] = useState('');
+  const [videoUrlDraft, setVideoUrlDraft] = useState('');
   const [busy, setBusy] = useState(false);
+  const [uploading, setUploading] = useState<'image' | 'video' | null>(null);
+  /** Matches feed PostItem: portrait → natural width; landscape/square → cover + fixed frame */
+  const [previewImageMode, setPreviewImageMode] = useState<'portrait' | 'landscape' | null>(null);
+  const imageFileRef = useRef<HTMLInputElement>(null);
+  const videoFileRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    setPreviewImageMode(null);
+  }, [imageUrl]);
+
+  const handlePreviewImageLoad = useCallback((e: React.SyntheticEvent<HTMLImageElement>) => {
+    const { naturalWidth: w, naturalHeight: h } = e.currentTarget;
+    if (w > 0 && h > 0) {
+      setPreviewImageMode(h > w ? 'portrait' : 'landscape');
+    }
+  }, []);
+
+  const commitImageDraft = () => {
+    const t = imageUrlDraft.trim();
+    if (t) {
+      setImageUrl(t);
+      setImageUrlDraft('');
+    }
+  };
+
+  const commitVideoDraft = () => {
+    const t = videoUrlDraft.trim();
+    if (t) {
+      setVideoUrl(t);
+      setVideoUrlDraft('');
+    }
+  };
+
+  const uploadFeedFile = async (file: File, kind: 'image' | 'video') => {
+    if (!user) {
+      alert('Please log in to post.');
+      return;
+    }
+    setUploading(kind);
+    try {
+      const ext = file.name.includes('.') ? file.name.split('.').pop() : kind === 'image' ? 'jpg' : 'mp4';
+      const safeName = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
+      const filePath = `feed/${user.id}/${safeName}`;
+      const { error: uploadError } = await supabase.storage.from('posts').upload(filePath, file);
+      if (uploadError) {
+        if (uploadError.message.includes('Bucket not found')) {
+          throw new Error('Storage bucket "posts" not found. Create a public "posts" bucket in Supabase.');
+        }
+        throw uploadError;
+      }
+      const { data: { publicUrl } } = supabase.storage.from('posts').getPublicUrl(filePath);
+      if (kind === 'image') {
+        setImageUrl(publicUrl);
+        setImageUrlDraft('');
+      } else {
+        setVideoUrl(publicUrl);
+        setVideoUrlDraft('');
+      }
+    } finally {
+      setUploading(null);
+    }
+  };
 
   const publish = async () => {
     if (!user) {
@@ -584,22 +964,27 @@ function CreatePostModal({
   return (
     <div className="fixed inset-0 z-[180] flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative w-full max-w-lg rounded-3xl bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-800 shadow-2xl p-6">
-        <div className="flex items-start justify-between gap-4 mb-4">
-          <div>
-            <h3 className="text-xl font-bold">Create Post</h3>
-            <p className="text-xs text-gray-500 mt-1">Share something with your community.</p>
+      <div
+        role="dialog"
+        aria-modal="true"
+        className="relative flex w-full max-w-lg max-h-[90vh] flex-col overflow-hidden rounded-3xl border border-gray-100 bg-white shadow-2xl dark:border-gray-800 dark:bg-gray-900"
+      >
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 pt-6">
+          <div className="flex items-start justify-between gap-4 mb-4">
+            <div>
+              <h3 className="text-xl font-bold">Create Post</h3>
+              <p className="text-xs text-gray-500 mt-1">Share something with your community.</p>
+            </div>
+            <button
+              onClick={onClose}
+              className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-full transition-colors shrink-0"
+              aria-label="Close"
+            >
+              <X size={20} />
+            </button>
           </div>
-          <button
-            onClick={onClose}
-            className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-full transition-colors"
-            aria-label="Close"
-          >
-            <X size={20} />
-          </button>
-        </div>
 
-        <div className="space-y-4">
+          <div className="space-y-4 pb-2">
           <textarea
             value={content}
             onChange={(e) => setContent(e.target.value)}
@@ -609,28 +994,158 @@ function CreatePostModal({
           />
 
           <div className="space-y-2">
-            <label className="text-xs font-bold text-gray-500 uppercase tracking-wider">Image URL (optional)</label>
-            <input
-              value={imageUrl}
-              onChange={(e) => setImageUrl(e.target.value)}
-              placeholder="https://..."
-              className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl px-3 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-            />
+            <label className="text-xs font-bold text-gray-500 uppercase tracking-wider">Image (optional)</label>
+            {imageUrl ? (
+              <div className="relative rounded-2xl overflow-hidden border border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800/80">
+                <div
+                  className={cn(
+                    'relative w-full',
+                    previewImageMode === 'landscape' && 'h-[min(380px,52vh)] sm:h-[400px]'
+                  )}
+                >
+                  <img
+                    src={imageUrl}
+                    alt="Selected image preview"
+                    className={cn(
+                      previewImageMode === 'landscape'
+                        ? 'h-full w-full object-cover object-center'
+                        : 'block w-full h-auto max-h-[min(92vh,1200px)] object-contain'
+                    )}
+                    onLoad={handlePreviewImageLoad}
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setImageUrl('');
+                    setImageUrlDraft('');
+                  }}
+                  className="absolute top-2 right-2 p-1.5 rounded-full bg-black/50 text-white hover:bg-black/70 transition-colors z-10"
+                  aria-label="Remove image"
+                >
+                  <X size={16} />
+                </button>
+              </div>
+            ) : null}
+            <div className="flex gap-2 items-stretch">
+              <input
+                type="file"
+                ref={imageFileRef}
+                accept="image/*"
+                className="hidden"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  e.target.value = '';
+                  if (!f) return;
+                  uploadFeedFile(f, 'image').catch((err: unknown) => {
+                    console.error(err);
+                    alert(err instanceof Error ? err.message : 'Image upload failed');
+                  });
+                }}
+              />
+              <input
+                value={imageUrlDraft}
+                onChange={(e) => setImageUrlDraft(e.target.value)}
+                onBlur={commitImageDraft}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    commitImageDraft();
+                  }
+                }}
+                placeholder="Paste image URL (optional)"
+                className="min-w-0 flex-1 bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl px-3 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              />
+              <button
+                type="button"
+                onClick={() => imageFileRef.current?.click()}
+                disabled={!!uploading || busy}
+                title="Upload image"
+                aria-label="Upload image from device"
+                className="shrink-0 flex items-center justify-center px-3 rounded-2xl border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-800 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-gray-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <ImageIcon size={20} />
+              </button>
+            </div>
+            {uploading === 'image' && (
+              <p className="text-xs text-gray-500">Uploading image…</p>
+            )}
           </div>
 
           <div className="space-y-2">
-            <label className="text-xs font-bold text-gray-500 uppercase tracking-wider">Video URL (optional)</label>
-            <input
-              value={videoUrl}
-              onChange={(e) => setVideoUrl(e.target.value)}
-              placeholder="https://..."
-              className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl px-3 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-            />
+            <label className="text-xs font-bold text-gray-500 uppercase tracking-wider">Video (optional)</label>
+            {videoUrl ? (
+              <div className="relative rounded-2xl overflow-hidden border border-gray-200 dark:border-gray-700 bg-black/80">
+                <video
+                  src={videoUrl}
+                  controls
+                  playsInline
+                  className="w-full max-h-48 object-contain"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    setVideoUrl('');
+                    setVideoUrlDraft('');
+                  }}
+                  className="absolute top-2 right-2 p-1.5 rounded-full bg-black/50 text-white hover:bg-black/70 transition-colors"
+                  aria-label="Remove video"
+                >
+                  <X size={16} />
+                </button>
+              </div>
+            ) : null}
+            <div className="flex gap-2 items-stretch">
+              <input
+                type="file"
+                ref={videoFileRef}
+                accept="video/*"
+                className="hidden"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  e.target.value = '';
+                  if (!f) return;
+                  uploadFeedFile(f, 'video').catch((err: unknown) => {
+                    console.error(err);
+                    alert(err instanceof Error ? err.message : 'Video upload failed');
+                  });
+                }}
+              />
+              <input
+                value={videoUrlDraft}
+                onChange={(e) => setVideoUrlDraft(e.target.value)}
+                onBlur={commitVideoDraft}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    commitVideoDraft();
+                  }
+                }}
+                placeholder="Paste video URL (optional)"
+                className="min-w-0 flex-1 bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl px-3 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              />
+              <button
+                type="button"
+                onClick={() => videoFileRef.current?.click()}
+                disabled={!!uploading || busy}
+                title="Upload video"
+                aria-label="Upload video from device"
+                className="shrink-0 flex items-center justify-center px-3 rounded-2xl border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-800 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-gray-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Video size={20} />
+              </button>
+            </div>
+            {uploading === 'video' && (
+              <p className="text-xs text-gray-500">Uploading video…</p>
+            )}
           </div>
+          </div>
+        </div>
 
+        <div className="shrink-0 border-t border-gray-100 bg-white px-6 pb-6 pt-4 dark:border-gray-800 dark:bg-gray-900">
           <button
             onClick={publish}
-            disabled={busy}
+            disabled={busy || !!uploading}
             className="w-full bg-indigo-600 hover:bg-indigo-700 text-white py-3 rounded-2xl font-bold transition-all shadow-lg shadow-indigo-500/20 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {busy ? 'Posting...' : 'Post'}
@@ -820,7 +1335,7 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
   const filteredPosts = posts;
 
   return (
-    <div className="space-y-4 lg:space-y-6 pb-4">
+    <div className="space-y-6 pb-4">
       {filteredPosts.length > 0 ? (
         filteredPosts.map((post, index) => (
           <React.Fragment key={post.id}>
@@ -844,16 +1359,41 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
           </React.Fragment>
         ))
       ) : (
-        <div className="bg-white dark:bg-gray-900 rounded-2xl p-12 text-center border border-gray-100 dark:border-gray-800">
-          <div className="w-16 h-16 bg-gray-100 dark:bg-gray-800 rounded-full flex items-center justify-center mx-auto mb-4">
+        <div className={cn(homeCard, 'p-8 text-center')}>
+          <div className="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-4">
             <ShoppingBag size={32} className="text-gray-400" />
           </div>
-          <h3 className="font-bold text-lg mb-2">No posts found</h3>
+          <h3 className="text-gray-900 font-bold text-lg mb-2">No posts found</h3>
           <p className="text-gray-500 text-sm">Be the first to post in this category!</p>
         </div>
       )}
     </div>
   );
+}
+
+/** Relative time / short date for feed posts (e.g. "2h ago", "Mar 22"). */
+function formatPostTimestamp(iso: string | undefined | null): string {
+  if (!iso) return 'Just now';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return 'Just now';
+  const now = new Date();
+  const diffMs = now.getTime() - d.getTime();
+  if (diffMs < 0) {
+    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  }
+  const sec = Math.floor(diffMs / 1000);
+  if (sec < 45) return 'Just now';
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 7) return `${day}d ago`;
+  const sameYear = d.getFullYear() === now.getFullYear();
+  if (sameYear) {
+    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  }
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
 // -------------- Enhanced PostItem: video, double tap, avatar ring, nav ----------
@@ -901,6 +1441,9 @@ function PostItem({
   // Track if post video is visible
   const [videoVisible, setVideoVisible] = useState(false);
 
+  /** null = not loaded yet; portrait = tall → no crop; landscape/square → cover + max-height */
+  const [feedImageMode, setFeedImageMode] = useState<'portrait' | 'landscape' | null>(null);
+
   useEffect(() => {
     setEditContent(post.content ?? '');
   }, [post.id, post.content]);
@@ -920,12 +1463,16 @@ function PostItem({
   const videoUrl =
     typeof post.video_url === 'string' ? post.video_url.trim() : post.video_url;
 
+  useEffect(() => {
+    setFeedImageMode(null);
+  }, [imageUrl]);
+
   const postUser = {
     name: displayUsername,
     username: displayUsername,
     avatar: displayAvatar,
     user_id: post.user_id,
-    time: post.created_at ? new Date(post.created_at).toLocaleString() : 'Just now',
+    time: formatPostTimestamp(post.created_at),
     isMe: post.user_id === user?.id,
   };
 
@@ -1430,15 +1977,22 @@ function PostItem({
     });
   };
 
+  const handleFeedImageLoad = useCallback((e: React.SyntheticEvent<HTMLImageElement>) => {
+    const { naturalWidth: w, naturalHeight: h } = e.currentTarget;
+    if (w > 0 && h > 0) {
+      setFeedImageMode(h > w ? 'portrait' : 'landscape');
+    }
+  }, []);
+
   return (
-    <div className="bg-white dark:bg-gray-900 rounded-none lg:rounded-2xl shadow-sm border-b lg:border border-gray-100 dark:border-gray-800">
+    <div className={homeCard}>
       <div className="p-4 flex items-center justify-between">
         <div className="flex items-center gap-3">
           {/* AVATAR with story ring + navigation */}
           <button
             onClick={handleAvatarClick}
             className={cn(
-              "w-10 h-10 rounded-full border border-gray-100 dark:border-gray-800 overflow-hidden hover:opacity-80 transition-opacity relative flex-shrink-0",
+              'w-10 h-10 rounded-full border border-gray-200 overflow-hidden hover:opacity-80 transition-opacity relative flex-shrink-0',
               hasActiveStory && "ring-2 ring-yellow-400 ring-offset-2"
             )}
             style={
@@ -1459,7 +2013,7 @@ function PostItem({
             {/* USERNAME NAVIGATION */}
             <button
               onClick={handleProfileClick}
-              className="font-bold text-sm hover:underline hover:text-indigo-600 transition-colors block text-left"
+              className="text-gray-900 font-bold text-sm hover:underline hover:text-indigo-600 transition-colors block text-left"
             >
               {postUser.name}
             </button>
@@ -1504,16 +2058,14 @@ function PostItem({
             </div>
           </div>
         ) : (
-          <p className="text-sm mb-4">{renderTextWithHashtags(post.content ?? '', navigate)}</p>
+          <p className="text-sm text-gray-800 mb-4">{renderTextWithHashtags(post.content ?? '', navigate)}</p>
         )}
       </div>
 
       {(videoUrl || imageUrl) && (
         <div className="px-0 relative">
-          <div className="relative overflow-hidden bg-gray-100 dark:bg-gray-800 border-y lg:border lg:rounded-2xl border-gray-100 dark:border-gray-800 aspect-video flex items-center justify-center w-full">
-            {/* Double tap overlay for video or image */}
-            {videoUrl ? (
-              // Video: autoplay/muted/loop, click = /reels/:id, double tap = like + heart
+          {videoUrl ? (
+            <div className="relative overflow-hidden bg-gray-50 border border-gray-100 rounded-xl aspect-video flex items-center justify-center w-full">
               <div className="relative w-full h-full flex items-center justify-center select-none">
                 <video
                   ref={videoRef}
@@ -1523,33 +2075,43 @@ function PostItem({
                   loop
                   playsInline
                   className="w-full h-full object-contain bg-black"
-                  style={{ cursor: "pointer", background: "#000" }}
+                  style={{ cursor: 'pointer', background: '#000' }}
                   {...doubleTapHandlers}
                   onClick={(e) => {
                     if (e.detail === 1) {
-                      // Wait: will single tap become double? Defer navigation if double tap
                       setTimeout(() => {
                         if (!showHeart) handleVideoClick(e);
-                      }, 300); // match double tap delay
+                      }, 300);
                     }
                   }}
                 />
                 <HeartOverlay show={showHeart} />
               </div>
-            ) : (
-              // Image: use raw URL so Supabase storage works without transform API
-              <div className="relative w-full h-full flex items-center justify-center select-none">
+            </div>
+          ) : (
+            <div className="relative overflow-hidden bg-gray-100 border border-gray-100 rounded-xl w-full">
+              <div
+                className={cn(
+                  'relative w-full select-none',
+                  feedImageMode === 'landscape' && 'h-[min(380px,52vh)] sm:h-[400px]'
+                )}
+              >
                 <img
                   src={imageUrl || ''}
                   alt=""
-                  className="w-full h-full object-cover"
+                  className={cn(
+                    feedImageMode === 'landscape'
+                      ? 'h-full w-full object-cover object-center'
+                      : 'block w-full h-auto max-h-[min(92vh,1200px)] object-contain'
+                  )}
                   referrerPolicy="no-referrer"
+                  onLoad={handleFeedImageLoad}
                   {...doubleTapHandlers}
                 />
                 <HeartOverlay show={showHeart} />
               </div>
-            )}
-          </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -1564,9 +2126,9 @@ function PostItem({
             >
               <Heart size={10} fill="white" />
             </div>
-            <span className="text-xs text-gray-500">{formatCount(likesCount)}</span>
+            <span className="text-xs text-gray-400">{formatCount(likesCount)}</span>
           </div>
-          <div className="flex items-center gap-4 text-xs text-gray-500">
+          <div className="flex items-center gap-4 text-xs text-gray-400">
             <button onClick={() => setShowComments(!showComments)} className="hover:underline">
               {formatCount(commentsCount)} comments
             </button>
@@ -1574,7 +2136,7 @@ function PostItem({
           </div>
         </div>
 
-        <div className="flex items-center justify-between pt-4 border-t border-gray-100 dark:border-gray-800">
+        <div className="flex items-center justify-between pt-4 border-t border-gray-100">
           <FeedAction
             icon={
               <Heart
@@ -1614,7 +2176,7 @@ function PostItem({
               exit={{ height: 0, opacity: 0 }}
               className="overflow-hidden"
             >
-              <div className="pt-4 mt-4 border-t border-gray-100 dark:border-gray-800 space-y-4">
+              <div className="pt-4 mt-4 border-t border-gray-100 space-y-4">
                 <div className="space-y-4 max-h-[300px] overflow-y-auto no-scrollbar pr-2">
                   {loadingComments ? (
                     <div className="flex justify-center py-4">
@@ -1624,21 +2186,21 @@ function PostItem({
                     comments.map((comment) => (
                       <div key={comment.id} className="flex gap-3">
                         <ResponsiveImage src={comment.avatar} alt="" width={40} height={40} className="w-8 h-8 rounded-full object-cover" />
-                        <div className="flex-1 bg-gray-50 dark:bg-gray-800/50 p-3 rounded-2xl">
+                        <div className="flex-1 bg-gray-50 border border-gray-100 p-3 rounded-xl">
                           <div className="flex items-center justify-between mb-1">
-                            <span className="font-bold text-xs">@{comment.user}</span>
-                            <span className="text-[10px] text-gray-400">{comment.time}</span>
+                            <span className="font-bold text-xs text-gray-900">@{comment.user}</span>
+                            <span className="text-[10px] text-gray-500">{comment.time}</span>
                           </div>
-                          <p className="text-xs text-gray-700 dark:text-gray-300">{comment.text}</p>
+                          <p className="text-xs text-gray-700">{comment.text}</p>
                         </div>
                       </div>
                     ))
                   ) : (
-                    <p className="text-center text-xs text-gray-500 py-4">No comments yet. Be the first to comment!</p>
+                    <p className="text-center text-xs text-gray-400 py-4">No comments yet. Be the first to comment!</p>
                   )}
                 </div>
 
-                <form onSubmit={handleAddComment} className="flex items-center gap-2 bg-gray-100 dark:bg-gray-800 rounded-2xl p-1.5">
+                <form onSubmit={handleAddComment} className="flex items-center gap-2 bg-gray-50 border border-gray-100 rounded-xl p-1.5">
                   <ResponsiveImage src={profile?.avatar_url || MOCK_USER.avatar} alt="" width={40} height={40} className="w-7 h-7 rounded-full object-cover ml-1" />
                   <input
                     type="text"
@@ -1767,11 +2329,22 @@ function MenuButton({ icon, label, onClick, className }: { icon: React.ReactNode
 }
 
 export function RightSidebar() {
+  const location = useLocation();
+  const isHome = location.pathname === '/';
+
   return (
-    <aside className="hidden xl:block space-y-6 sticky top-22 h-fit w-80">
+    <aside
+      className={cn(
+        'hidden xl:block w-80 flex-shrink-0 space-y-5',
+        isHome
+          ? 'sticky top-14 sm:top-16 self-start h-[calc(100vh-3.5rem)] sm:h-[calc(100vh-4rem)] overflow-y-auto overflow-x-hidden no-scrollbar py-4 pl-4 pr-2 bg-[#F0F2F5] border-l border-gray-200/70'
+          : 'sticky top-22 h-fit'
+      )}
+    >
       <PeopleYouMayKnow />
       <TrendingSection />
       <SuggestedGroups />
+      <SuggestedForYou />
     </aside>
   );
 }
@@ -1811,48 +2384,148 @@ function FeedAction({
 
 function PeopleYouMayKnow() {
   const navigate = useNavigate();
+  const location = useLocation();
   const { user } = useAuth();
   const [following, setFollowing] = useState<Record<string, boolean>>({});
   const [people, setPeople] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    if (!user) {
+      setPeople([]);
+      setFollowing({});
+      setLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+
     const fetchSuggested = async () => {
-      if (!user) return;
+      setLoading(true);
       try {
-        const res = await fetch(`/api/users/suggestions?userId=${encodeURIComponent(user.id)}&limit=3`);
-        if (!res.ok) throw new Error('Failed to fetch suggestions');
-        const data = await res.json();
+        const uid = user.id;
+        const limit = 3;
 
-        if (data) {
-          setPeople(data);
+        const { data: profRows, error: profErr } = await supabase
+          .from('profiles')
+          .select('id, username, avatar_url')
+          .neq('id', uid)
+          .limit(40);
 
-          const { data: followsData } = await supabase
-            .from('follows')
-            .select('following_id')
-            .eq('follower_id', user.id)
-            .in('following_id', data.map(p => p.id));
-
-          const followingMap: Record<string, boolean> = {};
-          followsData?.forEach(f => {
-            followingMap[f.following_id] = true;
-          });
-          setFollowing(followingMap);
+        if (profErr) {
+          console.warn('[PeopleYouMayKnow] profiles:', profErr.message);
         }
+
+        let candidates: { id: string; username: string | null; avatar_url: string | null }[] = [
+          ...(profRows ?? []),
+        ];
+
+        if (candidates.length < 8) {
+          const { data: postRows } = await supabase
+            .from('posts')
+            .select('user_id')
+            .neq('user_id', uid)
+            .limit(100);
+          const authorIds = [
+            ...new Set(
+              (postRows ?? [])
+                .map((p: { user_id?: string }) => p.user_id)
+                .filter((id): id is string => typeof id === 'string' && id.length > 0 && id !== uid)
+            ),
+          ];
+          const have = new Set(candidates.map((c) => c.id));
+          const need = authorIds.filter((id) => !have.has(id)).slice(0, 24);
+          if (need.length > 0) {
+            const { data: extra } = await supabase
+              .from('profiles')
+              .select('id, username, avatar_url')
+              .in('id', need);
+            for (const row of extra ?? []) {
+              if (!candidates.some((c) => c.id === row.id)) candidates.push(row);
+            }
+          }
+        }
+
+        const { data: followsData } = await supabase
+          .from('follows')
+          .select('following_id')
+          .eq('follower_id', uid);
+        const followingIds = new Set((followsData ?? []).map((f) => f.following_id));
+
+        let pick = candidates.filter((c) => !followingIds.has(c.id));
+        if (pick.length < limit) {
+          pick = [...candidates];
+        }
+
+        pick = pick
+          .filter((c, i, a) => a.findIndex((x) => x.id === c.id) === i)
+          .sort(() => Math.random() - 0.5)
+          .slice(0, limit);
+
+        if (pick.length === 0) {
+          pick = [
+            {
+              id: '__pymk_fb_1__',
+              username: 'dance_queen',
+              avatar_url: 'https://picsum.photos/seed/pymkfb1/100/100',
+              _fallback: true,
+            },
+            {
+              id: '__pymk_fb_2__',
+              username: 'nature_lover',
+              avatar_url: 'https://picsum.photos/seed/pymkfb2/100/100',
+              _fallback: true,
+            },
+            {
+              id: '__pymk_fb_3__',
+              username: 'tech_guru',
+              avatar_url: 'https://picsum.photos/seed/pymkfb3/100/100',
+              _fallback: true,
+            },
+          ];
+        }
+
+        if (cancelled) return;
+
+        setPeople(pick);
+
+        const followingMap: Record<string, boolean> = {};
+        for (const p of pick) {
+          if ((p as { _fallback?: boolean })._fallback) continue;
+          if (followingIds.has(p.id)) followingMap[p.id] = true;
+        }
+        setFollowing(followingMap);
       } catch (err) {
         console.error('Error fetching suggested users:', err);
+        if (!cancelled) setPeople([]);
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     };
 
     fetchSuggested();
+    return () => {
+      cancelled = true;
+    };
   }, [user]);
 
-  const handleFollow = async (id: string) => {
+  const openProfileOrExplore = (person: { id: string; _fallback?: boolean }) => {
+    if (person._fallback) {
+      navigate('/explore');
+      return;
+    }
+    navigate(`/profile/${person.id}`);
+  };
+
+  const handleFollow = async (person: { id: string; _fallback?: boolean }) => {
     if (!user) return;
+    if (person._fallback) {
+      navigate('/explore');
+      return;
+    }
+    const id = person.id;
     const wasFollowing = following[id];
-    setFollowing(prev => ({ ...prev, [id]: !wasFollowing }));
+    setFollowing((prev) => ({ ...prev, [id]: !wasFollowing }));
 
     try {
       if (wasFollowing) {
@@ -1868,44 +2541,106 @@ function PeopleYouMayKnow() {
       }
     } catch (err) {
       console.error('Error toggling follow:', err);
-      setFollowing(prev => ({ ...prev, [id]: wasFollowing }));
+      setFollowing((prev) => ({ ...prev, [id]: wasFollowing }));
     }
   };
 
-  if (loading) return null;
-  if (people.length === 0) return null;
+  const isHomeFeed = location.pathname === '/';
+  const cardClass = cn(isHomeFeed ? homeCard : exploreGlassCard, 'p-5');
+
+  if (!user) return null;
+
+  if (loading) {
+    return (
+      <div className={cardClass}>
+        <h3 className={cn('font-bold text-sm mb-4', isHomeFeed ? 'text-gray-900' : 'text-white')}>
+          People You May Know
+        </h3>
+        <div className="space-y-4">
+          {[1, 2, 3].map((i) => (
+            <div key={i} className="flex items-center justify-between gap-2 animate-pulse">
+              <div className="flex min-w-0 flex-1 items-center gap-3">
+                <div className="h-10 w-10 shrink-0 rounded-full bg-gray-200 dark:bg-gray-700" />
+                <div className="h-4 max-w-[120px] flex-1 rounded bg-gray-200 dark:bg-gray-700" />
+              </div>
+              <div className="h-8 w-[72px] shrink-0 rounded-lg bg-gray-200 dark:bg-gray-700" />
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  if (people.length === 0) {
+    return (
+      <div className={cardClass}>
+        <h3 className={cn('font-bold text-sm mb-2', isHomeFeed ? 'text-gray-900' : 'text-white')}>
+          People You May Know
+        </h3>
+        <p className={cn('text-xs', isHomeFeed ? 'text-gray-500' : 'text-white/60')}>
+          No suggestions right now.
+        </p>
+      </div>
+    );
+  }
 
   return (
-    <div className="bg-white dark:bg-gray-900 rounded-none lg:rounded-2xl p-4 shadow-sm border-b lg:border border-gray-100 dark:border-gray-800">
-      <h3 className="font-bold text-sm mb-4">People You May Know</h3>
+    <div className={cardClass}>
+      <h3 className={cn('font-bold text-sm mb-4', isHomeFeed ? 'text-gray-900' : 'text-white')}>
+        People You May Know
+      </h3>
       <div className="space-y-4">
-        {people.map((person) => (
-          <div key={person.id} className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
+        {people.map((person) => {
+          const isFb = !!(person as { _fallback?: boolean })._fallback;
+          return (
+            <div key={person.id} className="flex items-center justify-between gap-2">
+              <div className="flex min-w-0 flex-1 items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => openProfileOrExplore(person as { id: string; _fallback?: boolean })}
+                  className={cn(
+                    'h-10 w-10 shrink-0 rounded-full overflow-hidden hover:opacity-80 transition-opacity',
+                    isHomeFeed ? 'border border-gray-200' : 'border border-gray-100 dark:border-gray-800'
+                  )}
+                >
+                  <img
+                    src={person.avatar_url || `https://picsum.photos/seed/${person.id}/100/100`}
+                    alt=""
+                    className="h-full w-full object-cover"
+                    referrerPolicy="no-referrer"
+                  />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => openProfileOrExplore(person as { id: string; _fallback?: boolean })}
+                  className={cn(
+                    'min-w-0 truncate text-left text-sm font-bold transition-colors hover:underline',
+                    isHomeFeed ? 'text-gray-900 hover:text-indigo-600' : 'text-white hover:text-indigo-300'
+                  )}
+                >
+                  {resolveProfileUsername(person.username)}
+                </button>
+              </div>
               <button
-                onClick={() => navigate(`/profile/${person.id}`)}
-                className="w-10 h-10 rounded-full border border-gray-100 dark:border-gray-800 overflow-hidden hover:opacity-80 transition-opacity"
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void handleFollow(person as { id: string; _fallback?: boolean });
+                }}
+                className={cn(
+                  'shrink-0 px-3 py-1 rounded-lg text-xs font-bold transition-all',
+                  isFb
+                    ? 'bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 hover:bg-indigo-100 dark:text-indigo-400'
+                    : following[person.id]
+                      ? 'bg-gray-100 dark:bg-gray-800 text-gray-500'
+                      : 'bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 hover:bg-indigo-100 dark:text-indigo-400'
+                )}
               >
-                <img src={person.avatar_url || `https://picsum.photos/seed/${person.id}/100/100`} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
-              </button>
-              <button
-                onClick={() => navigate(`/profile/${person.id}`)}
-                className="text-sm font-bold hover:underline hover:text-indigo-600 transition-colors"
-              >
-                {resolveProfileUsername(person.username)}
+                {isFb ? 'Explore' : following[person.id] ? 'Following' : 'Follow'}
               </button>
             </div>
-            <button
-              onClick={() => handleFollow(person.id)}
-              className={cn(
-                "text-xs font-bold transition-colors",
-                following[person.id] ? "text-gray-400" : "text-indigo-600 hover:underline"
-              )}
-            >
-              {following[person.id] ? 'Following' : 'Follow'}
-            </button>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
@@ -1913,10 +2648,12 @@ function PeopleYouMayKnow() {
 
 function TrendingSection() {
   const navigate = useNavigate();
+  const location = useLocation();
+  const isHomeFeed = location.pathname === '/';
   const trends = ['SummerVibes', 'TechNews', 'TravelGoals', 'FitnessJourney', 'FoodieLife'];
   return (
-    <div className="bg-white dark:bg-gray-900 rounded-none lg:rounded-2xl p-4 shadow-sm border-b lg:border border-gray-100 dark:border-gray-800">
-      <h3 className="font-bold text-sm mb-4">Trending</h3>
+    <div className={cn(isHomeFeed ? homeCard : exploreGlassCard, 'p-5')}>
+      <h3 className={cn('font-bold text-sm mb-4', isHomeFeed ? 'text-gray-900' : 'text-white')}>Trending</h3>
       <div className="space-y-3">
         {trends.map((trend) => (
           <button
@@ -1934,6 +2671,7 @@ function TrendingSection() {
 
 function SuggestedGroups() {
   const navigate = useNavigate();
+  const location = useLocation();
   const [joined, setJoined] = useState<Record<string, boolean>>({});
 
   const groups = [
@@ -1946,9 +2684,11 @@ function SuggestedGroups() {
     setJoined(prev => ({ ...prev, [id]: !prev[id] }));
   };
 
+  const isHomeFeed = location.pathname === '/';
+
   return (
-    <div className="bg-white dark:bg-gray-900 rounded-2xl p-4 shadow-sm border border-gray-100 dark:border-gray-800">
-      <h3 className="font-bold text-sm mb-4">Suggested Groups</h3>
+    <div className={cn(isHomeFeed ? homeCard : exploreGlassCard, 'p-5')}>
+      <h3 className={cn('font-bold text-sm mb-4', isHomeFeed ? 'text-gray-900' : 'text-white')}>Suggested Groups</h3>
       <div className="space-y-4">
         {groups.map(group => (
           <div
@@ -1960,7 +2700,14 @@ function SuggestedGroups() {
               <div className="w-10 h-10 bg-gray-100 dark:bg-gray-800 rounded-xl flex items-center justify-center group-hover:scale-110 transition-transform">
                 {group.icon}
               </div>
-              <span className="text-sm font-bold group-hover:text-indigo-600 transition-colors">{group.name}</span>
+              <span
+                className={cn(
+                  'text-sm font-bold transition-colors',
+                  isHomeFeed ? 'text-gray-900 group-hover:text-indigo-600' : 'text-white group-hover:text-indigo-300'
+                )}
+              >
+                {group.name}
+              </span>
             </div>
             <button
               onClick={(e) => handleJoin(e, group.id)}
@@ -1974,6 +2721,66 @@ function SuggestedGroups() {
               {joined[group.id] ? 'Leave' : 'Join'}
             </button>
           </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** Promotional category carousel — not feed posts; below Suggested Groups on home/explore sidebar. */
+function SuggestedForYou() {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const isHomeFeed = location.pathname === '/';
+
+  const items = [
+    { id: 'sfy-food', label: 'Foodie', image: 'https://picsum.photos/seed/sfyfood/400/520', tag: 'Foodie' },
+    { id: 'sfy-nature', label: 'Nature', image: 'https://picsum.photos/seed/sfynature/400/520', tag: 'Nature' },
+    { id: 'sfy-fitness', label: 'Fitness', image: 'https://picsum.photos/seed/sfyfit/400/520', tag: 'Fitness' },
+    { id: 'sfy-fashion', label: 'Fashion', image: 'https://picsum.photos/seed/sfyfash/400/520', tag: 'Fashion' },
+    { id: 'sfy-tech', label: 'Tech', image: 'https://picsum.photos/seed/sfytech/400/520', tag: 'TechNews' },
+    { id: 'sfy-music', label: 'Music', image: 'https://picsum.photos/seed/sfymusic/400/520', tag: 'Music' },
+  ];
+
+  return (
+    <div className={cn(isHomeFeed ? homeCard : exploreGlassCard, 'p-5')}>
+      <h3
+        className={cn(
+          'font-bold text-sm mb-3',
+          isHomeFeed ? 'text-gray-900' : 'text-white'
+        )}
+      >
+        Suggested For You
+      </h3>
+      <div className="flex max-h-[160px] gap-2.5 overflow-x-auto overflow-y-hidden scroll-smooth pb-1 no-scrollbar">
+        {items.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            onClick={() => navigate(`/hashtag/${item.tag}`)}
+            className={cn(
+              'group relative h-[148px] w-[128px] shrink-0 overflow-hidden rounded-2xl',
+              'text-left shadow-sm ring-1 ring-black/5 transition-all duration-300 ease-out',
+              'hover:scale-105 hover:shadow-lg hover:ring-black/10',
+              'focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2',
+              isHomeFeed ? 'focus-visible:ring-offset-white' : 'focus-visible:ring-offset-gray-900'
+            )}
+          >
+            <img
+              src={item.image}
+              alt=""
+              className="absolute inset-0 h-full w-full object-cover"
+              loading="lazy"
+              referrerPolicy="no-referrer"
+            />
+            <div
+              className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/60 to-transparent"
+              aria-hidden
+            />
+            <span className="absolute bottom-2.5 left-2.5 right-2.5 z-[1] truncate text-[11px] font-bold leading-tight text-white drop-shadow-md">
+              {item.label}
+            </span>
+          </button>
         ))}
       </div>
     </div>

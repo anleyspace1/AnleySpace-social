@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'motion/react';
 import { useAuth } from '../contexts/AuthContext';
@@ -518,6 +518,18 @@ function GroupPost({ post, groupName, groupId, onUpdate }: { post: any; groupNam
   const navigate = useNavigate();
   const { user } = useAuth();
   const [isLiked, setIsLiked] = useState(false);
+  const [groupImageMode, setGroupImageMode] = useState<'portrait' | 'landscape' | null>(null);
+
+  useEffect(() => {
+    setGroupImageMode(null);
+  }, [post.image_url]);
+
+  const handleGroupPostImageLoad = useCallback((e: React.SyntheticEvent<HTMLImageElement>) => {
+    const { naturalWidth: w, naturalHeight: h } = e.currentTarget;
+    if (w > 0 && h > 0) {
+      setGroupImageMode(h > w ? 'portrait' : 'landscape');
+    }
+  }, []);
   
   const handleEdit = async () => {
     const newContent = prompt('Edit your post:', post.content);
@@ -603,8 +615,24 @@ function GroupPost({ post, groupName, groupId, onUpdate }: { post: any; groupNam
       </div>
 
       {post.image_url && (
-        <div className="aspect-video bg-gray-100 dark:bg-gray-800">
-          <img src={post.image_url} alt="" className="w-full h-full object-cover" />
+        <div className="overflow-hidden bg-gray-100 dark:bg-gray-800">
+          <div
+            className={cn(
+              'relative w-full',
+              groupImageMode === 'landscape' && 'h-[min(380px,52vh)] sm:h-[400px]'
+            )}
+          >
+            <img
+              src={post.image_url}
+              alt=""
+              className={cn(
+                groupImageMode === 'landscape'
+                  ? 'h-full w-full object-cover object-center'
+                  : 'block w-full h-auto max-h-[min(92vh,1200px)] object-contain'
+              )}
+              onLoad={handleGroupPostImageLoad}
+            />
+          </div>
         </div>
       )}
 

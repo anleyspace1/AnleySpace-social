@@ -53,6 +53,12 @@ import PostRedirectPage from './pages/PostRedirectPage';
 import EditProfilePage from './pages/EditProfilePage';
 import CreateReelPage from './pages/CreateReelPage';
 import StoryPage from './pages/StoryPage';
+import AssetsHomePage from './assets_system/pages/AssetsHomePage';
+import CreatorGemsPage from './assets_system/pages/CreatorGemsPage';
+import InfluencerGiftsPage from './assets_system/pages/InfluencerGiftsPage';
+import TrendingAssetsPage from './assets_system/pages/TrendingAssetsPage';
+import MyAssetsPage from './assets_system/pages/MyAssetsPage';
+import RewardsPage from './assets_system/pages/RewardsPage';
 import { MOCK_USER } from './constants';
 
 import { AuthProvider, useAuth } from './contexts/AuthContext';
@@ -316,7 +322,12 @@ function Header({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (va
                   <X size={20} />
                 </button>
               </div>
-              <Sidebar onClose={() => setIsMobileMenuOpen(false)} darkMode={darkMode} setDarkMode={setDarkMode} />
+              <Sidebar
+                onClose={() => setIsMobileMenuOpen(false)}
+                darkMode={darkMode}
+                setDarkMode={setDarkMode}
+                navAppearance="default"
+              />
             </motion.div>
           </div>
         )}
@@ -358,6 +369,7 @@ function AppContent() {
   const { user } = useAuth();
   const isReels = location.pathname === '/reels';
   const isCreateReel = location.pathname === '/reels/create';
+  const isHome = location.pathname === '/' && !isReels && !isCreateReel;
   const isAuthPage = location.pathname === '/login' || location.pathname === '/signup' || location.pathname === '/forgot-password' || location.pathname === '/reset-password';
   
   const [darkMode, setDarkMode] = useState(() => {
@@ -387,24 +399,55 @@ function AppContent() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-50 dark:bg-black text-gray-900 dark:text-white font-sans overflow-x-hidden">
+    <div
+      className={cn(
+        'min-h-screen font-sans overflow-x-hidden',
+        isHome
+          ? 'bg-[#F5F6FA] text-gray-900 flex flex-col min-h-[100dvh] h-[100dvh] overflow-hidden'
+          : 'bg-gradient-to-br from-[#0f172a] via-[#1e1b4b] to-[#312e81] text-white'
+      )}
+    >
       <CallManager />
       {!isReels && !isCreateReel && <Header darkMode={darkMode} setDarkMode={setDarkMode} />}
       
-      <div className={cn(
-        "mx-auto flex gap-6",
-        (isReels || isCreateReel) ? "max-w-none p-0" : "max-w-[1600px] pt-14 sm:pt-16 px-0 lg:px-6 pb-[72px] lg:pb-0"
-      )}>
+      <div
+        className={cn(
+          'mx-auto flex',
+          isReels || isCreateReel
+            ? 'max-w-none p-0'
+            : 'max-w-[1600px] pt-14 sm:pt-16 px-0 lg:px-6 pb-[72px] lg:pb-0',
+          isHome
+            ? 'flex-1 min-h-0 w-full gap-0 items-stretch overflow-hidden'
+            : 'gap-6'
+        )}
+      >
           {!isReels && !isCreateReel && (
-            <aside className="hidden lg:block w-72 sticky top-[72px] h-fit">
-              <Sidebar darkMode={darkMode} setDarkMode={setDarkMode} />
+            <aside
+              className={cn(
+                'hidden lg:block w-72 flex-shrink-0',
+                isHome
+                  ? 'sticky top-14 sm:top-16 self-start h-[calc(100vh-3.5rem)] sm:h-[calc(100vh-4rem)] overflow-y-auto overflow-x-hidden no-scrollbar py-4 pl-3 pr-2 rounded-r-2xl bg-gradient-to-br from-[#0f172a] via-[#1e1b4b] to-[#312e81] text-white shadow-xl shadow-black/10'
+                  : 'sticky top-[72px] h-fit'
+              )}
+            >
+              <Sidebar
+                darkMode={darkMode}
+                setDarkMode={setDarkMode}
+                navAppearance={isHome ? 'darkColumn' : 'default'}
+              />
             </aside>
           )}
           
-          <main className={cn(
-            "flex-1 min-h-[calc(100vh-56px)] sm:min-h-[calc(100vh-64px)]",
-            (isReels || isCreateReel) ? "p-0" : "py-0 lg:py-6"
-          )}>
+          <main
+            className={cn(
+              'flex-1 min-w-0',
+              isReels || isCreateReel
+                ? 'p-0 min-h-[calc(100vh-56px)] sm:min-h-[calc(100vh-64px)]'
+                : isHome
+                  ? 'flex-1 min-h-0 h-full overflow-y-auto overflow-x-hidden home-feed-scroll bg-[#F5F6FA] px-3 sm:px-4 py-4 lg:py-6'
+                  : 'min-h-[calc(100vh-56px)] sm:min-h-[calc(100vh-64px)] py-0 lg:py-6'
+            )}
+          >
             <AnimatePresence mode="wait">
               <Routes>
                 <Route path="/" element={<ProtectedRoute><HomePage /></ProtectedRoute>} />
@@ -412,6 +455,12 @@ function AppContent() {
                 <Route path="/reels" element={<ProtectedRoute><ReelsPage /></ProtectedRoute>} />
                 <Route path="/reels/create" element={<ProtectedRoute><CreateReelPage /></ProtectedRoute>} />
                 <Route path="/marketplace" element={<ProtectedRoute><MarketplacePage /></ProtectedRoute>} />
+                <Route path="/assets" element={<ProtectedRoute><AssetsHomePage /></ProtectedRoute>} />
+                <Route path="/assets/gems" element={<ProtectedRoute><CreatorGemsPage /></ProtectedRoute>} />
+                <Route path="/assets/gifts" element={<ProtectedRoute><InfluencerGiftsPage /></ProtectedRoute>} />
+                <Route path="/assets/trending" element={<ProtectedRoute><TrendingAssetsPage /></ProtectedRoute>} />
+                <Route path="/assets/my-assets" element={<ProtectedRoute><MyAssetsPage /></ProtectedRoute>} />
+                <Route path="/assets/rewards" element={<ProtectedRoute><RewardsPage /></ProtectedRoute>} />
                 <Route path="/marketplace/product/:id" element={<ProtectedRoute><ProductDetailPage /></ProtectedRoute>} />
                 <Route path="/friends" element={<ProtectedRoute><FriendsPage /></ProtectedRoute>} />
                 <Route path="/groups" element={<ProtectedRoute><GroupsPage /></ProtectedRoute>} />

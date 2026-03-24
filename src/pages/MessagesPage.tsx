@@ -1072,13 +1072,13 @@ export default function MessagesPage() {
   };
 
   return (
-    <div className="flex h-[calc(100vh-56px-72px)] sm:h-[calc(100vh-64px)] bg-gray-50 dark:bg-black relative overflow-hidden">
-      {/* Chat List */}
+    <div className="flex min-h-0 h-[calc(100vh-56px-72px)] sm:h-[calc(100vh-64px)] lg:h-[calc(100vh-4rem)] max-h-[calc(100vh-56px-72px)] sm:max-h-[calc(100vh-64px)] lg:max-h-[calc(100vh-4rem)] bg-gray-50 dark:bg-black relative overflow-hidden items-stretch">
+      {/* Chat List — fills row height; list scrolls inside (scrollbar hidden via no-scrollbar) */}
       <div className={cn(
-        "w-full md:w-80 border-r border-gray-200 dark:border-gray-800 flex flex-col bg-white dark:bg-black",
+        "w-full md:w-80 md:max-w-[20rem] shrink-0 border-r border-gray-200 dark:border-gray-800 flex flex-col min-h-0 self-stretch overflow-hidden bg-white dark:bg-black",
         selectedChat && "hidden md:flex"
       )}>
-        <div className="p-3 sm:p-4 border-b border-gray-200 dark:border-gray-800">
+        <div className="shrink-0 p-3 sm:p-4 border-b border-gray-200 dark:border-gray-800">
           <h1 className="text-xl sm:text-2xl font-bold mb-3 sm:mb-4">Messages</h1>
           <div className="relative">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={16} />
@@ -1089,7 +1089,10 @@ export default function MessagesPage() {
             />
           </div>
         </div>
-        <div className="flex-1 overflow-y-auto">
+        <div
+          className="min-h-0 flex-1 basis-0 overflow-y-auto overflow-x-hidden overscroll-y-contain touch-pan-y [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden [&::-webkit-scrollbar]:h-0 [&::-webkit-scrollbar]:w-0"
+          aria-label="Chat list"
+        >
           {chats.map((chat) => (
             <button
               key={chat.id}
@@ -1126,14 +1129,14 @@ export default function MessagesPage() {
         </div>
       </div>
 
-      {/* Conversation */}
+      {/* Conversation — fixed flex share; scroll only inside thread + input stays bottom */}
       <div className={cn(
-        "flex-1 flex flex-col bg-white dark:bg-black",
+        "flex-1 flex flex-col min-h-0 min-w-0 overflow-hidden bg-white dark:bg-black",
         !selectedChat && "hidden md:flex items-center justify-center text-gray-500"
       )}>
         {selectedChat ? (
           <>
-            <div className="p-3 sm:p-4 border-b border-gray-200 dark:border-gray-800 flex items-center justify-between">
+            <div className="shrink-0 p-3 sm:p-4 border-b border-gray-200 dark:border-gray-800 flex items-center justify-between">
               <div className="flex items-center gap-2 sm:gap-3">
                 <button onClick={() => setSelectedChat(null as any)} className="md:hidden p-2 -ml-2">
                   <ChevronLeft size={20} />
@@ -1186,9 +1189,9 @@ export default function MessagesPage() {
               </div>
             </div>
 
-            <div className="flex-1 overflow-y-auto p-3 sm:p-4 space-y-3 sm:space-y-4 bg-gray-50 dark:bg-black/20">
+            <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-3 sm:p-4 space-y-3 sm:space-y-4 bg-[#f5f7fb] dark:bg-[#111827]/80">
               <div className="flex justify-center">
-                <span className="text-xs bg-gray-200 dark:bg-gray-800 text-gray-500 px-3 py-1 rounded-full">Today</span>
+                <span className="text-xs bg-white dark:bg-gray-800 text-gray-600 dark:text-gray-400 px-3 py-1 rounded-full border border-gray-200/80 dark:border-gray-700 shadow-sm">Today</span>
               </div>
               
               {messages.map((msg) => {
@@ -1209,10 +1212,10 @@ export default function MessagesPage() {
                     />
                   )}
                   <div className={cn(
-                    "p-3 rounded-2xl shadow-sm max-w-[70%] min-w-[60px]",
+                    "p-3 rounded-xl max-w-[70%] min-w-[60px] shadow-[0_1px_3px_rgba(0,0,0,0.06)]",
                     msg.senderId === user?.id 
-                      ? "bg-indigo-600 text-white rounded-tr-none" 
-                      : "bg-gray-100 dark:bg-gray-800 text-black dark:text-white rounded-tl-none"
+                      ? "bg-gradient-to-br from-indigo-600 to-violet-600 text-white shadow-[0_2px_10px_rgba(79,70,229,0.35)]" 
+                      : "bg-white text-[#0f172a] border border-gray-200/90 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 shadow-[0_1px_4px_rgba(15,23,42,0.06)]"
                   )}>
                     {msg.type === 'voice' || msg.type === 'audio' ? (
                       <div className="flex items-center gap-3 min-w-[160px] py-1">
@@ -1241,8 +1244,8 @@ export default function MessagesPage() {
                           className={cn(
                             "text-xs mb-1.5",
                             msg.senderId === user?.id
-                              ? "text-indigo-100/90"
-                              : "text-gray-500 dark:text-gray-400"
+                              ? "text-white/90"
+                              : "text-gray-600 dark:text-gray-400"
                           )}
                         >
                           Replied to your story
@@ -1274,7 +1277,10 @@ export default function MessagesPage() {
                           </button>
                         ) : null}
                         {msg.content ? (
-                          <p className="text-sm break-words">{msg.content}</p>
+                          <p className={cn(
+                            "text-sm break-words",
+                            msg.senderId === user?.id ? "text-white" : "text-[#0f172a] dark:text-gray-100"
+                          )}>{msg.content}</p>
                         ) : null}
                       </div>
                     ) : msg.type === 'image' || (msg.imageUrl && msg.type !== 'story_reply' && msg.type !== 'voice' && msg.type !== 'audio') ? (
@@ -1287,14 +1293,17 @@ export default function MessagesPage() {
                         />
                       </div>
                     ) : (
-                      <p className="text-sm">{msg.content}</p>
+                      <p className={cn(
+                        "text-sm break-words",
+                        msg.senderId === user?.id ? "text-white" : "text-[#0f172a] dark:text-gray-100"
+                      )}>{msg.content}</p>
                     )}
                     {msg.senderId === user?.id ? (
                       <div
                         className="message-footer mt-1 flex items-center justify-end gap-1.5 text-[11px] sm:text-[12px] opacity-80"
                         title={msg.isSeen ? 'Seen' : 'Delivered'}
                       >
-                        <span className="time shrink-0 text-indigo-100/90">{msg.timestamp}</span>
+                        <span className="time shrink-0 text-white/85">{msg.timestamp}</span>
                         <span
                           className={cn(
                             'status shrink-0 select-none leading-none tracking-tight',
@@ -1306,7 +1315,7 @@ export default function MessagesPage() {
                         </span>
                       </div>
                     ) : (
-                      <span className="text-[10px] sm:text-[11px] mt-1 block text-gray-400">
+                      <span className="text-[10px] sm:text-[11px] mt-1 block text-gray-500 dark:text-gray-400">
                         {msg.timestamp}
                       </span>
                     )}
@@ -1317,7 +1326,7 @@ export default function MessagesPage() {
               <div ref={messagesEndRef} />
             </div>
 
-            <div className="p-2 sm:p-4 border-t border-gray-200 dark:border-gray-800">
+            <div className="shrink-0 p-2 sm:p-4 border-t border-[#e5e7eb] bg-white dark:bg-gray-950 dark:border-gray-800">
               {selectedImage && (
                 <div className="mb-3 relative inline-block">
                   <img src={selectedImage} alt="Preview" className="w-32 h-32 object-cover rounded-xl border-2 border-indigo-500" />
@@ -1351,7 +1360,7 @@ export default function MessagesPage() {
                   </div>
                 </div>
               ) : (
-                <div className="flex items-center gap-1 sm:gap-2 bg-gray-100 dark:bg-gray-900 rounded-2xl p-1.5 sm:p-2">
+                <div className="flex items-center gap-1 sm:gap-2 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-xl p-1.5 sm:p-2 shadow-sm">
                   <input 
                     type="file" 
                     accept="image/*" 
@@ -1369,21 +1378,21 @@ export default function MessagesPage() {
                   />
                   <button 
                     onClick={() => cameraInputRef.current?.click()}
-                    className="p-1.5 sm:p-2 text-gray-500 hover:text-indigo-600"
+                    className="p-1.5 sm:p-2 text-gray-600 hover:text-indigo-600"
                     title="Take Photo"
                   >
                     <Camera size={20} />
                   </button>
                   <button 
                     onClick={() => fileInputRef.current?.click()}
-                    className="p-1.5 sm:p-2 text-gray-500 hover:text-indigo-600"
+                    className="p-1.5 sm:p-2 text-gray-600 hover:text-indigo-600"
                     title="Upload Image"
                   >
                     <ImageIcon size={20} />
                   </button>
                   <button 
                     onClick={startRecording}
-                    className="p-1.5 sm:p-2 text-gray-500 hover:text-indigo-600"
+                    className="p-1.5 sm:p-2 text-gray-600 hover:text-indigo-600"
                     title="Voice Message"
                   >
                     <Mic size={20} />
@@ -1394,7 +1403,7 @@ export default function MessagesPage() {
                     onChange={(e) => setMessage(e.target.value)}
                     onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
                     placeholder="Message..." 
-                    className="flex-1 bg-transparent border-none focus:ring-0 py-1.5 sm:py-2 text-sm"
+                    className="flex-1 bg-transparent border-none focus:ring-0 py-1.5 sm:py-2 text-sm text-gray-900 dark:text-gray-100 placeholder:text-gray-500"
                   />
                   <button 
                     onClick={handleSendMessage}
