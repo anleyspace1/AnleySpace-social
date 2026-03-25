@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Heart, 
@@ -38,6 +38,7 @@ import {
 import { MOCK_VIDEOS, MOCK_USER, MOCK_SOUNDS, MOCK_PRODUCTS } from '../constants';
 import { cn } from '../lib/utils';
 import { supabase } from '../lib/supabase';
+import { apiUrl } from '../lib/apiOrigin';
 import { useAuth } from '../contexts/AuthContext';
 import { Video } from '../types';
 import ShareModal from '../components/ShareModal';
@@ -53,61 +54,135 @@ const resolveProfileUsername = (username?: string | null) => {
 export default function ReelsPage() {
   const navigate = useNavigate();
   const location = useLocation();
+  const params = useParams<{ id?: string }>();
   const { user } = useAuth();
-  const [videos, setVideos] = useState(MOCK_VIDEOS.map((v, i) => ({
-    ...v,
-    isLive: i === 0,
-    viewerCount: i === 0 ? '2.5K' : undefined
-  })));
+  const navState = location.state as any;
+  const selectedVideoUrl: string | undefined = navState?.videoUrl;
+  const selectedVideoId: string | null =
+    (navState?.selectedReelId ? String(navState.selectedReelId) : null) ||
+    (navState?.videoId ? String(navState.videoId) : null) ||
+    (params.id ? String(params.id) : null);
+
+  // In the “selected from Home” mode, we replace the feed with a single video.
+  const isSelectedMode = !!selectedVideoId;
+
+  const [videos, setVideos] = useState<any[]>([]);
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
   const [isCommentsOpen, setIsCommentsOpen] = useState(true); // Default open on tablet
-  const [activeVideoId, setActiveVideoId] = useState<string | null>(MOCK_VIDEOS[0].id);
+  const [activeVideoId, setActiveVideoId] = useState<string | null>(null);
+  const [currentIndex, setCurrentIndex] = useState(0);
   const [preselectedSound, setPreselectedSound] = useState<any>(null);
   const [activeNav, setActiveNav] = useState<string>('for-you');
   const [reelsLoaded, setReelsLoaded] = useState(false);
   const feedRef = useRef<HTMLDivElement | null>(null);
+  const touchStartYRef = useRef<number | null>(null);
+  const touchStartXRef = useRef<number | null>(null);
+  const suppressSwipeRef = useRef(false);
+
+  // If navigated from Home with a selected video, prioritize it once the feed loads
+  // (do not replace the feed with a single video).
+  useEffect(() => {
+    if (!isSelectedMode || !selectedVideoId) return;
+    setActiveVideoId(String(selectedVideoId));
+
+    // Remember last selected reel so direct /reels can start from it.
+    try {
+      if (selectedVideoUrl) sessionStorage.setItem('reels_last_videoUrl', selectedVideoUrl);
+      sessionStorage.setItem('reels_last_videoId', String(selectedVideoId));
+      sessionStorage.setItem('reels_last_thumbnail', navState?.thumbnail || selectedVideoUrl || '');
+      sessionStorage.setItem('reels_last_username', navState?.username || '');
+      sessionStorage.setItem('reels_last_avatar', navState?.avatar || '');
+      sessionStorage.setItem('reels_last_caption', navState?.caption || '');
+    } catch {
+      // ignore storage errors
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSelectedMode, selectedVideoUrl, selectedVideoId]);
+
+  // (base "/reels" selection persistence is handled inside fetchReels)
 
   useEffect(() => {
     const fetchReels = async () => {
       try {
-        const response = await fetch('/api/reels');
-        if (response.ok) {
-          const data = await response.json();
-          if (data.length > 0) {
-            const formattedReels = data.map((r: any) => ({
-              id: r.id,
-              url: r.url,
-              thumbnail: r.thumbnail,
-              user: {
-                username: resolveProfileUsername(r.username),
-                avatar: r.avatar || `https://picsum.photos/seed/${r.user_id || r.id}/100/100`
-              },
-              caption: r.caption,
-              likes: r.likes || 0,
-              comments: r.comments || 0,
-              views: r.views || 0,
-              shares: r.shares,
-              saves: r.saves,
-              coins: r.coins,
-              sound: r.sound_title ? { title: r.sound_title, artist: r.sound_artist } : null
-            }));
-            
-            setVideos(formattedReels);
+        const likedStorageKey = 'reels_liked_ids_v1';
+        const readLikedIds = () => {
+          try {
+            const raw = localStorage.getItem(likedStorageKey);
+            const parsed = raw ? JSON.parse(raw) : [];
+            if (!Array.isArray(parsed)) return new Set<string>();
+            return new Set(parsed.map((x) => String(x)));
+          } catch {
+            return new Set<string>();
           }
-        }
-      } catch (err) {
-        console.error('Failed to fetch reels:', err);
+        };
+
+        const likedIds = readLikedIds();
+
+        const normalizeUrl = (url: string) => {
+          try {
+            const parsed = new URL(url);
+            return `${parsed.origin}${parsed.pathname}`;
+          } catch {
+            return url;
+          }
+        };
+
+        const targetId = params.id ? String(params.id) : selectedVideoId ? String(selectedVideoId) : null;
+        const targetUrl = selectedVideoUrl ? normalizeUrl(selectedVideoUrl) : null;
+
+        const apiRes = await fetch(apiUrl('/api/reels'), { method: 'GET' });
+        if (!apiRes.ok) throw new Error(`Failed to fetch reels: ${apiRes.status}`);
+        const payload = await apiRes.json();
+        const reels = Array.isArray(payload) ? payload : [];
+
+        const list = reels
+          .map((r: any) => {
+            const id = String(r.id);
+            return {
+              id,
+              url: r.url,
+              videoUrl: r.url,
+              thumbnail: r.thumbnail || r.url,
+              user: {
+                username: r.username || 'User',
+                avatar: r.avatar || `https://picsum.photos/seed/${r.user_id || id}/100/100`,
+              },
+              caption: String(r.caption || ''),
+              likes: typeof r.likes === 'number' ? r.likes : 0,
+              comments: typeof r.comments === 'number' ? r.comments : 0,
+              views: typeof r.views === 'number' ? r.views : 0,
+              shares: typeof r.shares === 'number' ? r.shares : 0,
+              saves: typeof r.saves === 'number' ? r.saves : 0,
+              coins: typeof r.coins === 'number' ? r.coins : 0,
+              sound: r.sound_title ? { title: r.sound_title, artist: r.sound_artist } : null,
+              isLive: false,
+              liked: likedIds.has(id),
+            };
+          })
+          .filter((v: any) => !!v.url);
+
+        setVideos(list);
+        const targetById = targetId
+          ? list.find((v: any) => String(v.id) === String(targetId))
+          : null;
+        const targetByUrl = targetUrl
+          ? list.find((v: any) => normalizeUrl(String(v.url)) === targetUrl)
+          : null;
+        const target = targetById || targetByUrl || list[0] || null;
+        setActiveVideoId(target ? String(target.id) : null);
       } finally {
         setReelsLoaded(true);
       }
     };
 
+    // In selected mode we already set the single video; no need to fetch the feed.
     fetchReels();
-  }, []);
+  }, [isSelectedMode, params.id, selectedVideoId, selectedVideoUrl]);
 
   useEffect(() => {
     const state = location.state as any;
     if (!state || videos.length === 0) return;
+    if (state?.videoUrl) return;
     console.log('[Reels] open state', { videoId: state.videoId, postId: state.postId, index: state.index, videoUrl: state.videoUrl });
 
     // Primary selection: exact reel id from navigation state.
@@ -115,7 +190,7 @@ export default function ReelsPage() {
       const matched = videos.find((v) => v.id === state.videoId);
       if (matched) {
         console.log('[Reels] matched by videoId', { videoId: state.videoId, matchedIndex: videos.findIndex(v => v.id === matched.id) });
-        setActiveVideoId(matched.id);
+        setActiveVideoId(String(matched.id));
         return;
       }
 
@@ -140,7 +215,7 @@ export default function ReelsPage() {
       const byUrl = videos.find((v) => normalizeUrl(v.url) === targetUrl);
       if (byUrl) {
         console.log('[Reels] matched by videoUrl', { videoId: byUrl.id });
-        setActiveVideoId(byUrl.id);
+        setActiveVideoId(String(byUrl.id));
         return;
       }
     }
@@ -148,34 +223,133 @@ export default function ReelsPage() {
     // Fallback: index from navigation state.
     if (typeof state.index === 'number' && state.index >= 0 && state.index < videos.length) {
       console.log('[Reels] fallback by index', { index: state.index, selectedId: videos[state.index].id });
-      setActiveVideoId(videos[state.index].id);
+      setActiveVideoId(String(videos[state.index].id));
     }
   }, [location.state, videos, reelsLoaded]);
 
   useEffect(() => {
-    if (!activeVideoId || !feedRef.current) return;
+    if (!videos.length) return;
+    if (!activeVideoId) {
+      setCurrentIndex(0);
+      return;
+    }
+    const idx = videos.findIndex((v) => String(v.id) === String(activeVideoId));
+    if (idx >= 0) setCurrentIndex(idx);
+  }, [videos, activeVideoId]);
+
+  useEffect(() => {
+    if (!activeVideoId || !feedRef.current || videos.length <= 1) return;
     const target = feedRef.current.querySelector(`[data-reel-id="${activeVideoId}"]`) as HTMLElement | null;
     if (target) {
       target.scrollIntoView({ block: 'start', behavior: 'smooth' });
     }
-  }, [activeVideoId]);
+  }, [activeVideoId, videos.length]);
 
   const updateVideoCounts = (
     videoId: string,
-    patch: Partial<{ likes: number; comments: number; views: number }>
+    patch: Partial<{ likes: number; comments: number; views: number; liked: boolean }>
   ) => {
-    setVideos(prev => prev.map(v => (v.id === videoId ? { ...v, ...patch } : v)));
+    setVideos(prev =>
+      prev.map((v) => (String(v.id) === String(videoId) ? { ...v, ...patch } : v))
+    );
+  };
+
+  const goToIndex = (idx: number) => {
+    if (!videos.length) return;
+    const safe = Math.max(0, Math.min(idx, videos.length - 1));
+    const v = videos[safe];
+    if (v) setActiveVideoId(String(v.id));
+    setCurrentIndex(safe);
+  };
+
+  const nextVideo = () => {
+    if (!videos.length) return;
+    if (currentIndex >= videos.length - 1) return;
+    goToIndex(currentIndex + 1);
+  };
+
+  const prevVideo = () => {
+    if (!videos.length) return;
+    if (currentIndex <= 0) return;
+    goToIndex(currentIndex - 1);
+  };
+
+  const handleTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (videos.length <= 1) return;
+    // If the user is interacting with UI controls (like/comment/gift) or the comments panel
+    // is open, don't treat the gesture as a reel swipe.
+    const target = e.target as HTMLElement | null;
+    const interactiveEl = target?.closest?.('button, input, textarea, form, a, [role="button"]');
+    // Only suppress swipe when the touch started on an interactive control,
+    // so swiping still works (and comments update per-reel).
+    suppressSwipeRef.current = !!interactiveEl;
+    const t = e.touches[0];
+    touchStartYRef.current = t.clientY;
+    touchStartXRef.current = t.clientX;
+  };
+
+  const handleTouchEnd = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (videos.length <= 1) return;
+    if (suppressSwipeRef.current) {
+      touchStartYRef.current = null;
+      touchStartXRef.current = null;
+      suppressSwipeRef.current = false;
+      return;
+    }
+    const startY = touchStartYRef.current;
+    const startX = touchStartXRef.current;
+    if (startY == null || startX == null) return;
+
+    const t = e.changedTouches[0];
+    const dx = t.clientX - startX;
+    const dy = t.clientY - startY;
+
+    // Ignore mostly-horizontal gestures and tiny swipes.
+    const absDx = Math.abs(dx);
+    const absDy = Math.abs(dy);
+    const threshold = 45;
+    if (absDy < threshold || absDy < absDx) return;
+
+    // Swipe up => next, swipe down => previous.
+    if (dy < 0) nextVideo();
+    else prevVideo();
+
+    touchStartYRef.current = null;
+    touchStartXRef.current = null;
+    suppressSwipeRef.current = false;
   };
 
   const handleUpload = (newVideo: any) => {
     setVideos([newVideo, ...videos]);
-    setActiveVideoId(newVideo.id);
+    setActiveVideoId(String(newVideo.id));
     navigate('/reels');
     setIsUploadModalOpen(false);
     setPreselectedSound(null);
   };
 
-  const activeVideo = videos.find(v => v.id === activeVideoId) || videos[0];
+  const activeVideo =
+    (activeVideoId ? videos.find((v) => String(v.id) === String(activeVideoId)) : null) ||
+    videos[currentIndex] ||
+    videos[0];
+
+  if (!reelsLoaded) {
+    return (
+      <div className="relative h-screen overflow-hidden bg-[#0A0A0A] flex items-center justify-center">
+        <div className="w-10 h-10 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
+
+  if (reelsLoaded && videos.length === 0) {
+    return (
+      <div className="relative h-screen overflow-hidden bg-[#0A0A0A] flex items-center justify-center">
+        <div className="text-center text-white/80 px-6">
+          <div className="text-sm font-bold">No videos available</div>
+          <div className="text-xs text-white/50 mt-1">Please try again later.</div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="relative h-screen overflow-hidden bg-[#0A0A0A] flex flex-col font-sans">
@@ -236,16 +410,25 @@ export default function ReelsPage() {
       {/* Main Content Area */}
       <div className="flex-1 flex overflow-hidden">
         {/* Reels Feed */}
-        <div className={cn(
-          "relative flex-1 transition-all duration-500 ease-in-out h-full overflow-y-scroll snap-y snap-mandatory no-scrollbar",
-          isCommentsOpen ? "lg:mr-0" : ""
-        )} ref={feedRef}>
+        <div
+          className={cn(
+            "relative flex-1 transition-all duration-500 ease-in-out h-full overflow-y-scroll snap-y snap-mandatory no-scrollbar",
+            isCommentsOpen ? "lg:mr-0" : ""
+          )}
+          ref={feedRef}
+          onTouchStart={handleTouchStart}
+          onTouchEnd={handleTouchEnd}
+        >
           {videos.map((video) => (
-            <div key={video.id} data-reel-id={video.id} className="h-full w-full snap-start relative">
-              <VideoPost 
-                video={video} 
+            <div
+              key={video.id}
+              data-reel-id={video.id}
+              className="h-full w-full snap-start relative"
+            >
+              <VideoPost
+                video={video}
                 onToggleComments={() => setIsCommentsOpen(!isCommentsOpen)}
-                onActive={() => setActiveVideoId(video.id)}
+                onActive={() => setActiveVideoId(String(video.id))}
                 onCountsChange={updateVideoCounts}
                 onUseSound={(sound) => {
                   setPreselectedSound(sound);
@@ -830,13 +1013,15 @@ function SoundSelector({ onClose, onSelect, selectedSoundId }: { onClose: () => 
   );
 }
 
-function VideoPost({ video, onToggleComments, onActive, onUseSound, onCountsChange }: { video: any; onToggleComments: () => void; onActive: () => void; onUseSound: (sound: any) => void; onCountsChange: (videoId: string, patch: Partial<{ likes: number; comments: number; views: number }>) => void; key?: React.Key }) {
+function VideoPost({ video, onToggleComments, onActive, onUseSound, onCountsChange }: { video: any; onToggleComments: () => void; onActive: () => void; onUseSound: (sound: any) => void; onCountsChange: (videoId: string, patch: Partial<{ likes: number; comments: number; views: number; liked: boolean }>) => void; key?: React.Key }) {
   const navigate = useNavigate();
   const { user } = useAuth();
   const [isPlaying, setIsPlaying] = useState(false);
-  const [isLiked, setIsLiked] = useState(false);
+  const [isLiked, setIsLiked] = useState(!!video?.liked);
   const [isSaved, setIsSaved] = useState(false);
+  const [isMuted, setIsMuted] = useState(true);
   const [isFollowing, setIsFollowing] = useState(false);
+  const [selectedGiftId, setSelectedGiftId] = useState<string | null>(null);
   const [activeGifts, setActiveGifts] = useState<any[]>([]);
   const [floatingHearts, setFloatingHearts] = useState<any[]>([]);
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
@@ -853,21 +1038,42 @@ function VideoPost({ video, onToggleComments, onActive, onUseSound, onCountsChan
   ];
 
   const handleLike = async () => {
+    const reelId = video?.id != null ? String(video.id) : null;
     const userId = user?.id || MOCK_USER.id;
+    if (!reelId) {
+      console.log('[ReelsPage] like: missing reelId', { reelId, video });
+      return;
+    }
     const previous = isLiked;
-    setIsLiked(!isLiked);
+    console.log('[ReelsPage] like click', { reelId, userId, previousLiked: previous });
+    setIsLiked((prev) => !prev);
     try {
-      const response = await fetch(`/api/reels/${video.id}/like`, {
+      const response = await fetch(apiUrl(`/api/reels/${reelId}/like`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId })
       });
       if (!response.ok) throw new Error('Failed to like reel');
       const data = await response.json();
-      if (typeof data.likes === 'number') {
-        onCountsChange(video.id, { likes: data.likes });
-      }
+      console.log('[ReelsPage] like response', { reelId, data });
+      onCountsChange(reelId, {
+        ...(typeof data.likes === 'number' ? { likes: data.likes } : {}),
+        liked: !!data.liked
+      });
       setIsLiked(!!data.liked);
+
+      // Persist liked UI across refresh (server doesn't return per-user liked state from /api/reels).
+      try {
+        const likedStorageKey = 'reels_liked_ids_v1';
+        const raw = localStorage.getItem(likedStorageKey);
+        const arr = raw ? JSON.parse(raw) : [];
+        const set = new Set(Array.isArray(arr) ? arr.map((x: any) => String(x)) : []);
+        if (data.liked) set.add(reelId);
+        else set.delete(reelId);
+        localStorage.setItem(likedStorageKey, JSON.stringify(Array.from(set)));
+      } catch {
+        /* non-fatal */
+      }
     } catch (err) {
       console.error('Failed to toggle reel like:', err);
       setIsLiked(previous);
@@ -879,6 +1085,57 @@ function VideoPost({ video, onToggleComments, onActive, onUseSound, onCountsChan
     setFloatingHearts(prev => [...prev, ...newHearts]);
     setTimeout(() => {
       setFloatingHearts(prev => prev.filter(h => !newHearts.find(nh => nh.id === h.id)));
+    }, 2000);
+  };
+
+  useEffect(() => {
+    // Keep local like UI synced with the parent `videos` array.
+    setIsLiked(!!video?.liked);
+  }, [video?.liked, video?.id]);
+
+  const handleSelectGift = (gift: { id: string }) => {
+    setSelectedGiftId(gift?.id ?? null);
+    console.log('[ReelsPage] gift select', { reelId: video?.id != null ? String(video.id) : null, giftId: gift?.id });
+  };
+
+  const handleSendGift = async () => {
+    const reelId = video?.id != null ? String(video.id) : null;
+    if (!reelId) {
+      console.log('[ReelsPage] gift send: missing reelId', { reelId, video });
+      return;
+    }
+    const userId = user?.id || MOCK_USER.id;
+    const giftToSend =
+      selectedGiftId ? REEL_GIFTS.find((g) => g.id === selectedGiftId) : undefined;
+    const finalGift = giftToSend || REEL_GIFTS[0];
+
+    console.log('[ReelsPage] gift send', {
+      reelId,
+      userId,
+      giftId: finalGift?.id,
+      giftPrice: finalGift?.price
+    });
+
+    // Local animation/UX fix (this page didn't previously wire any gift logic).
+    // This restores click functionality without changing layout.
+    setActiveGifts((prev) => [
+      ...prev,
+      {
+        id: Date.now(),
+        reelId,
+        senderId: userId,
+        giftId: finalGift?.id,
+        coins: finalGift?.price
+      }
+    ]);
+
+    const newHearts = Array.from({ length: 8 }).map((_, i) => ({
+      id: Date.now() + i,
+      x: Math.random() * 60 - 30,
+    }));
+    setFloatingHearts((prev) => [...prev, ...newHearts]);
+    setTimeout(() => {
+      setFloatingHearts((prev) => prev.filter((h) => !newHearts.find((nh) => nh.id === h.id)));
     }, 2000);
   };
 
@@ -904,7 +1161,7 @@ function VideoPost({ video, onToggleComments, onActive, onUseSound, onCountsChan
         entries.forEach(async (entry) => {
           if (entry.isIntersecting) {
             onActive();
-            fetch(`/api/reels/${video.id}/view`, {
+            fetch(apiUrl(`/api/reels/${video.id}/view`), {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ userId: user?.id })
@@ -918,7 +1175,7 @@ function VideoPost({ video, onToggleComments, onActive, onUseSound, onCountsChan
               .catch(() => {});
             try {
               if (videoRef.current) {
-                videoRef.current.muted = false;
+                videoRef.current.muted = isMuted;
                 await videoRef.current.play();
                 setIsPlaying(true);
               }
@@ -939,18 +1196,43 @@ function VideoPost({ video, onToggleComments, onActive, onUseSound, onCountsChan
   }, [onActive, onCountsChange, user?.id, video.id]);
 
   return (
-    <div className="relative h-full w-full bg-black overflow-hidden group">
+    <div className="relative h-full w-full bg-black overflow-hidden group flex items-center justify-center">
+      {/* Blurred background using the same video */}
+      <video
+        src={(video as any).videoUrl || video.url}
+        className="absolute inset-0 h-full w-full object-cover blur-[20px] scale-[1.2] z-0"
+        muted
+        autoPlay
+        loop
+        playsInline
+        preload="metadata"
+        aria-hidden="true"
+        tabIndex={-1}
+      />
       {/* Video Player */}
       <video
+        key={video.id}
         ref={videoRef}
-        src={video.url}
-        className="h-full w-full object-cover"
+        src={(video as any).videoUrl || video.url}
+        className="relative z-[1] h-full w-full object-contain"
         controls
         loop
-        muted={false}
+        muted={isMuted}
+        autoPlay
         playsInline
-        onClick={togglePlay}
+        onClick={() => {
+          setIsMuted((prev) => !prev);
+          togglePlay();
+        }}
       />
+
+      {isMuted && (
+        <div className="absolute inset-0 z-[2] flex items-center justify-center pointer-events-none">
+          <div className="rounded-full bg-black/45 backdrop-blur-md px-3 py-2 text-[12px] font-bold text-white shadow-sm">
+            Tap for sound
+          </div>
+        </div>
+      )}
 
       {/* Overlays */}
       <div className="absolute inset-0 bg-gradient-to-b from-black/40 via-transparent to-black/60 pointer-events-none" />
@@ -991,6 +1273,12 @@ function VideoPost({ video, onToggleComments, onActive, onUseSound, onCountsChan
         <ActionButton 
           icon={<Gift className="text-orange-400" size={30} />} 
           label="Send Gift" 
+          onClick={() => {
+            // Keep the existing scroll affordance, but also perform the send action.
+            const el = document.getElementById('gift-selection-row');
+            el?.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
+            void handleSendGift();
+          }}
         />
         <ActionButton 
           icon={<Camera className="text-white" size={30} />} 
@@ -1061,10 +1349,15 @@ function VideoPost({ video, onToggleComments, onActive, onUseSound, onCountsChan
       </div>
 
       {/* Tablet Gift Selection Row */}
-      <div className="hidden lg:flex absolute bottom-6 left-6 right-6 h-16 bg-black/40 backdrop-blur-xl border border-white/10 rounded-2xl items-center justify-between px-6 z-10">
+      <div id="gift-selection-row" className="hidden lg:flex absolute bottom-6 left-6 right-6 h-16 bg-black/40 backdrop-blur-xl border border-white/10 rounded-2xl items-center justify-between px-6 z-10">
         <div className="flex items-center gap-8 overflow-x-auto no-scrollbar">
           {REEL_GIFTS.map((gift) => (
-            <button key={gift.id} className="flex flex-col items-center gap-1 group">
+            <button
+              key={gift.id}
+              type="button"
+              onClick={() => handleSelectGift(gift)}
+              className="flex flex-col items-center gap-1 group"
+            >
               <span className="text-2xl group-hover:scale-125 transition-transform">{gift.icon}</span>
               <div className="flex items-center gap-1 text-yellow-500 text-[9px] font-black">
                 <Coins size={10} />
@@ -1152,13 +1445,25 @@ function SuggestedReels({ videos, onSelect }: { videos: any[]; onSelect: (id: st
             onClick={() => onSelect(video.id)}
             className="relative aspect-[9/16] rounded-xl overflow-hidden group border border-white/5"
           >
-            <ResponsiveImage 
-              src={video.thumbnail} 
-              alt="" 
-              width={400}
-              height={711}
-              className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500" 
-            />
+            {((video as any).video_url || video.url) ? (
+              <video
+                src={(video as any).video_url || video.url}
+                muted
+                autoPlay
+                loop
+                playsInline
+                className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500"
+                preload="metadata"
+              />
+            ) : (
+              <ResponsiveImage
+                src={video.thumbnail}
+                alt=""
+                width={400}
+                height={711}
+                className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500"
+              />
+            )}
             <div className="absolute inset-0 bg-gradient-to-t from-black/60 to-transparent" />
             <div className="absolute bottom-2 left-2 flex items-center gap-1.5">
               <div className="w-4 h-4 rounded-full overflow-hidden border border-white/20">
@@ -1184,13 +1489,25 @@ function SuggestedReels({ videos, onSelect }: { videos: any[]; onSelect: (id: st
             onClick={() => onSelect(video.id)}
             className="relative aspect-[9/16] rounded-lg overflow-hidden group border border-white/5"
           >
-            <ResponsiveImage 
-              src={video.thumbnail} 
-              alt="" 
-              width={300}
-              height={533}
-              className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500" 
-            />
+            {((video as any).video_url || video.url) ? (
+              <video
+                src={(video as any).video_url || video.url}
+                muted
+                autoPlay
+                loop
+                playsInline
+                className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500"
+                preload="metadata"
+              />
+            ) : (
+              <ResponsiveImage
+                src={video.thumbnail}
+                alt=""
+                width={300}
+                height={533}
+                className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500"
+              />
+            )}
             <div className="absolute bottom-1 right-1">
               <span className="text-white text-[7px] font-bold">{(video.likes / 10).toFixed(1)}K</span>
             </div>
@@ -1201,7 +1518,7 @@ function SuggestedReels({ videos, onSelect }: { videos: any[]; onSelect: (id: st
   );
 }
 
-function CommentsSection({ video, onClose, onCountsChange }: { video: any; onClose: () => void; onCountsChange: (videoId: string, patch: Partial<{ likes: number; comments: number; views: number }>) => void }) {
+function CommentsSection({ video, onClose, onCountsChange }: { video: any; onClose: () => void; onCountsChange: (videoId: string, patch: Partial<{ likes: number; comments: number; views: number; liked: boolean }>) => void }) {
   const { user, profile } = useAuth();
   const [comments, setComments] = useState<any[]>([]);
   const [newComment, setNewComment] = useState('');
@@ -1209,8 +1526,9 @@ function CommentsSection({ video, onClose, onCountsChange }: { video: any; onClo
   useEffect(() => {
     const loadComments = async () => {
       if (!video?.id) return;
+      const reelId = String(video.id);
       try {
-        const res = await fetch(`/api/reels/${video.id}/comments`);
+        const res = await fetch(apiUrl(`/api/reels/${reelId}/comments`));
         if (!res.ok) return;
         const data = await res.json();
         setComments((data || []).map((c: any) => ({
@@ -1230,29 +1548,36 @@ function CommentsSection({ video, onClose, onCountsChange }: { video: any; onClo
 
   const handleAddComment = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user?.id || !video?.id) {
-      console.error('Cannot post comment: missing authenticated user or reel id', { userId: user?.id, reelId: video?.id });
+    const reelId = video?.id != null ? String(video.id) : null;
+    const userId = user?.id || MOCK_USER.id;
+    if (!reelId) {
+      console.error('[ReelsPage] comment: missing reelId', { reelId, video });
       return;
     }
     if (!newComment.trim()) return;
     const text = newComment.trim();
+    console.log('[ReelsPage] comment submit', { reelId, userId, text });
     setNewComment('');
     try {
-      const res = await fetch(`/api/reels/${video.id}/comments`, {
+      const res = await fetch(apiUrl(`/api/reels/${reelId}/comments`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          userId: user.id,
-          user_id: user.id,
-          reel_id: video.id,
+          userId,
+          user_id: userId,
+          reel_id: reelId,
           content: text,
           username: resolveProfileUsername(profile?.username),
           avatar: profile?.avatar_url || MOCK_USER.avatar,
           text
         })
       });
-      if (!res.ok) throw new Error('Failed to save comment');
+      if (!res.ok) {
+        console.error('[ReelsPage] comment response not ok', { reelId, status: res.status });
+        throw new Error('Failed to save comment');
+      }
       const data = await res.json();
+      console.log('[ReelsPage] comment response', { reelId, data });
       if (Array.isArray(data?.commentsList)) {
         setComments(data.commentsList.map((c: any) => ({
           id: c.id,
@@ -1273,7 +1598,7 @@ function CommentsSection({ video, onClose, onCountsChange }: { video: any; onClo
         }, ...prev]);
       }
       if (typeof data?.comments === 'number') {
-        onCountsChange(video.id, { comments: data.comments });
+        onCountsChange(reelId, { comments: data.comments });
       }
     } catch (err) {
       console.error('Failed to add reel comment:', err);

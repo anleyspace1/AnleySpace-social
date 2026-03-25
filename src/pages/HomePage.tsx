@@ -55,6 +55,17 @@ const resolveProfileUsername = (username?: string | null) => {
   return value;
 };
 
+const reelCache = new Map<string, string>();
+
+const normalizeReelUrl = (url: string) => {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return url;
+  }
+};
+
 /** Inline hashtags as clickable navigation (same route as TrendingSection). */
 function renderTextWithHashtags(
   text: string,
@@ -948,8 +959,32 @@ function CreatePostModal({
         category: categoryParam || 'general',
       };
 
-      const { error } = await supabase.from('posts').insert(payload);
+      const { data: insertedPost, error } = await supabase
+        .from('posts')
+        .insert(payload)
+        .select('id, user_id, video_url, content')
+        .single();
       if (error) throw error;
+
+      // Ensure video posts are also available in Reels data source.
+      if (insertedPost?.video_url) {
+        try {
+          await fetch(apiUrl('/api/reels'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              userId: insertedPost.user_id || user.id,
+              url: insertedPost.video_url,
+              caption: insertedPost.content || '',
+              username: resolveProfileUsername((user as any)?.user_metadata?.username),
+              avatar: (user as any)?.user_metadata?.avatar_url || '',
+            }),
+          });
+        } catch (reelErr) {
+          // Non-fatal for post publishing; Home click path can still create on-demand.
+          console.warn('[CreatePostModal] failed to mirror video post into reels:', reelErr);
+        }
+      }
 
       onClose();
       onPostCreated?.();
@@ -1955,16 +1990,84 @@ function PostItem({
   const doubleTapHandlers = useDoubleTap(handleDoubleTap);
 
   // Video click navigates to reels with selected video context.
-  const handleVideoClick = (e: React.MouseEvent) => {
+  const handleVideoClick = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    const reelId = (post as any).reel_id || post.id;
+    let reelId: string | null = (post as any).reel_id ? String((post as any).reel_id) : null;
+    const normalizedVideoUrl = videoUrl ? normalizeReelUrl(String(videoUrl)) : '';
+    try {
+      if (normalizedVideoUrl) {
+        // 1) Cache hit: avoid GET/POST and duplicate creation.
+        const cachedReelId = reelCache.get(normalizedVideoUrl);
+        if (cachedReelId) {
+          reelId = cachedReelId;
+        } else {
+          // 2) Query existing reels before creating a new one.
+          let matchedReelId: string | null = null;
+          const reelsRes = await fetch(apiUrl('/api/reels'));
+          if (reelsRes.ok) {
+            const reels = await reelsRes.json();
+            if (Array.isArray(reels)) {
+              for (const r of reels) {
+                const reelVideoUrl = normalizeReelUrl(String((r as any)?.video_url || ''));
+                console.log('MATCHING:', {
+                  home: normalizedVideoUrl,
+                  reel: reelVideoUrl
+                });
+                if (reelVideoUrl && reelVideoUrl === normalizedVideoUrl) {
+                  if ((r as any)?.id != null) {
+                    matchedReelId = String((r as any).id);
+                  }
+                  break;
+                }
+              }
+            }
+          }
+
+          if (matchedReelId) {
+            reelId = matchedReelId;
+            reelCache.set(normalizedVideoUrl, reelId);
+          } else {
+            // 3) Create only when not found.
+          const createRes = await fetch(apiUrl('/api/reels'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              userId: post.user_id || user?.id,
+                url: videoUrl,
+              caption: post.content || '',
+              username: postUser.username,
+              avatar: postUser.avatar,
+            }),
+          });
+          if (createRes.ok) {
+            const created = await createRes.json();
+            if (created?.id != null) {
+              reelId = String(created.id);
+                reelCache.set(normalizedVideoUrl, reelId);
+            }
+          }
+          }
+        }
+      } else if (!reelId) {
+        reelId = String(post.id);
+      }
+    } catch (err) {
+      console.warn('[Home] reel id resolve failed', err);
+    }
+
+    if (!reelId) {
+      console.warn('[Home] missing reelId after resolve, skipping navigation', { postId: post.id, videoUrl });
+      return;
+    }
+
     console.log('[Home] navigate to reels', {
       reelId,
       index,
       videoUrl
     });
-    navigate('/reels', {
+    navigate(`/reels/${reelId}`, {
       state: {
+        selectedReelId: reelId,
         videoId: reelId,
         postId: post.id,
         videoUrl,
@@ -2065,8 +2168,8 @@ function PostItem({
       {(videoUrl || imageUrl) && (
         <div className="px-0 relative">
           {videoUrl ? (
-            <div className="relative overflow-hidden bg-gray-50 border border-gray-100 rounded-xl aspect-video flex items-center justify-center w-full">
-              <div className="relative w-full h-full flex items-center justify-center select-none">
+            <div className="relative overflow-hidden bg-black border border-gray-100 rounded-xl w-full max-h-[500px] flex items-center justify-center">
+              <div className="relative w-full flex items-center justify-center select-none">
                 <video
                   ref={videoRef}
                   src={videoUrl}
@@ -2074,8 +2177,8 @@ function PostItem({
                   muted
                   loop
                   playsInline
-                  className="w-full h-full object-contain bg-black"
-                  style={{ cursor: 'pointer', background: '#000' }}
+                  className="w-full h-auto object-contain max-h-[500px]"
+                  style={{ cursor: 'pointer' }}
                   {...doubleTapHandlers}
                   onClick={(e) => {
                     if (e.detail === 1) {
@@ -2416,9 +2519,12 @@ function PeopleYouMayKnow() {
           console.warn('[PeopleYouMayKnow] profiles:', profErr.message);
         }
 
-        let candidates: { id: string; username: string | null; avatar_url: string | null }[] = [
-          ...(profRows ?? []),
-        ];
+        let candidates: {
+          id: string;
+          username: string | null;
+          avatar_url: string | null;
+          _fallback?: boolean;
+        }[] = [...(profRows ?? [])];
 
         if (candidates.length < 8) {
           const { data: postRows } = await supabase
