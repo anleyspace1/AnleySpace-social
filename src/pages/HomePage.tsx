@@ -2046,7 +2046,7 @@ function PostItem({
   const doubleTapHandlers = useDoubleTap(handleDoubleTap);
 
   // Video click navigates to reels with selected video context.
-  const handleVideoClick = async (e: React.MouseEvent) => {
+  const handleVideoClick = async (e: React.SyntheticEvent) => {
     e.stopPropagation();
     let reelId: string | null = (post as any).reel_id ? String((post as any).reel_id) : null;
     const normalizedVideoUrl = videoUrl ? normalizeReelUrl(String(videoUrl)) : '';
@@ -2131,7 +2131,8 @@ function PostItem({
         thumbnail: imageUrl || videoUrl,
         caption: post.content,
         username: postUser.username,
-        avatar: postUser.avatar
+        avatar: postUser.avatar,
+        selectedPost: post,
       }
     });
   };
@@ -2224,7 +2225,19 @@ function PostItem({
       {(videoUrl || imageUrl) && (
         <div className="px-0 relative">
           {videoUrl ? (
-            <div className="relative overflow-hidden bg-black border border-gray-100 rounded-xl w-full max-h-[500px] flex items-center justify-center">
+            // Same pattern as Explore "Live Now" / Trending cards: outer div is the tap target (onClick on wrapper), not the media element.
+            <div
+              className="relative overflow-hidden bg-black border border-gray-100 rounded-xl w-full max-h-[500px] flex items-center justify-center group cursor-pointer touch-manipulation"
+              onClick={(e) => {
+                doubleTapHandlers.onClick?.(e);
+                if (e.detail === 1) {
+                  setTimeout(() => {
+                    if (!showHeart) void handleVideoClick(e);
+                  }, 300);
+                }
+              }}
+              onTouchStart={doubleTapHandlers.onTouchStart}
+            >
               <div className="relative w-full flex items-center justify-center select-none">
                 <video
                   ref={videoRef}
@@ -2233,16 +2246,8 @@ function PostItem({
                   muted
                   loop
                   playsInline
-                  className="w-full h-auto object-contain max-h-[500px]"
+                  className="w-full h-auto object-contain max-h-[500px] pointer-events-none md:pointer-fine:pointer-events-auto"
                   style={{ cursor: 'pointer' }}
-                  {...doubleTapHandlers}
-                  onClick={(e) => {
-                    if (e.detail === 1) {
-                      setTimeout(() => {
-                        if (!showHeart) handleVideoClick(e);
-                      }, 300);
-                    }
-                  }}
                 />
                 <HeartOverlay show={showHeart} />
               </div>

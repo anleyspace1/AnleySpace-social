@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
@@ -58,6 +58,7 @@ export default function ReelsPage() {
   const { user } = useAuth();
   const navState = location.state as any;
   const selectedVideoUrl: string | undefined = navState?.videoUrl;
+  const selectedPost: any | null = navState?.selectedPost ?? null;
   const selectedVideoId: string | null =
     (navState?.selectedReelId ? String(navState.selectedReelId) : null) ||
     (navState?.videoId ? String(navState.videoId) : null) ||
@@ -75,6 +76,7 @@ export default function ReelsPage() {
   const [activeNav, setActiveNav] = useState<string>('for-you');
   const [reelsLoaded, setReelsLoaded] = useState(false);
   const feedRef = useRef<HTMLDivElement | null>(null);
+  const videoRefs = useRef<(HTMLDivElement | null)[]>([]);
   const touchStartYRef = useRef<number | null>(null);
   const touchStartXRef = useRef<number | null>(null);
   const suppressSwipeRef = useRef(false);
@@ -132,12 +134,18 @@ export default function ReelsPage() {
 
         const { data: reelsRows, error: reelsError } = await supabase
           .from('posts')
-          .select('id, user_id, content, video_url, image_url, created_at')
-          .eq('category', 'reel')
+          .select('id, user_id, content, video_url, image_url, created_at, category')
           .not('video_url', 'is', null)
           .order('created_at', { ascending: false });
         if (reelsError) throw reelsError;
-        const reels = Array.isArray(reelsRows) ? reelsRows : [];
+        let reels = Array.isArray(reelsRows) ? reelsRows : [];
+        if (selectedPost?.id != null) {
+          const selectedPostId = String(selectedPost.id);
+          const exists = reels.some((p: any) => String(p?.id) === selectedPostId);
+          if (!exists) {
+            reels = [selectedPost, ...reels];
+          }
+        }
 
         const userIds = Array.from(new Set(reels.map((r: any) => r.user_id).filter(Boolean)));
         let profileMap: Record<string, { username?: string | null; avatar_url?: string | null }> = {};
@@ -149,7 +157,40 @@ export default function ReelsPage() {
           profileMap = Object.fromEntries((profiles || []).map((p: any) => [String(p.id), p]));
         }
 
+        // Match Home feed behavior: compute likes/comments counts from likes/comments tables.
+        const postIds = reels.map((r: any) => String(r.id)).filter(Boolean);
+        let likesByPost: Record<string, number> = {};
+        let commentsByPost: Record<string, number> = {};
+        if (postIds.length > 0) {
+          const { data: likeRows, error: likesAggErr } = await supabase
+            .from('likes')
+            .select('post_id')
+            .in('post_id', postIds);
+          if (!likesAggErr && Array.isArray(likeRows)) {
+            likeRows.forEach((row: any) => {
+              const pid = String(row.post_id);
+              likesByPost[pid] = (likesByPost[pid] || 0) + 1;
+            });
+          }
+
+          const { data: commentRows, error: commentsAggErr } = await supabase
+            .from('comments')
+            .select('post_id')
+            .in('post_id', postIds);
+          if (!commentsAggErr && Array.isArray(commentRows)) {
+            commentRows.forEach((row: any) => {
+              const pid = String(row.post_id);
+              commentsByPost[pid] = (commentsByPost[pid] || 0) + 1;
+            });
+          }
+        }
+
         const list = reels
+          // Mirror Home feed "no group:* posts" behavior
+          .filter((r: any) => {
+            const cat = typeof r?.category === 'string' ? r.category.trim().toLowerCase() : '';
+            return !cat.startsWith('group:');
+          })
           .map((r: any) => {
             const id = String(r.id);
             const playUrl = r.video_url || r.url || '';
@@ -163,8 +204,8 @@ export default function ReelsPage() {
                 avatar: profileMap[String(r.user_id)]?.avatar_url || r.avatar || `https://picsum.photos/seed/${r.user_id || id}/100/100`,
               },
               caption: String(r.content || r.caption || ''),
-              likes: typeof r.likes === 'number' ? r.likes : 0,
-              comments: typeof r.comments === 'number' ? r.comments : 0,
+              likes: likesByPost[id] ?? 0,
+              comments: commentsByPost[id] ?? 0,
               views: typeof r.views === 'number' ? r.views : 0,
               shares: typeof r.shares === 'number' ? r.shares : 0,
               saves: typeof r.saves === 'number' ? r.saves : 0,
@@ -263,6 +304,22 @@ export default function ReelsPage() {
     }
   }, [activeVideoId, videos.length]);
 
+  // Home → Reels: center the clicked video once the feed list is ready.
+  useEffect(() => {
+    if (!selectedPost?.id || !videos.length) return;
+    const targetId = String(selectedPost.id);
+    const index = videos.findIndex((v) => String(v.id) === targetId);
+    if (index === -1) return;
+    const el = videoRefs.current[index];
+    if (!el) return;
+    const raf = requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      });
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [videos, selectedPost?.id]);
+
   const updateVideoCounts = (
     videoId: string,
     patch: Partial<{ likes: number; comments: number; views: number; liked: boolean }>
@@ -271,6 +328,48 @@ export default function ReelsPage() {
       prev.map((v) => (String(v.id) === String(videoId) ? { ...v, ...patch } : v))
     );
   };
+
+  const refreshPostCounts = useCallback(async (postId: string) => {
+    try {
+      const { count: likesCount, error: likesCountErr } = await supabase
+        .from('likes')
+        .select('*', { count: 'exact', head: true })
+        .eq('post_id', postId);
+      if (likesCountErr) throw likesCountErr;
+
+      const { count: commentsCount, error: commentsCountErr } = await supabase
+        .from('comments')
+        .select('*', { count: 'exact', head: true })
+        .eq('post_id', postId);
+      if (commentsCountErr) throw commentsCountErr;
+
+      let likedByUser = false;
+      if (user?.id) {
+        const { data: likeRow, error: likeRowErr } = await supabase
+          .from('likes')
+          .select('id')
+          .eq('post_id', postId)
+          .eq('user_id', user.id)
+          .maybeSingle();
+        if (!likeRowErr) likedByUser = !!likeRow;
+      }
+
+      setVideos((prev) =>
+        prev.map((v) =>
+          String(v.id) === String(postId)
+            ? {
+                ...v,
+                likes: typeof likesCount === 'number' ? likesCount : v.likes,
+                comments: typeof commentsCount === 'number' ? commentsCount : v.comments,
+                liked: typeof likedByUser === 'boolean' ? likedByUser : v.liked,
+              }
+            : v
+        )
+      );
+    } catch (err) {
+      console.error('[ReelsPage] refreshPostCounts failed:', err);
+    }
+  }, [user?.id]);
 
   const goToIndex = (idx: number) => {
     if (!videos.length) return;
@@ -437,9 +536,12 @@ export default function ReelsPage() {
           onTouchStart={handleTouchStart}
           onTouchEnd={handleTouchEnd}
         >
-          {videos.map((video) => (
+          {videos.map((video, index) => (
             <div
               key={video.id}
+              ref={(el) => {
+                videoRefs.current[index] = el;
+              }}
               data-reel-id={video.id}
               className="h-full w-full snap-start relative"
             >
@@ -448,6 +550,7 @@ export default function ReelsPage() {
                 onToggleComments={() => setIsCommentsOpen(!isCommentsOpen)}
                 onActive={() => setActiveVideoId(String(video.id))}
                 onCountsChange={updateVideoCounts}
+                onRefreshPostCounts={(postId) => void refreshPostCounts(postId)}
                 onUseSound={(sound) => {
                   setPreselectedSound(sound);
                   setIsUploadModalOpen(true);
@@ -466,6 +569,7 @@ export default function ReelsPage() {
             <CommentsSection 
               video={activeVideo} 
               onCountsChange={updateVideoCounts}
+              onRefreshPostCounts={(postId) => void refreshPostCounts(postId)}
               onClose={() => setIsCommentsOpen(false)} 
             />
             <SuggestedReels videos={videos} onSelect={(id) => setActiveVideoId(id)} />
@@ -486,6 +590,7 @@ export default function ReelsPage() {
             <CommentsSection 
               video={activeVideo} 
               onCountsChange={updateVideoCounts}
+              onRefreshPostCounts={(postId) => void refreshPostCounts(postId)}
               onClose={() => setIsCommentsOpen(false)} 
             />
           </motion.div>
@@ -1058,7 +1163,22 @@ function SoundSelector({ onClose, onSelect, selectedSoundId }: { onClose: () => 
   );
 }
 
-function VideoPost({ video, onToggleComments, onActive, onUseSound, onCountsChange }: { video: any; onToggleComments: () => void; onActive: () => void; onUseSound: (sound: any) => void; onCountsChange: (videoId: string, patch: Partial<{ likes: number; comments: number; views: number; liked: boolean }>) => void; key?: React.Key }) {
+function VideoPost({
+  video,
+  onToggleComments,
+  onActive,
+  onUseSound,
+  onCountsChange,
+  onRefreshPostCounts,
+}: {
+  video: any;
+  onToggleComments: () => void;
+  onActive: () => void;
+  onUseSound: (sound: any) => void;
+  onCountsChange: (videoId: string, patch: Partial<{ likes: number; comments: number; views: number; liked: boolean }>) => void;
+  onRefreshPostCounts: (postId: string) => void;
+  key?: React.Key;
+}) {
   const navigate = useNavigate();
   const { user } = useAuth();
   const [isPlaying, setIsPlaying] = useState(false);
@@ -1091,38 +1211,103 @@ function VideoPost({ video, onToggleComments, onActive, onUseSound, onCountsChan
     }
     const previous = isLiked;
     console.log('[ReelsPage] like click', { reelId, userId, previousLiked: previous });
-    setIsLiked((prev) => !prev);
+    const prevLikesCount = typeof video?.likes === 'number' ? video.likes : 0;
+    const nextLiked = !previous;
+    const jsonHeaders = { 'Content-Type': 'application/json' } as const;
+    setIsLiked(nextLiked);
+    onCountsChange(reelId, { likes: prevLikesCount + (nextLiked ? 1 : -1), liked: nextLiked });
     try {
-      const response = await fetch(apiUrl(`/api/reels/${reelId}/like`), {
+      const response = await fetch(apiUrl('/api/feed/post-like'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId })
+        headers: jsonHeaders,
+        body: JSON.stringify({ userId, postId: reelId })
       });
-      if (!response.ok) throw new Error('Failed to like reel');
-      const data = await response.json();
-      console.log('[ReelsPage] like response', { reelId, data });
-      onCountsChange(reelId, {
-        ...(typeof data.likes === 'number' ? { likes: data.likes } : {}),
-        liked: !!data.liked
-      });
-      setIsLiked(!!data.liked);
+      if (!response.ok) throw new Error('Failed to like post');
+      const data = await response.json().catch(() => null);
+      console.log('[ReelsPage] post-like response', { postId: reelId, data });
 
-      // Persist liked UI across refresh (server doesn't return per-user liked state from /api/reels).
+      // Persist liked UI across refresh.
       try {
         const likedStorageKey = 'reels_liked_ids_v1';
         const raw = localStorage.getItem(likedStorageKey);
         const arr = raw ? JSON.parse(raw) : [];
         const set = new Set(Array.isArray(arr) ? arr.map((x: any) => String(x)) : []);
-        if (data.liked) set.add(reelId);
+        if (nextLiked) set.add(reelId);
         else set.delete(reelId);
         localStorage.setItem(likedStorageKey, JSON.stringify(Array.from(set)));
       } catch {
         /* non-fatal */
       }
+
+      // If server returned explicit state, sync to it; otherwise keep optimistic values.
+      if (data && typeof data?.liked === 'boolean') {
+        setIsLiked(data.liked);
+        onCountsChange(reelId, { liked: data.liked });
+      }
     } catch (err) {
-      console.error('Failed to toggle reel like:', err);
-      setIsLiked(previous);
+      console.error('[ReelsPage] like API failed, trying supabase fallback:', err);
+      try {
+        if (nextLiked) {
+          const { error: insErr } = await supabase
+            .from('likes')
+            .insert({ post_id: reelId, user_id: userId });
+          if (insErr) throw insErr;
+
+          // Best-effort notification (non-fatal).
+          try {
+            const notifyRes = await fetch(apiUrl('/api/notifications/from-feed-like'), {
+              method: 'POST',
+              headers: jsonHeaders,
+              body: JSON.stringify({ userId, postId: reelId }),
+            });
+            await notifyRes.text();
+          } catch {
+            /* non-fatal */
+          }
+        } else {
+          const { error: delErr } = await supabase
+            .from('likes')
+            .delete()
+            .eq('post_id', reelId)
+            .eq('user_id', userId);
+          if (delErr) throw delErr;
+        }
+
+        // Keep optimistic values; sync localStorage likedIds to nextLiked.
+        try {
+          const likedStorageKey = 'reels_liked_ids_v1';
+          const raw = localStorage.getItem(likedStorageKey);
+          const arr = raw ? JSON.parse(raw) : [];
+          const set = new Set(Array.isArray(arr) ? arr.map((x: any) => String(x)) : []);
+          if (nextLiked) set.add(reelId);
+          else set.delete(reelId);
+          localStorage.setItem(likedStorageKey, JSON.stringify(Array.from(set)));
+        } catch {
+          /* non-fatal */
+        }
+      } catch (fallbackErr) {
+        console.error('[ReelsPage] like supabase fallback failed:', fallbackErr);
+        setIsLiked(previous);
+        onCountsChange(reelId, { likes: prevLikesCount, liked: previous });
+        try {
+          const likedStorageKey = 'reels_liked_ids_v1';
+          const raw = localStorage.getItem(likedStorageKey);
+          const arr = raw ? JSON.parse(raw) : [];
+          const set = new Set(Array.isArray(arr) ? arr.map((x: any) => String(x)) : []);
+          if (previous) set.add(reelId);
+          else set.delete(reelId);
+          localStorage.setItem(likedStorageKey, JSON.stringify(Array.from(set)));
+        } catch {
+          /* non-fatal */
+        }
+      }
     }
+
+    // Reliable UI sync on Vercel even if realtime is delayed.
+    setTimeout(() => {
+      if (reelId) onRefreshPostCounts(reelId);
+    }, 500);
+
     const newHearts = Array.from({ length: 5 }).map((_, i) => ({
       id: Date.now() + i,
       x: Math.random() * 60 - 30,
@@ -1563,7 +1748,17 @@ function SuggestedReels({ videos, onSelect }: { videos: any[]; onSelect: (id: st
   );
 }
 
-function CommentsSection({ video, onClose, onCountsChange }: { video: any; onClose: () => void; onCountsChange: (videoId: string, patch: Partial<{ likes: number; comments: number; views: number; liked: boolean }>) => void }) {
+function CommentsSection({
+  video,
+  onClose,
+  onCountsChange,
+  onRefreshPostCounts,
+}: {
+  video: any;
+  onClose: () => void;
+  onCountsChange: (videoId: string, patch: Partial<{ likes: number; comments: number; views: number; liked: boolean }>) => void;
+  onRefreshPostCounts: (postId: string) => void;
+}) {
   const { user, profile } = useAuth();
   const [comments, setComments] = useState<any[]>([]);
   const [newComment, setNewComment] = useState('');
@@ -1571,82 +1766,166 @@ function CommentsSection({ video, onClose, onCountsChange }: { video: any; onClo
   useEffect(() => {
     const loadComments = async () => {
       if (!video?.id) return;
-      const reelId = String(video.id);
+      const postId = String(video.id);
       try {
-        const res = await fetch(apiUrl(`/api/reels/${reelId}/comments`));
-        if (!res.ok) return;
-        const data = await res.json();
+        const { data, error } = await supabase
+          .from('comments')
+          .select('id, post_id, user_id, content, created_at')
+          .eq('post_id', postId)
+          .order('created_at', { ascending: true });
+        if (error) throw error;
+
+        const userIds = Array.from(new Set((data || []).map((c: any) => c.user_id).filter(Boolean)));
+        let profilesMap: Record<string, any> = {};
+        if (userIds.length > 0) {
+          const { data: profilesData, error: profilesErr } = await supabase
+            .from('profiles')
+            .select('id, username, avatar_url')
+            .in('id', userIds);
+          if (profilesErr) {
+            console.error('Failed to fetch comment profiles:', profilesErr);
+          } else {
+            profilesMap = (profilesData || []).reduce((acc: any, p: any) => {
+              acc[String(p.id)] = p;
+              return acc;
+            }, {});
+          }
+        }
+
         setComments((data || []).map((c: any) => ({
           id: c.id,
-          user: resolveProfileUsername(c.username),
-          text: c.text,
-          avatar: c.avatar || `https://picsum.photos/seed/${c.user_id}/100/100`,
+          user: resolveProfileUsername(profilesMap[String(c.user_id)]?.username),
+          text: c.content,
+          avatar: profilesMap[String(c.user_id)]?.avatar_url || `https://picsum.photos/seed/${c.user_id}/100/100`,
           time: c.created_at ? new Date(c.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'now',
-          likes: '0'
+          likes: '0',
         })));
       } catch (err) {
-        console.error('Failed to fetch reel comments:', err);
+        console.error('Failed to fetch reel(post) comments:', err);
       }
     };
-    loadComments();
+
+    void loadComments();
   }, [video?.id]);
 
   const handleAddComment = async (e: React.FormEvent) => {
     e.preventDefault();
-    const reelId = video?.id != null ? String(video.id) : null;
+    const postId = video?.id != null ? String(video.id) : null;
     const userId = user?.id || MOCK_USER.id;
-    if (!reelId) {
-      console.error('[ReelsPage] comment: missing reelId', { reelId, video });
+    if (!postId) {
+      console.error('[ReelsPage] comment: missing postId', { postId, video });
       return;
     }
     if (!newComment.trim()) return;
     const text = newComment.trim();
-    console.log('[ReelsPage] comment submit', { reelId, userId, text });
+    console.log('[ReelsPage] comment submit', { postId, userId, text });
     setNewComment('');
     try {
-      const res = await fetch(apiUrl(`/api/reels/${reelId}/comments`), {
+      const commentRes = await fetch(apiUrl('/api/feed/post-comment'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           userId,
-          user_id: userId,
-          reel_id: reelId,
+          postId,
           content: text,
-          username: resolveProfileUsername(profile?.username),
-          avatar: profile?.avatar_url || MOCK_USER.avatar,
-          text
         })
       });
-      if (!res.ok) {
-        console.error('[ReelsPage] comment response not ok', { reelId, status: res.status });
-        throw new Error('Failed to save comment');
+      let inserted: any = null;
+      if (commentRes.ok) {
+        const payload = await commentRes.json().catch(() => null);
+        inserted = payload?.comment ?? null;
       }
-      const data = await res.json();
-      console.log('[ReelsPage] comment response', { reelId, data });
-      if (Array.isArray(data?.commentsList)) {
-        setComments(data.commentsList.map((c: any) => ({
-          id: c.id,
-          user: resolveProfileUsername(c.username),
-          text: c.text,
-          avatar: c.avatar || `https://picsum.photos/seed/${c.user_id}/100/100`,
-          time: c.created_at ? new Date(c.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'now',
-          likes: '0'
-        })));
-      } else if (data?.comment) {
-        setComments(prev => [{
-          id: data.comment.id,
-          user: resolveProfileUsername(data.comment.username || profile?.username),
-          text: data.comment.text,
-          avatar: data.comment.avatar || profile?.avatar_url || MOCK_USER.avatar,
-          time: 'now',
-          likes: '0'
-        }, ...prev]);
+
+      // Fallback: direct supabase insert + non-fatal notifications (same pattern as Home).
+      if (!inserted) {
+        const { data: ins, error } = await supabase
+          .from('comments')
+          .insert({
+            post_id: postId,
+            user_id: userId,
+            content: text,
+            created_at: new Date(),
+          })
+          .select('id, post_id, user_id, content, created_at')
+          .single();
+        if (error) throw error;
+        inserted = ins;
+
+        try {
+          await fetch(apiUrl('/api/notifications/from-feed-comment'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              userId,
+              postId,
+              commentId: inserted?.id,
+            }),
+          });
+        } catch {
+          /* non-fatal */
+        }
       }
-      if (typeof data?.comments === 'number') {
-        onCountsChange(reelId, { comments: data.comments });
+
+      // Optimistic UI append so the new comment shows immediately.
+      if (inserted?.id) {
+        setComments((prev) => [
+          {
+            id: inserted.id,
+            user: resolveProfileUsername(profile?.username),
+            text: inserted.content,
+            avatar: profile?.avatar_url || MOCK_USER.avatar,
+            time: 'now',
+            likes: '0',
+          },
+          ...(Array.isArray(prev) ? prev : []),
+        ]);
       }
+
+      // Refresh comments list.
+      const { data: freshData, error: freshErr } = await supabase
+        .from('comments')
+        .select('id, post_id, user_id, content, created_at')
+        .eq('post_id', postId)
+        .order('created_at', { ascending: true });
+      if (freshErr) throw freshErr;
+
+      const freshUserIds = Array.from(new Set((freshData || []).map((c: any) => c.user_id).filter(Boolean)));
+      let freshProfilesMap: Record<string, any> = {};
+      if (freshUserIds.length > 0) {
+        const { data: freshProfilesData, error: freshProfilesErr } = await supabase
+          .from('profiles')
+          .select('id, username, avatar_url')
+          .in('id', freshUserIds);
+        if (!freshProfilesErr) {
+          freshProfilesMap = (freshProfilesData || []).reduce((acc: any, p: any) => {
+            acc[String(p.id)] = p;
+            return acc;
+          }, {});
+        }
+      }
+
+      setComments((freshData || []).map((c: any) => ({
+        id: c.id,
+        user: resolveProfileUsername(freshProfilesMap[String(c.user_id)]?.username),
+        text: c.content,
+        avatar: freshProfilesMap[String(c.user_id)]?.avatar_url || `https://picsum.photos/seed/${c.user_id}/100/100`,
+        time: c.created_at ? new Date(c.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'now',
+        likes: '0',
+      })));
+
+      const { count, error: countErr } = await supabase
+        .from('comments')
+        .select('*', { count: 'exact', head: true })
+        .eq('post_id', postId);
+      if (!countErr && typeof count === 'number') {
+        onCountsChange(postId, { comments: count });
+      }
+      // Reliable UI sync on Vercel even if realtime is delayed.
+      setTimeout(() => {
+        if (postId) onRefreshPostCounts(postId);
+      }, 500);
     } catch (err) {
-      console.error('Failed to add reel comment:', err);
+      console.error('Failed to add reel(post) comment:', err);
       setNewComment(text);
     }
   };
