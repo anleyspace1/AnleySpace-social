@@ -200,6 +200,34 @@ export default function GroupChatPage() {
   }, [id]);
 
   useEffect(() => {
+    if (!id) return;
+
+    // Reuse DM-style Supabase realtime fallback for environments where socket events can lag (e.g. Vercel).
+    const channel = supabase
+      .channel(`group-chat:${id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'group_messages',
+          filter: `group_id=eq.${id}`,
+        },
+        (payload) => {
+          const newMessage = payload.new as Record<string, unknown>;
+          if (String(newMessage.group_id ?? '') === String(id)) {
+            void fetchMessages();
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [id]);
+
+  useEffect(() => {
     // Initialize Socket.IO
     const socket = io();
     socketRef.current = socket;
@@ -342,6 +370,8 @@ export default function GroupChatPage() {
       };
 
       socketRef.current.emit('send_group_message', messageData);
+      // Immediate non-blocking refresh for deploys where realtime delivery can lag.
+      void fetchMessages();
 
       setInputText('');
       setSelectedImage(null);

@@ -1026,16 +1026,12 @@ function CreatePostModal({
       // Ensure video posts are also available in Reels data source.
       if (insertedPost?.video_url) {
         try {
-          await fetch(apiUrl('/api/reels'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              userId: insertedPost.user_id || user.id,
-              url: insertedPost.video_url,
-              caption: insertedPost.content || '',
-              username: resolveProfileUsername((user as any)?.user_metadata?.username),
-              avatar: (user as any)?.user_metadata?.avatar_url || '',
-            }),
+          await supabase.from('posts').insert({
+            user_id: insertedPost.user_id || user.id,
+            content: insertedPost.content || '',
+            image_url: null,
+            video_url: insertedPost.video_url,
+            category: 'reel',
           });
         } catch (reelErr) {
           // Non-fatal for post publishing; Home click path can still create on-demand.
@@ -2063,22 +2059,25 @@ function PostItem({
         } else {
           // 2) Query existing reels before creating a new one.
           let matchedReelId: string | null = null;
-          const reelsRes = await fetch(apiUrl('/api/reels'));
-          if (reelsRes.ok) {
-            const reels = await reelsRes.json();
-            if (Array.isArray(reels)) {
-              for (const r of reels) {
-                const reelVideoUrl = normalizeReelUrl(String((r as any)?.video_url || ''));
-                console.log('MATCHING:', {
-                  home: normalizedVideoUrl,
-                  reel: reelVideoUrl
-                });
-                if (reelVideoUrl && reelVideoUrl === normalizedVideoUrl) {
-                  if ((r as any)?.id != null) {
-                    matchedReelId = String((r as any).id);
-                  }
-                  break;
+          const { data: reelsRows, error: reelsError } = await supabase
+            .from('posts')
+            .select('id, video_url')
+            .eq('category', 'reel')
+            .not('video_url', 'is', null)
+            .order('created_at', { ascending: false })
+            .limit(200);
+          if (!reelsError && Array.isArray(reelsRows)) {
+            for (const r of reelsRows) {
+              const reelVideoUrl = normalizeReelUrl(String((r as any)?.video_url || ''));
+              console.log('MATCHING:', {
+                home: normalizedVideoUrl,
+                reel: reelVideoUrl
+              });
+              if (reelVideoUrl && reelVideoUrl === normalizedVideoUrl) {
+                if ((r as any)?.id != null) {
+                  matchedReelId = String((r as any).id);
                 }
+                break;
               }
             }
           }
@@ -2088,24 +2087,21 @@ function PostItem({
             reelCache.set(normalizedVideoUrl, reelId);
           } else {
             // 3) Create only when not found.
-          const createRes = await fetch(apiUrl('/api/reels'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              userId: post.user_id || user?.id,
-                url: videoUrl,
-              caption: post.content || '',
-              username: postUser.username,
-              avatar: postUser.avatar,
-            }),
-          });
-          if (createRes.ok) {
-            const created = await createRes.json();
-            if (created?.id != null) {
+            const { data: created, error: createError } = await supabase
+              .from('posts')
+              .insert({
+                user_id: post.user_id || user?.id,
+                content: post.content || '',
+                image_url: null,
+                video_url: videoUrl,
+                category: 'reel',
+              })
+              .select('id')
+              .single();
+            if (!createError && created?.id != null) {
               reelId = String(created.id);
-                reelCache.set(normalizedVideoUrl, reelId);
+              reelCache.set(normalizedVideoUrl, reelId);
             }
-          }
           }
         }
       } else if (!reelId) {

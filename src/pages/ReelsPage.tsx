@@ -130,25 +130,39 @@ export default function ReelsPage() {
         const targetId = params.id ? String(params.id) : selectedVideoId ? String(selectedVideoId) : null;
         const targetUrl = selectedVideoUrl ? normalizeUrl(selectedVideoUrl) : null;
 
-        const res = await fetch(apiUrl('/api/reels'));
-        if (!res.ok) throw new Error(`Failed to fetch reels: ${res.status}`);
-        const data = await res.json();
-        const reels = Array.isArray(data) ? data : [];
+        const { data: reelsRows, error: reelsError } = await supabase
+          .from('posts')
+          .select('id, user_id, content, video_url, image_url, created_at')
+          .eq('category', 'reel')
+          .not('video_url', 'is', null)
+          .order('created_at', { ascending: false });
+        if (reelsError) throw reelsError;
+        const reels = Array.isArray(reelsRows) ? reelsRows : [];
+
+        const userIds = Array.from(new Set(reels.map((r: any) => r.user_id).filter(Boolean)));
+        let profileMap: Record<string, { username?: string | null; avatar_url?: string | null }> = {};
+        if (userIds.length > 0) {
+          const { data: profiles } = await supabase
+            .from('profiles')
+            .select('id, username, avatar_url')
+            .in('id', userIds);
+          profileMap = Object.fromEntries((profiles || []).map((p: any) => [String(p.id), p]));
+        }
 
         const list = reels
           .map((r: any) => {
             const id = String(r.id);
-            const playUrl = r.url || r.video_url || '';
+            const playUrl = r.video_url || r.url || '';
             return {
               id,
               url: playUrl,
               videoUrl: playUrl,
-              thumbnail: r.thumbnail || playUrl,
+              thumbnail: r.image_url || r.thumbnail || playUrl,
               user: {
-                username: r.username || 'User',
-                avatar: r.avatar || `https://picsum.photos/seed/${r.user_id || id}/100/100`,
+                username: profileMap[String(r.user_id)]?.username || r.username || 'User',
+                avatar: profileMap[String(r.user_id)]?.avatar_url || r.avatar || `https://picsum.photos/seed/${r.user_id || id}/100/100`,
               },
-              caption: String(r.caption || ''),
+              caption: String(r.content || r.caption || ''),
               likes: typeof r.likes === 'number' ? r.likes : 0,
               comments: typeof r.comments === 'number' ? r.comments : 0,
               views: typeof r.views === 'number' ? r.views : 0,
@@ -633,33 +647,26 @@ function UploadReelModal({ onClose, onUpload, initialSound }: { onClose: () => v
       });
       if (!publicUrl) throw new Error('Failed to generate public URL for uploaded reel');
 
-      // Save reel metadata to backend
+      // Save reel metadata to posts table (same stable path as Home posts).
       const insertPayload = {
-        userId: user?.id || MOCK_USER.id,
-        url: publicUrl,
-        caption,
-        soundTitle: selectedSound?.title,
-        soundArtist: selectedSound?.artist,
-        username: resolveProfileUsername(profile?.username),
-        avatar: profile?.avatar_url || MOCK_USER.avatar,
+        user_id: user?.id || MOCK_USER.id,
+        content: caption || '',
+        image_url: null,
+        video_url: publicUrl,
+        category: 'reel',
       };
-      console.log('[REELS_DEBUG][ReelsPage] /api/reels payload', insertPayload);
-      const response = await fetch(apiUrl('/api/reels'), {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(insertPayload),
+      console.log('[REELS_DEBUG][ReelsPage] posts insert payload', insertPayload);
+      const { data: insertedPost, error: insertError } = await supabase
+        .from('posts')
+        .insert(insertPayload)
+        .select('id')
+        .single();
+      console.log('[REELS_DEBUG][ReelsPage] posts insert response', {
+        data: insertedPost ?? null,
+        error: insertError ?? null,
       });
-      const responseText = await response.text();
-      console.log('[REELS_DEBUG][ReelsPage] /api/reels response', {
-        status: response.status,
-        ok: response.ok,
-        body: responseText.slice(0, 500),
-      });
-
-      if (!response.ok) throw new Error('Failed to save reel to database');
-      const result = responseText ? JSON.parse(responseText) : {};
+      if (insertError) throw insertError;
+      const createdId = insertedPost?.id != null ? String(insertedPost.id) : `${Date.now()}`;
 
       const { data: probeRows, error: probeError } = await supabase
         .from('posts')
@@ -672,7 +679,7 @@ function UploadReelModal({ onClose, onUpload, initialSound }: { onClose: () => v
       });
 
       const newVideo = {
-        id: result.id,
+        id: createdId,
         url: publicUrl,
         user: {
           username: resolveProfileUsername(profile?.username),

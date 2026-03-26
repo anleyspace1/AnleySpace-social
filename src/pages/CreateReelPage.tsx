@@ -171,30 +171,25 @@ export default function CreateReelPage() {
       });
       if (!publicUrl) throw new Error('Failed to generate public URL for uploaded reel');
 
-      // Save reel metadata to backend
+      // Save reel metadata to posts table (same stable path as Home posts).
       const insertPayload = {
-        userId: user?.id || MOCK_USER.id,
-        url: publicUrl,
-        caption,
-        soundTitle: selectedSound?.title,
-        soundArtist: selectedSound?.artist,
+        user_id: user?.id || MOCK_USER.id,
+        content: caption || '',
+        image_url: null,
+        video_url: publicUrl,
+        category: 'reel',
       };
-      console.log('[REELS_DEBUG][CreateReelPage] /api/reels payload', insertPayload);
-      const response = await fetch(apiUrl('/api/reels'), {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(insertPayload),
+      console.log('[REELS_DEBUG][CreateReelPage] posts insert payload', insertPayload);
+      const { data: insertedPost, error: insertError } = await supabase
+        .from('posts')
+        .insert(insertPayload)
+        .select('id')
+        .single();
+      console.log('[REELS_DEBUG][CreateReelPage] posts insert response', {
+        data: insertedPost ?? null,
+        error: insertError ?? null,
       });
-      const responseText = await response.text();
-      console.log('[REELS_DEBUG][CreateReelPage] /api/reels response', {
-        status: response.status,
-        ok: response.ok,
-        body: responseText.slice(0, 500),
-      });
-
-      if (!response.ok) throw new Error('Failed to save reel to database');
+      if (insertError) throw insertError;
 
       // Diagnostics only: verify whether direct Supabase table access works under current auth/RLS.
       const { data: probeRows, error: probeError } = await supabase
