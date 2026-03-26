@@ -1185,6 +1185,8 @@ function VideoPost({
   const [isLiked, setIsLiked] = useState(!!video?.liked);
   const [isSaved, setIsSaved] = useState(false);
   const [isMuted, setIsMuted] = useState(true);
+  /** Touch-first devices: autoplay stays muted until user taps; desktop behavior unchanged. */
+  const [coarsePointer, setCoarsePointer] = useState(false);
   const [isFollowing, setIsFollowing] = useState(false);
   const [selectedGiftId, setSelectedGiftId] = useState<string | null>(null);
   const [activeGifts, setActiveGifts] = useState<any[]>([]);
@@ -1323,6 +1325,14 @@ function VideoPost({
     setIsLiked(!!video?.liked);
   }, [video?.liked, video?.id]);
 
+  useEffect(() => {
+    const mq = window.matchMedia('(pointer: coarse)');
+    const sync = () => setCoarsePointer(!!mq.matches);
+    sync();
+    mq.addEventListener('change', sync);
+    return () => mq.removeEventListener('change', sync);
+  }, []);
+
   const handleSelectGift = (gift: { id: string }) => {
     setSelectedGiftId(gift?.id ?? null);
     console.log('[ReelsPage] gift select', { reelId: video?.id != null ? String(video.id) : null, giftId: gift?.id });
@@ -1369,7 +1379,7 @@ function VideoPost({
     }, 2000);
   };
 
-  const togglePlay = async () => {
+  const togglePlay = useCallback(async () => {
     if (videoRef.current) {
       try {
         if (isPlaying) {
@@ -1383,7 +1393,33 @@ function VideoPost({
         console.error("Video play failed:", error);
       }
     }
-  };
+  }, [isPlaying]);
+
+  /** Desktop: unchanged (toggle mute + play/pause). Mobile: unmute + keep playing, or mute without pausing. */
+  const handleVideoSurfaceTap = useCallback(() => {
+    if (!coarsePointer) {
+      setIsMuted((prev) => !prev);
+      void togglePlay();
+      return;
+    }
+    if (isMuted) {
+      const el = videoRef.current;
+      if (el) {
+        el.muted = false;
+        setIsMuted(false);
+        void el
+          .play()
+          .then(() => setIsPlaying(true))
+          .catch(() => {});
+      } else {
+        setIsMuted(false);
+      }
+    } else {
+      const el = videoRef.current;
+      if (el) el.muted = true;
+      setIsMuted(true);
+    }
+  }, [coarsePointer, isMuted, togglePlay]);
 
   useEffect(() => {
     const observer = new IntersectionObserver(
@@ -1405,7 +1441,6 @@ function VideoPost({
               .catch(() => {});
             try {
               if (videoRef.current) {
-                videoRef.current.muted = isMuted;
                 await videoRef.current.play();
                 setIsPlaying(true);
               }
@@ -1450,15 +1485,35 @@ function VideoPost({
         muted={isMuted}
         autoPlay
         playsInline
-        onClick={() => {
-          setIsMuted((prev) => !prev);
-          togglePlay();
-        }}
+        onClick={handleVideoSurfaceTap}
       />
 
-      {isMuted && (
+      {isMuted && coarsePointer && (
+        <button
+          type="button"
+          className="absolute left-1/2 top-1/2 z-[12] -translate-x-1/2 -translate-y-1/2 rounded-full bg-black/45 px-3 py-2 text-[12px] font-bold text-white shadow-sm backdrop-blur-md touch-manipulation"
+          aria-label="Tap for sound"
+          onClick={(e) => {
+            e.stopPropagation();
+            const el = videoRef.current;
+            if (el) {
+              el.muted = false;
+              setIsMuted(false);
+              void el
+                .play()
+                .then(() => setIsPlaying(true))
+                .catch(() => {});
+            } else {
+              setIsMuted(false);
+            }
+          }}
+        >
+          Tap for sound
+        </button>
+      )}
+      {isMuted && !coarsePointer && (
         <div className="absolute inset-0 z-[2] flex items-center justify-center pointer-events-none">
-          <div className="rounded-full bg-black/45 backdrop-blur-md px-3 py-2 text-[12px] font-bold text-white shadow-sm">
+          <div className="rounded-full bg-black/45 px-3 py-2 text-[12px] font-bold text-white shadow-sm backdrop-blur-md">
             Tap for sound
           </div>
         </div>

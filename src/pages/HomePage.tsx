@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence, Reorder } from 'motion/react';
 import {
   Plus,
@@ -97,23 +97,41 @@ function renderTextWithHashtags(
 
 // Helper: Double tap detection and heart animation overlay
 function useDoubleTap(onDoubleTap: () => void, delay = 300) {
-  // Returns object: {onTouchStart, onClick, ...} for props spread
   const lastTap = useRef<number | null>(null);
+  /** Last touchstart time — used to ignore synthetic `click` after the same touch (mobile false double-tap). */
+  const lastTouchStartTs = useRef<number>(0);
 
-  const handler = (e: React.MouseEvent | React.TouchEvent) => {
-    const now = Date.now();
-    if (lastTap.current && now - lastTap.current < delay) {
-      onDoubleTap();
-      lastTap.current = null;
-    } else {
-      lastTap.current = now;
-    }
-  };
+  const handler = useCallback(
+    (e: React.MouseEvent | React.TouchEvent) => {
+      const now = Date.now();
+      if (e.type === 'click') {
+        // Same gesture as a recent touchstart → do not count click as a second tap (would trigger like).
+        if (lastTouchStartTs.current > 0 && now - lastTouchStartTs.current < 500) {
+          lastTouchStartTs.current = 0;
+          return;
+        }
+      }
+      if (e.type === 'touchstart') {
+        lastTouchStartTs.current = now;
+      }
 
-  return {
-    onClick: handler,
-    onTouchStart: handler,
-  };
+      if (lastTap.current != null && now - lastTap.current < delay) {
+        onDoubleTap();
+        lastTap.current = null;
+      } else {
+        lastTap.current = now;
+      }
+    },
+    [onDoubleTap, delay]
+  );
+
+  return useMemo(
+    () => ({
+      onClick: handler,
+      onTouchStart: handler,
+    }),
+    [handler]
+  );
 }
 
 function HeartOverlay({ show }: { show: boolean }) {
