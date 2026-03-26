@@ -1,7 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { io, type Socket } from 'socket.io-client';
 import { useAuth } from './AuthContext';
-import { API_ORIGIN } from '../lib/apiOrigin';
+import { API_ORIGIN, apiUrl } from '../lib/apiOrigin';
 import { playNotificationSound } from '../lib/notificationSound';
 
 export type AppNotification = {
@@ -74,7 +74,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
     }
     setLoading(true);
     try {
-      const res = await fetch(`${API_ORIGIN}/api/notifications?userId=${encodeURIComponent(user.id)}`);
+      const res = await fetch(apiUrl(`/api/notifications?userId=${encodeURIComponent(user.id)}`));
       if (!res.ok) {
         setNotifications([]);
         return;
@@ -136,7 +136,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
       if (!user?.id) return;
       setNotifications((prev) => prev.map((n) => (n.id === id ? { ...n, is_read: true } : n)));
       try {
-        const res = await fetch(`${API_ORIGIN}/api/notifications/${encodeURIComponent(id)}/read`, {
+        const res = await fetch(apiUrl(`/api/notifications/${encodeURIComponent(id)}/read`), {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ userId: user.id }),
@@ -169,7 +169,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
     try {
       await Promise.all(
         idsToMark.map((id) =>
-          fetch(`${API_ORIGIN}/api/notifications/${encodeURIComponent(id)}/read`, {
+          fetch(apiUrl(`/api/notifications/${encodeURIComponent(id)}/read`), {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ userId: user.id }),

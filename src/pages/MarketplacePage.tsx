@@ -24,6 +24,7 @@ import { Product, Video, Post } from '../types';
 import { cn } from '../lib/utils';
 import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../lib/supabase';
+import { apiUrl } from '../lib/apiOrigin';
 import { ResponsiveImage } from '../components/ResponsiveImage';
 
 export default function MarketplacePage() {
@@ -82,7 +83,7 @@ export default function MarketplacePage() {
 
   const fetchReels = async () => {
     try {
-      const res = await fetch('/api/reels');
+      const res = await fetch(apiUrl('/api/reels'));
       if (res.ok) {
         const data = await res.json();
         if (data.length > 0) {
@@ -117,7 +118,7 @@ export default function MarketplacePage() {
 
   const fetchProducts = async () => {
     try {
-      const res = await fetch('/api/marketplace/products');
+      const res = await fetch(apiUrl('/api/marketplace/products'));
       const data = await res.json();
       setProducts(data.map((p: any) => ({
         ...p,
@@ -132,7 +133,7 @@ export default function MarketplacePage() {
   const fetchUser = async () => {
     if (!user) return;
     try {
-      const res = await fetch(`/api/user/${user.id}`);
+      const res = await fetch(apiUrl(`/api/user/${user.id}`));
       const data = await res.json();
       if (data.coins !== undefined) {
         setUserCoins(data.coins);
@@ -178,7 +179,7 @@ export default function MarketplacePage() {
 
     setBuyStatus('processing');
     try {
-      const res = await fetch('/api/marketplace/buy', {
+      const res = await fetch(apiUrl('/api/marketplace/buy'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -247,7 +248,7 @@ export default function MarketplacePage() {
     };
 
     try {
-      const res = await fetch('/api/marketplace/products', {
+      const res = await fetch(apiUrl('/api/marketplace/products'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)

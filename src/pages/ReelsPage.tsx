@@ -130,19 +130,20 @@ export default function ReelsPage() {
         const targetId = params.id ? String(params.id) : selectedVideoId ? String(selectedVideoId) : null;
         const targetUrl = selectedVideoUrl ? normalizeUrl(selectedVideoUrl) : null;
 
-        const apiRes = await fetch(apiUrl('/api/reels'), { method: 'GET' });
-        if (!apiRes.ok) throw new Error(`Failed to fetch reels: ${apiRes.status}`);
-        const payload = await apiRes.json();
-        const reels = Array.isArray(payload) ? payload : [];
+        const res = await fetch(apiUrl('/api/reels'));
+        if (!res.ok) throw new Error(`Failed to fetch reels: ${res.status}`);
+        const data = await res.json();
+        const reels = Array.isArray(data) ? data : [];
 
         const list = reels
           .map((r: any) => {
             const id = String(r.id);
+            const playUrl = r.url || r.video_url || '';
             return {
               id,
-              url: r.url,
-              videoUrl: r.url,
-              thumbnail: r.thumbnail || r.url,
+              url: playUrl,
+              videoUrl: playUrl,
+              thumbnail: r.thumbnail || playUrl,
               user: {
                 username: r.username || 'User',
                 avatar: r.avatar || `https://picsum.photos/seed/${r.user_id || id}/100/100`,
@@ -170,6 +171,9 @@ export default function ReelsPage() {
           : null;
         const target = targetById || targetByUrl || list[0] || null;
         setActiveVideoId(target ? String(target.id) : null);
+      } catch (e) {
+        console.error('[ReelsPage] fetchReels', e);
+        setVideos([]);
       } finally {
         setReelsLoaded(true);
       }
@@ -593,11 +597,21 @@ function UploadReelModal({ onClose, onUpload, initialSound }: { onClose: () => v
     setIsUploading(true);
 
     try {
+      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined;
+      const { data: authData, error: authError } = await supabase.auth.getUser();
+      console.log('[REELS_DEBUG][ReelsPage] env + auth', {
+        mode: import.meta.env.MODE,
+        host: typeof window !== 'undefined' ? window.location.host : '(ssr)',
+        supabaseHost: supabaseUrl ? new URL(supabaseUrl).host : '(missing)',
+        authUser: authData?.user ?? null,
+        authError: authError ?? null,
+      });
+
       // Upload directly to the "reels" bucket.
       // This avoids false negatives when listBuckets is restricted for anon keys.
       const fileName = `${Date.now()}-${file.name.replace(/[^a-zA-Z0-9.]/g, '_')}`;
       const { data: uploadData, error: uploadError } = await supabase.storage
-        .from('reels')
+        .from('posts')
         .upload(fileName, file);
 
       if (uploadError) {
@@ -609,29 +623,53 @@ function UploadReelModal({ onClose, onUpload, initialSound }: { onClose: () => v
 
       const uploadedPath = uploadData?.path || fileName;
       const { data: { publicUrl } } = supabase.storage
-        .from('reels')
+        .from('posts')
         .getPublicUrl(uploadedPath);
+      console.log('[REELS_DEBUG][ReelsPage] storage upload result', {
+        uploadData,
+        uploadError: uploadError ?? null,
+        uploadedPath,
+        publicUrl,
+      });
       if (!publicUrl) throw new Error('Failed to generate public URL for uploaded reel');
 
       // Save reel metadata to backend
-      const response = await fetch('/api/reels', {
+      const insertPayload = {
+        userId: user?.id || MOCK_USER.id,
+        url: publicUrl,
+        caption,
+        soundTitle: selectedSound?.title,
+        soundArtist: selectedSound?.artist,
+        username: resolveProfileUsername(profile?.username),
+        avatar: profile?.avatar_url || MOCK_USER.avatar,
+      };
+      console.log('[REELS_DEBUG][ReelsPage] /api/reels payload', insertPayload);
+      const response = await fetch(apiUrl('/api/reels'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          userId: user?.id || MOCK_USER.id,
-          url: publicUrl,
-          caption,
-          soundTitle: selectedSound?.title,
-          soundArtist: selectedSound?.artist,
-          username: resolveProfileUsername(profile?.username),
-          avatar: profile?.avatar_url || MOCK_USER.avatar,
-        }),
+        body: JSON.stringify(insertPayload),
+      });
+      const responseText = await response.text();
+      console.log('[REELS_DEBUG][ReelsPage] /api/reels response', {
+        status: response.status,
+        ok: response.ok,
+        body: responseText.slice(0, 500),
       });
 
       if (!response.ok) throw new Error('Failed to save reel to database');
-      const result = await response.json();
+      const result = responseText ? JSON.parse(responseText) : {};
+
+      const { data: probeRows, error: probeError } = await supabase
+        .from('posts')
+        .select('id, user_id, created_at')
+        .order('created_at', { ascending: false })
+        .limit(1);
+      console.log('[REELS_DEBUG][ReelsPage] supabase reels probe', {
+        rows: probeRows ?? [],
+        error: probeError ?? null,
+      });
 
       const newVideo = {
         id: result.id,

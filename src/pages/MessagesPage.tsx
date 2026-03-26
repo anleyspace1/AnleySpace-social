@@ -38,7 +38,7 @@ import {
 import { MOCK_CHATS, MOCK_USER } from '../constants';
 import { Message } from '../types';
 import { cn } from '../lib/utils';
-import { API_ORIGIN } from '../lib/apiOrigin';
+import { apiUrl } from '../lib/apiOrigin';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import io from 'socket.io-client';
@@ -53,7 +53,7 @@ function isStoryMediaVideo(url: string, mediaType?: string | null) {
 /** Triggers SQLite + socket notification for the receiver (server verifies the Supabase row). */
 async function notifyInboxMessageRealtime(messageId: string, senderId: string, receiverId: string) {
   try {
-    const res = await fetch(`${API_ORIGIN}/api/notifications/dm`, {
+    const res = await fetch(apiUrl('/api/notifications/dm'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ messageId, senderId, receiverId }),
@@ -231,7 +231,7 @@ export default function MessagesPage() {
           injectedProfiles.set(targetProfile.id, targetProfile);
         }
         try {
-          await fetch('/api/users/sync', {
+          await fetch(apiUrl('/api/users/sync'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -266,7 +266,7 @@ export default function MessagesPage() {
         } else {
           // Safe fallback for newly created users not fully synced in profiles yet.
           try {
-            const res = await fetch(`/api/user/${encodeURIComponent(targetUserId.trim())}`);
+            const res = await fetch(apiUrl(`/api/user/${encodeURIComponent(targetUserId.trim())}`));
             if (res.ok) {
               const localUser = await res.json();
               const fallbackProfile = {
@@ -417,7 +417,7 @@ export default function MessagesPage() {
   const markConversationAsSeen = async () => {
     if (!selectedChat || !user) return;
     try {
-      const res = await fetch(`${API_ORIGIN}/api/messages/mark-seen`, {
+      const res = await fetch(apiUrl('/api/messages/mark-seen'), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -659,7 +659,7 @@ export default function MessagesPage() {
       });
       streamRef.current = stream;
 
-      const res = await fetch('/api/calls/start', {
+      const res = await fetch(apiUrl('/api/calls/start'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ hostId: user.id, type })
@@ -720,7 +720,7 @@ export default function MessagesPage() {
     }
 
     try {
-      const res = await fetch(`/api/calls/${activeCall?.id}/upgrade`, {
+      const res = await fetch(apiUrl(`/api/calls/${activeCall?.id}/upgrade`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ hostId: user.id, capacity, cost })
@@ -761,7 +761,7 @@ export default function MessagesPage() {
     if (!activeCall) return;
     
     try {
-      const res = await fetch(`/api/calls/${activeCall.id}/go-live`, {
+      const res = await fetch(apiUrl(`/api/calls/${activeCall.id}/go-live`), {
         method: 'POST'
       });
       const data = await res.json();
@@ -782,7 +782,7 @@ export default function MessagesPage() {
 
   const handleRespondJoin = async (requestId: string, userId: string, username: string, status: 'accepted' | 'declined') => {
     try {
-      const res = await fetch(`/api/calls/${activeCall?.id}/respond-join`, {
+      const res = await fetch(apiUrl(`/api/calls/${activeCall?.id}/respond-join`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ requestId, status })

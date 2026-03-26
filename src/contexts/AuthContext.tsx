@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import { User } from '@supabase/supabase-js';
 import { supabase, isSupabaseConfigured, invalidateSessionCache } from '../lib/supabase';
+import { apiUrl } from '../lib/apiOrigin';
 
 interface AuthContextType {
   user: User | null;
@@ -88,7 +89,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // Sync with local SQLite DB
       try {
         console.log(`AUTH: Syncing profile for ${profileRow.username} (${profileRow.id}) to local DB`);
-        const syncRes = await fetch('/api/users/sync', {
+        const syncRes = await fetch(apiUrl('/api/users/sync'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

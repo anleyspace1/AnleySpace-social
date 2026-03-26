@@ -22,6 +22,11 @@ const supabaseServiceUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 console.log("USING SERVICE ROLE:", !!supabaseServiceKey);
+if (!supabaseServiceKey) {
+  console.warn(
+    "SERVER: SUPABASE_SERVICE_ROLE_KEY is not set — POST /api/groups and membership sync will return 503 until configured."
+  );
+}
 
 let supabase: any = null;
 /** Service role client — bypasses RLS for server-side inserts (likes, comments, messages, etc.). */
@@ -30,11 +35,18 @@ if (supabaseUrl && supabaseAnonKey) {
   try {
     supabase = createClient(supabaseUrl, supabaseAnonKey);
     console.log("SERVER: Supabase client initialized");
+    try {
+      const host = new URL(supabaseUrl).host;
+      console.log("SERVER: [DEPLOY_DEBUG] Supabase URL host in use:", host);
+    } catch {
+      console.log("SERVER: [DEPLOY_DEBUG] Supabase URL present but not parseable as URL");
+    }
   } catch (err) {
     console.error("SERVER: Failed to initialize Supabase client:", err);
   }
 } else {
   console.warn("SERVER: Supabase environment variables missing. Some features may not work.");
+  console.warn("SERVER: [DEPLOY_DEBUG] Missing SUPABASE_URL/VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY");
 }
 if (supabaseServiceUrl && supabaseServiceKey) {
   try {
@@ -49,6 +61,218 @@ if (supabaseServiceUrl && supabaseServiceKey) {
   console.warn(
     "SERVER: SUPABASE_SERVICE_ROLE_KEY or Supabase URL missing — feed likes/comments inserts will fail until configured."
   );
+}
+
+/**
+ * Reads (GET /api/groups, joined list): prefer service role, else anon — avoids empty lists when only one key is set.
+ * Writes (POST create/join): MUST use {@link groupPersistenceClient} only — never anon (RLS / no JWT).
+ */
+function supabaseForGroupSync(): any {
+  return supabaseAdmin || supabase;
+}
+
+/** Service role only — required for `groups` / `group_members` writes so RLS is bypassed and user_id is never lost. */
+function groupPersistenceClient(): any {
+  return supabaseAdmin;
+}
+
+type GroupSyncResult = { ok: true } | { ok: false; error: string; code?: string };
+
+async function syncGroupRowToSupabase(args: {
+  id: string;
+  name: string;
+  description: string;
+  privacy: string;
+  creator_id: string;
+}): Promise<GroupSyncResult> {
+  const client = groupPersistenceClient();
+  if (!client) {
+    console.error("[syncGroupRowToSupabase] SUPABASE_SERVICE_ROLE_KEY missing — cannot upsert public.groups");
+    return { ok: false, error: "SUPABASE_SERVICE_ROLE_KEY not configured on server" };
+  }
+  const makeAttempts = (creatorKey: "created_by" | "creator_id") => {
+    const creator = { [creatorKey]: args.creator_id };
+    return [
+      {
+        label: `${creatorKey} + name + description + privacy`,
+        payload: {
+          id: args.id,
+          name: args.name,
+          description: args.description ?? "",
+          privacy: args.privacy,
+          ...creator,
+        },
+      },
+      {
+        label: `${creatorKey} + name + description`,
+        payload: {
+          id: args.id,
+          name: args.name,
+          description: args.description ?? "",
+          ...creator,
+        },
+      },
+      {
+        label: `${creatorKey} + name + privacy`,
+        payload: {
+          id: args.id,
+          name: args.name,
+          privacy: args.privacy,
+          ...creator,
+        },
+      },
+      { label: `${creatorKey} + name`, payload: { id: args.id, name: args.name, ...creator } },
+    ] as Array<{ label: string; payload: Record<string, unknown> }>;
+  };
+  // Try created_by first (requested/most common), then creator_id.
+  const attempts: Array<{ label: string; payload: Record<string, unknown> }> = [
+    ...makeAttempts("created_by"),
+    ...makeAttempts("creator_id"),
+  ];
+  const attemptErrors: Array<{ label: string; code?: string; message: string }> = [];
+
+  for (const attempt of attempts) {
+    const { data, error } = await client
+      .from("groups")
+      .insert([attempt.payload])
+      .select("id, name")
+      .single();
+
+    if (!error) {
+      console.log("[syncGroupRowToSupabase] insert OK", {
+        id: args.id,
+        creatorFieldUsed: attempt.label,
+        returned: data,
+      });
+      return { ok: true };
+    }
+
+    console.error("[syncGroupRowToSupabase] upsert FAILED", {
+      creatorFieldAttempted: attempt.label,
+      payloadKeys: Object.keys(attempt.payload),
+      code: error.code,
+      message: error.message,
+      details: (error as any).details,
+      hint: (error as any).hint,
+      creator_id: args.creator_id,
+    });
+    attemptErrors.push({ label: attempt.label, code: error.code, message: error.message });
+
+    if (error.code === "42P01") {
+      return { ok: false, error: error.message, code: error.code };
+    }
+  }
+
+  const merged = attemptErrors
+    .map((e) => `${e.label}: [${e.code || "no_code"}] ${e.message}`)
+    .join(" | ");
+  return { ok: false, error: merged || "Failed to upsert group row", code: attemptErrors[0]?.code };
+}
+
+async function syncGroupMembershipToSupabase(args: {
+  group_id: string;
+  user_id: string;
+  role: string;
+  context: string;
+}): Promise<GroupSyncResult & { row?: { group_id: string; user_id: string; role: string } }> {
+  const client = groupPersistenceClient();
+  if (!client) {
+    console.error(`[syncGroupMembershipToSupabase] ${args.context}: SUPABASE_SERVICE_ROLE_KEY missing`);
+    return { ok: false, error: "SUPABASE_SERVICE_ROLE_KEY not configured on server" };
+  }
+  const uid = typeof args.user_id === "string" ? args.user_id.trim() : "";
+  if (!uid) {
+    console.error(`[syncGroupMembershipToSupabase] ${args.context}: refused — user_id empty (would be NULL in DB)`);
+    return { ok: false, error: "user_id is required and must be non-empty" };
+  }
+
+  const { error: perr } = await client.from("profiles").upsert({ id: uid }, { onConflict: "id" });
+  if (perr && perr.code !== "42P01") {
+    console.warn(`[syncGroupMembershipToSupabase] ${args.context} profiles upsert:`, perr.code, perr.message);
+  }
+
+  const { data: upsertRows, error: upErr } = await client
+    .from("group_members")
+    .upsert(
+      {
+        group_id: args.group_id,
+        user_id: uid,
+        role: args.role,
+      },
+      { onConflict: "group_id,user_id" }
+    )
+    .select("group_id, user_id, role");
+
+  if (upErr) {
+    console.error(`[syncGroupMembershipToSupabase] ${args.context} group_members upsert FAILED`, {
+      code: upErr.code,
+      message: upErr.message,
+      details: (upErr as any).details,
+      hint: (upErr as any).hint,
+      group_id: args.group_id,
+      user_id: uid,
+      role: args.role,
+    });
+    return { ok: false, error: upErr.message, code: upErr.code };
+  }
+  console.log(`[syncGroupMembershipToSupabase] ${args.context} membership upsert result`, {
+    rows: upsertRows,
+  });
+
+  const { data: verify, error: vErr } = await client
+    .from("group_members")
+    .select("group_id, user_id, role")
+    .eq("group_id", args.group_id)
+    .eq("user_id", uid)
+    .maybeSingle();
+
+  if (vErr) {
+    console.error(`[syncGroupMembershipToSupabase] ${args.context} post-upsert verify query FAILED`, vErr);
+    return { ok: false, error: vErr.message, code: vErr.code };
+  }
+  if (!verify || !verify.user_id) {
+    // Service-role inserts have no JWT; DB triggers that set user_id = auth.uid() can leave NULL — repair explicitly.
+    console.warn(`[syncGroupMembershipToSupabase] ${args.context} verify: missing user_id; attempting repair`, {
+      verify,
+    });
+    const { error: fixErr } = await client
+      .from("group_members")
+      .update({ user_id: uid })
+      .eq("group_id", args.group_id)
+      .is("user_id", null);
+    if (fixErr) {
+      console.error(`[syncGroupMembershipToSupabase] ${args.context} repair user_id FAILED`, fixErr);
+      return { ok: false, error: "group_members row missing or user_id null after upsert" };
+    }
+    const { data: verify2, error: v2Err } = await client
+      .from("group_members")
+      .select("group_id, user_id, role")
+      .eq("group_id", args.group_id)
+      .eq("user_id", uid)
+      .maybeSingle();
+    if (v2Err || !verify2?.user_id) {
+      console.error(`[syncGroupMembershipToSupabase] ${args.context} verify after repair failed`, v2Err, verify2);
+      return { ok: false, error: "group_members row missing or user_id null after upsert" };
+    }
+    console.log(`[syncGroupMembershipToSupabase] ${args.context} final group_members row (after repair)`, verify2);
+    return { ok: true, row: verify2 as { group_id: string; user_id: string; role: string } };
+  }
+  console.log(`[syncGroupMembershipToSupabase] ${args.context} final group_members row`, verify);
+  return { ok: true, row: verify as { group_id: string; user_id: string; role: string } };
+}
+
+/** Authenticated Supabase user id from `Authorization: Bearer <access_token>`. */
+async function getAuthUserIdFromJwtHeader(req: Request): Promise<string | null> {
+  const authHeader = req.headers.authorization;
+  const token =
+    typeof authHeader === "string" && authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7).trim()
+      : null;
+  if (!supabase || !token) return null;
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user?.id) return null;
+  const id = String(data.user.id).trim();
+  return id || null;
 }
 
 /** Public URL for story preview in messages (never rely on relative paths in Supabase). */
@@ -277,21 +501,8 @@ async function startServer() {
   });
 
   const PORT = 3000;
-  const storiesUploadDir = path.join(process.cwd(), 'uploads', 'stories');
-  if (!fs.existsSync(storiesUploadDir)) {
-    fs.mkdirSync(storiesUploadDir, { recursive: true });
-  }
-  const storyUploadStorage = multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, storiesUploadDir),
-    filename: (_req, file, cb) => {
-      const ext =
-        path.extname(file.originalname) ||
-        (String(file.mimetype || '').startsWith('video/') ? '.mp4' : '.jpg');
-      cb(null, `${uuidv4()}${ext}`);
-    },
-  });
   const uploadStoryFile = multer({
-    storage: storyUploadStorage,
+    storage: multer.memoryStorage(),
     limits: { fileSize: 80 * 1024 * 1024 },
   });
 
@@ -567,6 +778,22 @@ async function startServer() {
   console.log(`SERVER: NODE_ENV is ${process.env.NODE_ENV}`);
   logToFile(`SERVER: NODE_ENV is ${process.env.NODE_ENV}`);
 
+  /**
+   * Server-only story timestamps for POST /api/stories.
+   * Never use client or request body for created_at / expires_at.
+   * expires_at is always exactly 24 hours after created_at (server clock).
+   */
+  function storyServerTimestamps(): { createdAtIso: string; expiresAtIso: string } {
+    const createdAt = new Date();
+    const expiresAt = new Date(createdAt.getTime() + 24 * 60 * 60 * 1000);
+    const createdAtIso = createdAt.toISOString();
+    const expiresAtIso = expiresAt.toISOString();
+    if (expiresAt.getTime() <= createdAt.getTime()) {
+      throw new Error('storyServerTimestamps: expires_at must be after created_at');
+    }
+    return { createdAtIso, expiresAtIso };
+  }
+
   // POST /api/stories (multipart) MUST be registered BEFORE express.json / urlencoded
   // so multer receives the raw multipart stream.
   app.post('/api/stories', (req, res, next) => {
@@ -579,9 +806,6 @@ async function startServer() {
       console.log('[trace:story-upload] L1 → next() (not multipart, JSON handler will run after body parsers)');
       return next();
     }
-    if (!fs.existsSync(storiesUploadDir)) {
-      fs.mkdirSync(storiesUploadDir, { recursive: true });
-    }
     console.log('[trace:story-upload] L1 running multer single(file)');
     uploadStoryFile.single('file')(req, res, async (err) => {
       if (err) {
@@ -592,51 +816,133 @@ async function startServer() {
       console.log('FINAL CHECK:');
       console.log('REQ.FILE:', req.file);
       console.log('REQ.BODY:', req.body);
-      const userId = req.body?.userId as string | undefined;
+      const user_id =
+        (typeof req.body?.user_id === 'string' && req.body.user_id.trim()) ||
+        (typeof req.body?.userId === 'string' && req.body.userId.trim()) ||
+        '';
       const username = (req.body?.username as string) || '';
       const avatar = (req.body?.avatar as string) || '';
-      if (!req.file || !userId || !username) {
+      if (!req.file || !user_id || !username) {
         console.log('[trace:story-upload] L1 validation fail → 400 Missing required fields', {
           hasFile: !!req.file,
-          hasUserId: !!userId,
+          hasUserId: !!user_id,
           hasUsername: !!username,
         });
         return res.status(400).json({ ok: false, error: 'Missing required fields' });
       }
-      console.log('[trace:story-upload] L1 validation OK → DB insert');
+      console.log('[trace:story-upload] L1 validation OK → Supabase Storage + DB insert');
       try {
-        ensureLocalUserForStory(userId, username, avatar);
-        const mediaType = String(req.file.mimetype || '').startsWith('video') ? 'video' : 'image';
-        const mediaUrl = `/uploads/stories/${req.file.filename}`;
+        if (!supabaseAdmin) {
+          return res.status(503).json({
+            ok: false,
+            error: 'Supabase service role required for story uploads (SUPABASE_SERVICE_ROLE_KEY)',
+          });
+        }
+        const buf = req.file.buffer;
+        if (!buf || !Buffer.isBuffer(buf)) {
+          return res.status(400).json({ ok: false, error: 'Missing file buffer' });
+        }
+        const safeOrig = path.basename(req.file.originalname || 'file');
+        const filePath = `stories/${Date.now()}-${safeOrig}`;
+        const { error: uploadError } = await supabaseAdmin.storage
+          .from('stories')
+          .upload(filePath, buf, {
+            contentType: req.file.mimetype || 'application/octet-stream',
+          });
+        if (uploadError) {
+          console.error('[trace:story-upload] Supabase storage upload error:', uploadError);
+          logToFile(`SERVER: Supabase storage upload error: ${uploadError.message}`);
+          return res.status(500).json({ ok: false, error: 'Failed to upload media' });
+        }
+        const { data: publicUrlData } = supabaseAdmin.storage.from('stories').getPublicUrl(filePath);
+        const mediaUrlRaw = publicUrlData?.publicUrl;
+        if (!mediaUrlRaw || typeof mediaUrlRaw !== 'string') {
+          console.error('[trace:story-upload] getPublicUrl missing publicUrl');
+          return res.status(500).json({ ok: false, error: 'Failed to resolve media URL' });
+        }
+        const mediaUrl = mediaUrlRaw.trim();
+        if (!mediaUrl) {
+          return res.status(500).json({ ok: false, error: 'Missing media URL' });
+        }
+        console.log('[trace:story-upload] STORY_MEDIA_URL:', mediaUrl);
+        const looksLikeSupabaseStorage =
+          /^https:\/\/.+\.supabase\.co\/storage\//i.test(mediaUrl) ||
+          (mediaUrl.startsWith('https://') && mediaUrl.includes('/storage/v1/object/public/'));
+        if (!looksLikeSupabaseStorage) {
+          console.warn(
+            '[trace:story-upload] STORY_MEDIA_URL does not match expected Supabase Storage public URL (https://*.supabase.co/storage/...)'
+          );
+        }
+
+        const mime = req.file.mimetype || '';
+        const mediaType: 'image' | 'video' = mime.startsWith('video') ? 'video' : 'image';
+
+        console.log('FINAL STORY DATA:', { media_url: mediaUrl, media_type: mediaType });
+
+        ensureLocalUserForStory(user_id, username, avatar);
         const id = uuidv4();
-        const createdAt = new Date().toISOString();
-        const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+        const { createdAtIso, expiresAtIso } = storyServerTimestamps();
+        console.log('STORY TIME CHECK:', {
+          created_at: createdAtIso,
+          expires_at: expiresAtIso,
+          now: new Date().toISOString(),
+        });
         db.prepare(`
           INSERT INTO stories (id, user_id, username, avatar, image_url, media_url, media_type, created_at, expires_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(id, userId, username, avatar, mediaUrl, mediaUrl, mediaType, createdAt, expiresAt);
-        try {
-          await supabase.from('stories').upsert({
+        `).run(id, user_id, username, avatar, mediaUrl, mediaUrl, mediaType, createdAtIso, expiresAtIso);
+        const { data: insertedRow, error: storyUpsertError } = await supabaseAdmin
+          .from('stories')
+          .upsert({
             id,
-            user_id: userId,
+            user_id,
             username,
             avatar,
             image_url: mediaUrl,
             media_url: mediaUrl,
             media_type: mediaType,
-            created_at: createdAt,
-            expires_at: expiresAt,
-          });
-        } catch (e) {
-          logToFile(`SERVER: Supabase story sync error: ${e}`);
+            created_at: createdAtIso,
+            expires_at: expiresAtIso,
+          })
+          .select();
+        if (storyUpsertError) {
+          console.error('SUPABASE UPSERT FAILED:', storyUpsertError);
+          logToFile(`SERVER: SUPABASE UPSERT FAILED: ${storyUpsertError.message}`);
+          try {
+            db.prepare('DELETE FROM stories WHERE id = ?').run(id);
+          } catch {
+            /* ignore rollback failure */
+          }
+          return res.status(500).json({ ok: false, error: 'Failed to save story to Supabase' });
         }
+        console.log('[trace:story-upload] L1 supabase upsert result (data + error):', {
+          user_id,
+          created_at: createdAtIso,
+          expires_at: expiresAtIso,
+          data: insertedRow,
+          error: storyUpsertError,
+        });
+
+        const { data: verifyRowData, error: verifyRowError } = await supabaseAdmin
+          .from('stories')
+          .select('*')
+          .eq('id', id);
+        if (verifyRowError) {
+          console.error('SUPABASE VERIFY SELECT ERROR:', verifyRowError);
+        }
+        const verifyRow = Array.isArray(verifyRowData) ? verifyRowData[0] : null;
+        console.log('[trace:story-upload] L1 supabase verify result (data + error):', {
+          user_id,
+          data: verifyRow,
+          error: verifyRowError,
+        });
         return res.json({
           ok: true,
           id,
-          user_id: userId,
+          user_id,
           media_url: mediaUrl,
           media_type: mediaType,
-          created_at: createdAt,
+          created_at: createdAtIso,
         });
       } catch (e) {
         console.error('UPLOAD ERROR:', e);
@@ -657,37 +963,108 @@ async function startServer() {
       bodyKeys: req.body && typeof req.body === 'object' ? Object.keys(req.body) : [],
     });
     try {
-      const { userId: jsonUserId, username: jsonUsername, avatar: jsonAvatar, imageUrl } = req.body;
-      if (!jsonUserId || !imageUrl) {
-        console.log('[trace:story-upload] L2 validation fail → 400 (need userId + imageUrl)', {
+      const {
+        username: jsonUsername,
+        avatar: jsonAvatar,
+        imageUrl,
+        media_type: bodyMediaType,
+        mediaType: bodyMediaTypeCamel,
+      } = req.body;
+      const jsonUserId =
+        (typeof req.body?.user_id === 'string' && req.body.user_id.trim()) ||
+        (typeof req.body?.userId === 'string' && req.body.userId.trim()) ||
+        '';
+      if (!jsonUserId || imageUrl == null || imageUrl === '') {
+        console.log('[trace:story-upload] L2 validation fail → 400 (need user_id/userId + imageUrl)', {
           hasJsonUserId: !!jsonUserId,
           hasImageUrl: !!imageUrl,
         });
         return res.status(400).json({ ok: false, error: 'Missing required fields' });
       }
+      const mediaUrl = String(imageUrl).trim();
+      if (!mediaUrl) {
+        return res.status(500).json({ ok: false, error: 'Missing media URL' });
+      }
+      const fromBodyType = bodyMediaType ?? bodyMediaTypeCamel;
+      let mediaType: string;
+      if (fromBodyType === 'video' || fromBodyType === 'image') {
+        mediaType = fromBodyType;
+      } else if (/\.(mp4|webm|ogg|mov)(\?|$)/i.test(mediaUrl)) {
+        mediaType = 'video';
+      } else {
+        mediaType = 'image';
+      }
+      if (!mediaType || (mediaType !== 'image' && mediaType !== 'video')) {
+        return res.status(500).json({ ok: false, error: 'Missing media type' });
+      }
+
+      console.log('FINAL STORY DATA:', { media_url: mediaUrl, media_type: mediaType });
+
       console.log('[trace:story-upload] L2 validation OK → DB insert (JSON story)');
+      if (!supabaseAdmin) {
+        return res.status(503).json({
+          ok: false,
+          error: 'Supabase service role required for story uploads (SUPABASE_SERVICE_ROLE_KEY)',
+        });
+      }
       ensureLocalUserForStory(jsonUserId, jsonUsername, jsonAvatar);
-      logToFile(`SERVER: Creating story for ${jsonUsername}, image length: ${String(imageUrl).length}`);
+      logToFile(`SERVER: Creating story for ${jsonUsername}, image length: ${String(mediaUrl).length}`);
       const id = uuidv4();
-      const createdAt = new Date().toISOString();
-      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      const { createdAtIso, expiresAtIso } = storyServerTimestamps();
+      console.log('STORY TIME CHECK:', {
+        created_at: createdAtIso,
+        expires_at: expiresAtIso,
+        now: new Date().toISOString(),
+      });
       db.prepare(`
         INSERT INTO stories (id, user_id, username, avatar, image_url, media_url, media_type, created_at, expires_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(id, jsonUserId, jsonUsername, jsonAvatar, imageUrl, null, 'image', createdAt, expiresAt);
-      try {
-        await supabase.from('stories').upsert({
+      `).run(id, jsonUserId, jsonUsername, jsonAvatar, mediaUrl, mediaUrl, mediaType, createdAtIso, expiresAtIso);
+      const { data: jsonInsertedRow, error: jsonStoryUpsertError } = await supabaseAdmin
+        .from('stories')
+        .upsert({
           id,
           user_id: jsonUserId,
           username: jsonUsername,
           avatar: jsonAvatar,
-          image_url: imageUrl,
-          created_at: createdAt,
-          expires_at: expiresAt,
-        });
-      } catch (e) {
-        logToFile(`SERVER: Supabase story sync error: ${e}`);
+          image_url: mediaUrl,
+          media_url: mediaUrl,
+          media_type: mediaType,
+          created_at: createdAtIso,
+          expires_at: expiresAtIso,
+        })
+        .select();
+      if (jsonStoryUpsertError) {
+        console.error('SUPABASE UPSERT FAILED:', jsonStoryUpsertError);
+        logToFile(`SERVER: SUPABASE UPSERT FAILED: ${jsonStoryUpsertError.message}`);
+        try {
+          db.prepare('DELETE FROM stories WHERE id = ?').run(id);
+        } catch {
+          /* ignore rollback failure */
+        }
+        return res.status(500).json({ ok: false, error: 'Failed to save story to Supabase' });
       }
+      console.log('[trace:story-upload] L2 supabase upsert result (data + error):', {
+        user_id: jsonUserId,
+        created_at: createdAtIso,
+        expires_at: expiresAtIso,
+        data: jsonInsertedRow,
+        error: jsonStoryUpsertError,
+      });
+
+      const { data: jsonVerifyRowData, error: jsonVerifyRowError } = await supabaseAdmin
+        .from('stories')
+        .select('*')
+        .eq('id', id);
+      if (jsonVerifyRowError) {
+        console.error('SUPABASE VERIFY SELECT ERROR:', jsonVerifyRowError);
+      }
+      const jsonVerifyRow = Array.isArray(jsonVerifyRowData) ? jsonVerifyRowData[0] : null;
+      console.log('[trace:story-upload] L2 supabase verify result (data + error):', {
+        user_id: jsonUserId,
+        data: jsonVerifyRow,
+        error: jsonVerifyRowError,
+      });
       res.json({ ok: true, id });
     } catch (e) {
       console.error('UPLOAD ERROR:', e);
@@ -1921,7 +2298,9 @@ async function startServer() {
 
   app.get("/api/groups", async (req, res) => {
     try {
-      const { data, error } = await supabase.from('groups').select('*');
+      const client = supabaseForGroupSync();
+      if (!client) throw new Error("no supabase");
+      const { data, error } = await client.from("groups").select("*");
       if (error) throw error;
       res.json(data || []);
     } catch (err) {
@@ -1932,23 +2311,35 @@ async function startServer() {
   });
 
   app.get("/api/groups/joined/:userId", async (req, res) => {
-    try {
-      const { data, error } = await supabase
-        .from('groups')
-        .select('*, group_members!inner(user_id)')
-        .eq('group_members.user_id', req.params.userId);
-      
-      if (error) throw error;
-      res.json(data || []);
-    } catch (err) {
-      logToFile(`SERVER: Supabase joined groups fetch error: ${err}`);
-      const groups = db.prepare(`
+    const userId = req.params.userId;
+    const localJoined = () =>
+      db
+        .prepare(
+          `
         SELECT g.* FROM groups g
         JOIN group_members gm ON g.id = gm.group_id
         WHERE gm.user_id = ?
-      `).all(req.params.userId);
-      res.json(groups);
+      `
+        )
+        .all(userId);
+
+    try {
+      const client = supabaseForGroupSync();
+      if (client) {
+        const { data, error } = await client
+          .from("groups")
+          .select("*, group_members!inner(user_id)")
+          .eq("group_members.user_id", userId);
+
+        if (error) throw error;
+        if (Array.isArray(data) && data.length > 0) {
+          return res.json(data);
+        }
+      }
+    } catch (err) {
+      logToFile(`SERVER: Supabase joined groups fetch error: ${err}`);
     }
+    res.json(localJoined());
   });
 
   app.get("/api/groups/:id", (req, res) => {
@@ -1986,113 +2377,248 @@ async function startServer() {
   });
 
   app.post("/api/groups", async (req, res) => {
-    const { name, description, image, type, creatorId } = req.body;
-    const id = uuidv4();
-    
-    try {
-      db.prepare('INSERT INTO groups (id, name, description, image, type, creator_id) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(id, name, description, image || `https://picsum.photos/seed/${id}/400/200`, type || 'Public', creatorId);
-      
-      db.prepare('INSERT INTO group_members (group_id, user_id, role) VALUES (?, ?, ?)')
-        .run(id, creatorId, 'admin');
-
-      // Sync to Supabase
-      // First try to sync the group itself (ignore error if table doesn't exist)
-      try {
-        await supabase.from('groups').upsert({
-          id,
-          name,
-          description,
-          image: image || `https://picsum.photos/seed/${id}/400/200`,
-          type: type || 'Public',
-          creator_id: creatorId
-        });
-      } catch (e) {
-        // Table might not exist, that's fine
-      }
-
-      const { error } = await supabase.from('group_members').upsert({
-        group_id: id,
-        user_id: creatorId,
-        role: 'admin'
+    if (!supabaseAdmin) {
+      console.error(
+        "[POST /api/groups] refused: SUPABASE_SERVICE_ROLE_KEY not set (USING SERVICE ROLE must be true for persistence)"
+      );
+      return res.status(503).json({
+        error:
+          "SUPABASE_SERVICE_ROLE_KEY must be set on the server (same env as SUPABASE_URL). Restart after setting.",
       });
-      
-      if (error) {
-        if (error.code === '42P01') {
-          console.warn('Supabase table "group_members" does not exist. Skipping sync.');
-        } else {
-          console.error('Supabase group_members sync error (create):', error.code, error.message);
-        }
+    }
+
+    try {
+      const { name, description, image, type } = req.body;
+
+      const authHeader = req.headers.authorization;
+      const token =
+        typeof authHeader === "string" && authHeader.startsWith("Bearer ")
+          ? authHeader.slice(7).trim()
+          : null;
+      const authUserResp = supabase && token ? await supabase.auth.getUser(token) : null;
+      const authUser = authUserResp?.data?.user || null;
+      console.log("CREATE GROUP USER:", authUser ? { id: authUser.id, email: authUser.email ?? null } : null);
+      const userId = authUser?.id ? String(authUser.id).trim() : null;
+      if (!userId) {
+        throw new Error("Missing authenticated userId - do not proceed");
       }
-        
-      res.json({ id, name, description });
-    } catch (err) {
-      console.error('Error creating group:', err);
-      res.status(500).json({ error: 'Failed to create group' });
+
+      console.log("Creating group with userId:", userId);
+
+      if (typeof name !== "string" || !name.trim()) {
+        return res.status(400).json({ error: "name is required" });
+      }
+      const id = uuidv4();
+      const imageUrl = image || `https://picsum.photos/seed/${id}/400/200`;
+      const groupType = type || "Public";
+      const privacy = String(groupType || "Public").toLowerCase();
+
+      const rollbackLocal = () => {
+        try {
+          db.prepare("DELETE FROM group_members WHERE group_id = ?").run(id);
+          db.prepare("DELETE FROM groups WHERE id = ?").run(id);
+        } catch (e) {
+          console.error("[POST /api/groups] rollback local DB failed:", e);
+        }
+      };
+
+      db.prepare(
+        "INSERT INTO groups (id, name, description, image, type, creator_id) VALUES (?, ?, ?, ?, ?, ?)"
+      ).run(id, name.trim(), description ?? "", imageUrl, groupType, userId);
+
+      if (!userId) {
+        rollbackLocal();
+        return res.status(401).json({ error: "User not authenticated" });
+      }
+      db.prepare("INSERT INTO group_members (group_id, user_id, role) VALUES (?, ?, ?)").run(id, userId, "admin");
+
+      console.log("[POST /api/groups] local SQLite OK, syncing to Supabase (service role)", {
+        group_id: id,
+        creator_id: userId,
+        role: "admin",
+      });
+
+      const groupRes = await syncGroupRowToSupabase({
+        id,
+        name: name.trim(),
+        description: description ?? "",
+        privacy,
+        creator_id: userId,
+      });
+      if (!groupRes.ok) {
+        rollbackLocal();
+        return res.status(503).json({
+          error: "Failed to persist group row to Supabase",
+          details: "error" in groupRes ? groupRes.error : "Unknown group sync failure",
+        });
+      }
+
+      // Insert admin membership with user JWT client so RLS enforces auth.uid() = user_id.
+      if (!supabaseUrl || !supabaseAnonKey || !token) {
+        rollbackLocal();
+        return res.status(401).json({ error: "User not authenticated" });
+      }
+      const supabaseMembershipClient = createClient(supabaseUrl, supabaseAnonKey, {
+        global: {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        },
+      });
+      const membershipPayload = {
+        group_id: id,
+        user_id: userId,
+        role: "admin",
+      };
+      console.log("MEMBERSHIP USER:", authUser);
+      console.log("MEMBERSHIP PAYLOAD:", membershipPayload);
+      const { error: membershipInsertError } = await supabaseMembershipClient
+        .from("group_members")
+        .insert(membershipPayload);
+      if (membershipInsertError && membershipInsertError.code !== "23505") {
+        rollbackLocal();
+        try {
+          await supabaseAdmin.from("groups").delete().eq("id", id);
+        } catch (e) {
+          console.error("[POST /api/groups] cleanup Supabase groups row failed:", e);
+        }
+        return res.status(503).json({
+          error: "Failed to persist group_members to Supabase",
+          details: membershipInsertError.message,
+        });
+      }
+
+      console.log("[POST /api/groups] create group response (success)", {
+        id,
+        name: name.trim(),
+        description: description ?? "",
+        membership: membershipPayload,
+      });
+      res.json({ id, name: name.trim(), description: description ?? "" });
+    } catch (err: unknown) {
+      console.log("CREATE GROUP ERROR:", err);
+      console.error("Error creating group:", err);
+      const message = err instanceof Error ? err.message : "";
+      if (message === "Missing authenticated userId - do not proceed") {
+        return res.status(401).json({ error: message });
+      }
+      res.status(500).json({ error: "Failed to create group" });
     }
   });
 
   app.post("/api/groups/:id/join", async (req, res) => {
-    const { userId } = req.body;
-    const groupId = req.params.id;
-    
-    try {
-      db.prepare('INSERT OR IGNORE INTO group_members (group_id, user_id, role) VALUES (?, ?, ?)')
-        .run(groupId, userId, 'member');
-      
-      // Sync to Supabase
-      const { error } = await supabase.from('group_members').upsert({
-        group_id: groupId,
-        user_id: userId,
-        role: 'member'
-      });
+    const groupId = typeof req.params.id === "string" ? req.params.id.trim() : "";
+    if (!groupId) return res.status(400).json({ error: "group_id is required" });
 
-      if (error) {
-        if (error.code === '42P01') {
-          console.warn('Supabase table "group_members" does not exist. Skipping sync.');
-        } else {
-          console.error('Supabase group_members sync error (join):', error.code, error.message);
-        }
-      }
-
-      res.json({ success: true });
-    } catch (err) {
-      console.error('Error joining group:', err);
-      res.status(400).json({ error: 'Already a member or group not found' });
+    if (!supabaseUrl || !supabaseAnonKey) {
+      return res.status(503).json({ error: "Supabase is not configured on server" });
     }
+
+    const authHeader = typeof req.headers.authorization === "string" ? req.headers.authorization : "";
+    const supabaseJoinClient = createClient(supabaseUrl, supabaseAnonKey, {
+      global: {
+        headers: {
+          Authorization: authHeader,
+        },
+      },
+    });
+
+    const { data: { user }, error: userError } = await supabaseJoinClient.auth.getUser();
+    if (userError) {
+      console.error("JOIN USER ERROR:", userError);
+    }
+    console.log("JOIN USER:", user);
+    if (!user?.id) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const payload = {
+      group_id: groupId,
+      user_id: user.id,
+      role: "member",
+    };
+    console.log("MEMBERSHIP USER:", user);
+    console.log("MEMBERSHIP PAYLOAD:", payload);
+    console.log("JOIN PAYLOAD:", { group_id: groupId, user_id: user?.id });
+
+    const { data: existingMembership, error: existingError } = await supabaseJoinClient
+      .from("group_members")
+      .select("group_id")
+      .eq("group_id", groupId)
+      .eq("user_id", user.id)
+      .maybeSingle();
+    if (existingError) console.log("INSERT ERROR:", existingError);
+    if (existingMembership) {
+      console.log("ALREADY MEMBER");
+      return res.status(200).json({ message: "Already joined" });
+    }
+
+    const { error } = await supabaseJoinClient.from("group_members").insert(payload);
+    console.log("INSERT RESULT:", error);
+
+    if (error) {
+      console.log("INSERT ERROR:", error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    // Keep local cache aligned after successful cloud insert.
+    try {
+      db.prepare("INSERT OR IGNORE INTO group_members (group_id, user_id, role) VALUES (?, ?, ?)").run(
+        groupId,
+        user.id,
+        "member"
+      );
+    } catch (e) {
+      console.warn("[POST /api/groups/:id/join] local cache sync failed:", e);
+    }
+
+    return res.status(200).json({ success: true });
   });
 
   app.post("/api/groups/:id/leave", async (req, res) => {
-    const { userId } = req.body;
     const groupId = req.params.id;
-    
+    const userId = await getAuthUserIdFromJwtHeader(req);
+    if (!userId) {
+      return res.status(401).json({ error: "Missing authenticated userId - do not proceed" });
+    }
+
     try {
-      db.prepare('DELETE FROM group_members WHERE group_id = ? AND user_id = ?')
-        .run(groupId, userId);
-      
-      // Also sync to Supabase
-      const { error } = await supabase.from('group_members')
-        .delete()
-        .eq('group_id', groupId)
-        .eq('user_id', userId);
-        
-      if (error) {
-        if (error.code === '42P01') {
-          console.warn('Supabase table "group_members" does not exist. Skipping sync.');
+      db.prepare("DELETE FROM group_members WHERE group_id = ? AND user_id = ?").run(groupId, userId);
+
+      const client = groupPersistenceClient();
+      if (client) {
+        const { error } = await client
+          .from("group_members")
+          .delete()
+          .eq("group_id", groupId)
+          .eq("user_id", userId);
+
+        if (error) {
+          if (error.code === "42P01") {
+            console.warn('Supabase table "group_members" does not exist. Skipping sync.');
+          } else {
+            console.error("Supabase group_members delete (leave) FAILED:", error.code, error.message);
+          }
         } else {
-          console.error('Supabase group_members sync error (leave):', error.code, error.message);
+          console.log("[POST /api/groups/leave] Supabase group_members delete OK", { groupId, userId });
         }
+      } else {
+        console.warn("[POST /api/groups/leave] SUPABASE_SERVICE_ROLE_KEY missing — cloud membership may be stale");
       }
 
       res.json({ success: true });
     } catch (err) {
-      res.status(400).json({ error: 'Failed to leave group' });
+      res.status(400).json({ error: "Failed to leave group" });
     }
   });
 
   app.post("/api/groups/:id/invite", async (req, res) => {
     const { username, userId, avatar } = req.body;
     const groupId = req.params.id;
+    const inviterId = await getAuthUserIdFromJwtHeader(req);
+    if (!inviterId) {
+      return res.status(401).json({ error: "Missing authenticated userId - do not proceed" });
+    }
     
     const normalizedUsername = typeof username === 'string' ? username.trim().replace(/^@/, '') : '';
 
@@ -2142,38 +2668,48 @@ async function startServer() {
     }
     
     if (!user) return res.status(404).json({ error: 'User not found. Please check the username.' });
-    
+
+    if (!supabaseAdmin) {
+      console.error("[POST /api/groups/invite] refused: SUPABASE_SERVICE_ROLE_KEY not set");
+      return res.status(503).json({
+        error:
+          "SUPABASE_SERVICE_ROLE_KEY must be set on the server (same env as SUPABASE_URL). Restart after setting.",
+      });
+    }
+
     try {
       db.prepare('INSERT OR IGNORE INTO group_members (group_id, user_id, role) VALUES (?, ?, ?)')
         .run(groupId, user.id, 'member');
-      
-      // Also sync to Supabase
-      // Ensure user has a profile in Supabase first to avoid FK errors
-      try {
-        await supabase.from('profiles').upsert({
-          id: user.id,
-          username: normalizedUsername,
-          avatar_url: avatar,
-          display_name: normalizedUsername
-        });
-      } catch (e) {
-        // Table might not exist or other error
-      }
 
-      const { error } = await supabase.from('group_members').upsert({
-        group_id: groupId,
-        user_id: user.id,
-        role: 'member'
-      });
-      
-      if (error) {
-        if (error.code === '42P01') {
-          console.warn('Supabase table "group_members" does not exist. Skipping sync.');
-        } else {
-          console.error('Supabase group_members sync error (invite):', error.code, error.message);
+      const syncClient = groupPersistenceClient();
+      if (syncClient) {
+        try {
+          await syncClient.from("profiles").upsert({
+            id: user.id,
+            username: normalizedUsername,
+            avatar_url: avatar,
+            display_name: normalizedUsername,
+          });
+        } catch {
+          /* non-fatal */
         }
       }
 
+      const memberRes = await syncGroupMembershipToSupabase({
+        group_id: groupId,
+        user_id: user.id,
+        role: "member",
+        context: `invite by ${inviterId}`,
+      });
+      if (!memberRes.ok) {
+        db.prepare("DELETE FROM group_members WHERE group_id = ? AND user_id = ?").run(groupId, user.id);
+        return res.status(503).json({
+          error: "Failed to persist membership to Supabase",
+          details: "error" in memberRes ? memberRes.error : "Unknown membership sync failure",
+        });
+      }
+
+      console.log("[POST /api/groups/invite] success", { groupId, userId: user.id, membership: memberRes.row });
       res.json({ success: true });
     } catch (err) {
       res.status(400).json({ error: 'User is already a member' });
@@ -2194,17 +2730,66 @@ async function startServer() {
     }
   });
 
-  app.post("/api/groups/:id/posts", (req, res) => {
-    const { userId, username, avatar, content, imageUrl } = req.body;
+  app.post("/api/groups/:id/posts", async (req, res) => {
+    const { username, avatar, content, imageUrl, image_url } = req.body;
     const groupId = req.params.id;
     const id = uuidv4();
+    const authUserId = await getAuthUserIdFromJwtHeader(req);
+    if (!authUserId) {
+      return res.status(401).json({ error: "Missing authenticated userId - do not proceed" });
+    }
+    if (typeof content !== "string" || !content.trim()) {
+      return res.status(400).json({ error: "content is required" });
+    }
+
+    const localUser = db
+      .prepare("SELECT username, avatar FROM users WHERE id = ?")
+      .get(authUserId) as { username?: string | null; avatar?: string | null } | undefined;
+    const normalizedUsername =
+      (typeof username === "string" && username.trim()) ||
+      (typeof localUser?.username === "string" && localUser.username.trim()) ||
+      "user";
+    const normalizedAvatar =
+      (typeof avatar === "string" && avatar.trim()) ||
+      (typeof localUser?.avatar === "string" && localUser.avatar.trim()) ||
+      null;
+    const normalizedImageUrl =
+      (typeof imageUrl === 'string' && imageUrl.trim()) ||
+      (typeof image_url === 'string' && image_url.trim()) ||
+      null;
     
     try {
       db.prepare(`
         INSERT INTO group_posts (id, group_id, user_id, username, avatar, content, image_url) 
         VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(id, groupId, userId, username, avatar, content, imageUrl || null);
-      
+      `).run(id, groupId, authUserId, normalizedUsername, normalizedAvatar, content.trim(), normalizedImageUrl);
+
+      // Keep cloud data aligned with local group feed storage.
+      if (supabaseAdmin) {
+        const { error: postSyncError } = await supabaseAdmin.from("group_posts").upsert(
+          {
+            id,
+            group_id: groupId,
+            user_id: authUserId,
+            username: normalizedUsername,
+            avatar: normalizedAvatar,
+            content: content.trim(),
+            image_url: normalizedImageUrl,
+          },
+          { onConflict: "id" }
+        );
+        if (postSyncError) {
+          console.error("[POST /api/groups/:id/posts] Supabase group_posts upsert FAILED", {
+            code: postSyncError.code,
+            message: postSyncError.message,
+            details: (postSyncError as any).details,
+            hint: (postSyncError as any).hint,
+            group_id: groupId,
+            user_id: authUserId,
+          });
+        }
+      }
+
       res.json({ success: true, id });
     } catch (err) {
       console.error('Error creating group post:', err);
@@ -2778,12 +3363,13 @@ async function startServer() {
 
   // Reels Endpoints
   app.get("/api/reels", async (req, res) => {
+    console.log("SERVER: [DEPLOY_DEBUG] GET /api/reels");
     const toReelsPublicUrl = (value: string | null | undefined) => {
       if (!value) return value;
       if (value.startsWith('http://') || value.startsWith('https://')) return value;
       const storagePath = value.startsWith('reels/') ? value.slice('reels/'.length) : value;
       if (!supabase) return value;
-      const { data } = supabase.storage.from('reels').getPublicUrl(storagePath);
+      const { data } = supabase.storage.from('posts').getPublicUrl(storagePath);
       return data?.publicUrl || value;
     };
 
@@ -2836,45 +3422,34 @@ async function startServer() {
       url: toReelsPublicUrl(r.url),
       thumbnail: toReelsPublicUrl(r.thumbnail)
     }));
+    console.log("SERVER: [DEPLOY_DEBUG] GET /api/reels rows:", normalized.length);
     res.json(normalized);
   });
 
-  // Stories API
+  // Stories API — Supabase only (no SQLite fallback; aligns with what was inserted)
   app.get("/api/stories", async (req, res) => {
-    const now = new Date().toISOString();
     try {
+      if (!supabase) {
+        console.error("FETCH STORIES ERROR: Supabase client not configured");
+        return res.status(500).json({ ok: false });
+      }
+
       const { data, error } = await supabase
-        .from('stories')
-        .select('*')
-        .gt('expires_at', now)
-        .order('created_at', { ascending: false });
-      
-      if (error) throw error;
-      
-      if (data && data.length > 0) {
-        return res.json(data);
+        .from("stories")
+        .select("*")
+        .order("created_at", { ascending: false });
+
+      if (error) {
+        console.error("FETCH STORIES ERROR:", error);
+        return res.status(500).json({ ok: false });
       }
-      
-      // Fallback to SQLite if Supabase returns nothing
-      const stories = db.prepare(`
-        SELECT * FROM stories 
-        WHERE expires_at > ? 
-        ORDER BY created_at DESC
-      `).all(now);
-      res.json(stories);
+
+      console.log("[API STORIES COUNT]:", data?.length ?? 0);
+      return res.json(data ?? []);
     } catch (err) {
-      logToFile(`SERVER: Supabase stories fetch error: ${err}`);
-      try {
-        const stories = db.prepare(`
-          SELECT * FROM stories 
-          WHERE expires_at > ? 
-          ORDER BY created_at DESC
-        `).all(now);
-        res.json(stories);
-      } catch (dbErr) {
-        logToFile(`SERVER: DB stories fetch error: ${dbErr}`);
-        res.json([]);
-      }
+      console.error("FETCH STORIES ERROR:", err);
+      logToFile(`SERVER: GET /api/stories error: ${err}`);
+      return res.status(500).json({ ok: false });
     }
   });
 
@@ -3106,10 +3681,14 @@ async function startServer() {
         logToFile
       );
       if (!inboxResult.ok) {
-        logToFile(`SERVER: POST /api/story-replies messages insert FAILED: ${inboxResult.error}`);
+        logToFile(
+          `SERVER: POST /api/story-replies messages insert FAILED: ${
+            "error" in inboxResult ? inboxResult.error : "Unknown inbox sync failure"
+          }`
+        );
         return res.status(502).json({
           error: "Story reply saved locally but inbox delivery failed",
-          details: inboxResult.error,
+          details: "error" in inboxResult ? inboxResult.error : "Unknown inbox sync failure",
           success: false,
           id,
         });
@@ -3154,14 +3733,29 @@ async function startServer() {
   app.post("/api/reels", (req, res) => {
     const { userId, url, thumbnail, caption, soundTitle, soundArtist, username, avatar } = req.body;
     const id = uuidv4();
-    
+  console.log("SERVER: [DEPLOY_DEBUG] POST /api/reels", {
+    userId: userId ? String(userId).slice(0, 8) + "…" : null,
+    hasUrl: !!url,
+    supabaseUrlHost: supabaseUrl ? (() => { try { return new URL(supabaseUrl).host; } catch { return "(invalid)"; } })() : "(missing)",
+    supabaseAnonKeyPresent: !!supabaseAnonKey,
+    supabaseServiceRolePresent: !!supabaseServiceRole,
+    payloadPreview: {
+      hasThumbnail: !!thumbnail,
+      captionLength: typeof caption === "string" ? caption.length : 0,
+      hasSoundTitle: !!soundTitle,
+      hasSoundArtist: !!soundArtist,
+      hasUsername: !!username,
+      hasAvatar: !!avatar,
+      urlHost: typeof url === "string" ? (() => { try { return new URL(url).host; } catch { return "(invalid-url)"; } })() : null,
+    },
+  });
     try {
       const toReelsPublicUrl = (value: string | null | undefined) => {
         if (!value) return value;
         if (value.startsWith('http://') || value.startsWith('https://')) return value;
         const storagePath = value.startsWith('reels/') ? value.slice('reels/'.length) : value;
         if (!supabase) return value;
-        const { data } = supabase.storage.from('reels').getPublicUrl(storagePath);
+        const { data } = supabase.storage.from('posts').getPublicUrl(storagePath);
         return data?.publicUrl || value;
       };
 
@@ -3177,9 +3771,10 @@ async function startServer() {
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `).run(id, userId, finalUrl, finalThumbnail, caption || '', soundTitle || null, soundArtist || null);
       
+      console.log("SERVER: [DEPLOY_DEBUG] POST /api/reels saved id:", id);
       res.json({ success: true, id });
     } catch (err) {
-      console.error('Reel upload error:', err);
+      console.error('SERVER: [DEPLOY_DEBUG] Reel upload error:', err);
       res.status(500).json({ error: 'Failed to save reel' });
     }
   });
@@ -3932,6 +4527,144 @@ app.put('/api/groups/:groupId/posts/:postId', (req, res) => {
   } catch (err) {
     console.error('Error updating group post:', err);
     res.status(500).json({ error: 'Failed to update group post' });
+  }
+});
+
+// Group post actions: like/comment/share counters
+app.post('/api/groups/:groupId/posts/:postId/like', (req, res) => {
+  const { groupId, postId } = req.params;
+  const rawDelta = Number((req.body as any)?.delta);
+  const delta = rawDelta === -1 ? -1 : 1;
+  try {
+    db.prepare(`
+      UPDATE group_posts
+      SET likes = MAX(0, COALESCE(likes, 0) + ?)
+      WHERE id = ? AND group_id = ?
+    `).run(delta, postId, groupId);
+    const row = db.prepare(`
+      SELECT id, likes, comments, COALESCE(shares, 0) AS shares
+      FROM group_posts
+      WHERE id = ? AND group_id = ?
+    `).get(postId, groupId);
+    res.json({ ok: true, post: row });
+  } catch (err) {
+    console.error('Error updating group post likes:', err);
+    res.status(500).json({ ok: false, error: 'Failed to update likes' });
+  }
+});
+
+app.post('/api/groups/:groupId/posts/:postId/comment', async (req, res) => {
+  const { postId } = req.params;
+  const text = typeof (req.body as any)?.text === 'string' ? (req.body as any).text.trim() : '';
+  const withTimeout = async <T,>(promise: Promise<T>, ms: number, label: string): Promise<T> => {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) =>
+        setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+      ),
+    ]);
+  };
+  try {
+    if (!postId) {
+      return res.status(400).json({ ok: false, error: 'post_id is required' });
+    }
+    if (!text) {
+      return res.status(400).json({ ok: false, error: 'Comment text is required' });
+    }
+    if (!supabase) {
+      console.error('[GROUP COMMENT] Supabase client not configured');
+      return res.status(500).json({ ok: false, error: 'Supabase is not configured' });
+    }
+
+    const authUserId = await getAuthUserIdFromJwtHeader(req);
+    console.log('[GROUP COMMENT] USER:', authUserId);
+    console.log('[GROUP COMMENT] PAYLOAD:', { post_id: postId, content: text });
+    if (!authUserId) {
+      return res.status(401).json({ ok: false, error: 'User not authenticated' });
+    }
+
+    // Group posts are stored in posts; comments must reference posts.id.
+    const { data: existingPost, error: postCheckError } = await withTimeout(
+      supabase
+        .from('posts')
+        .select('id')
+        .eq('id', postId)
+        .maybeSingle(),
+      12000,
+      'post check'
+    );
+    if (postCheckError) {
+      console.error('[GROUP COMMENT] POST CHECK ERROR:', postCheckError);
+      return res.status(500).json({ ok: false, error: 'Failed to validate post' });
+    }
+    if (!existingPost) {
+      return res.status(404).json({ ok: false, error: 'Post not found' });
+    }
+
+    const { data: insertedComment, error: insertError } = await withTimeout(
+      supabase
+        .from('comments')
+        .insert({
+          post_id: postId,
+          user_id: authUserId,
+          content: text,
+        })
+        .select('id, post_id, user_id, content, created_at')
+        .single(),
+      12000,
+      'comment insert'
+    );
+
+    console.log('[GROUP COMMENT] INSERT RESULT:', { data: insertedComment, error: insertError });
+    if (insertError) {
+      return res.status(500).json({ ok: false, error: insertError.message || 'Failed to insert comment' });
+    }
+
+    const { count, error: countError } = await withTimeout(
+      supabase
+        .from('comments')
+        .select('*', { count: 'exact', head: true })
+        .eq('post_id', postId),
+      12000,
+      'comment count'
+    );
+    if (countError) {
+      console.error('[GROUP COMMENT] COUNT ERROR:', countError);
+      return res.status(500).json({ ok: false, error: 'Failed to count comments' });
+    }
+
+    return res.json({
+      ok: true,
+      post: {
+        id: postId,
+        comments: Number(count || 0),
+      },
+      comment: insertedComment,
+    });
+  } catch (err) {
+    console.error('Error creating group post comment:', err);
+    const message = err instanceof Error ? err.message : 'Failed to update comments';
+    return res.status(500).json({ ok: false, error: message });
+  }
+});
+
+app.post('/api/groups/:groupId/posts/:postId/share', (req, res) => {
+  const { groupId, postId } = req.params;
+  try {
+    db.prepare(`
+      UPDATE group_posts
+      SET shares = COALESCE(shares, 0) + 1
+      WHERE id = ? AND group_id = ?
+    `).run(postId, groupId);
+    const row = db.prepare(`
+      SELECT id, likes, comments, COALESCE(shares, 0) AS shares
+      FROM group_posts
+      WHERE id = ? AND group_id = ?
+    `).get(postId, groupId);
+    res.json({ ok: true, post: row });
+  } catch (err) {
+    console.error('Error updating group post shares:', err);
+    res.status(500).json({ ok: false, error: 'Failed to update shares' });
   }
 });
 

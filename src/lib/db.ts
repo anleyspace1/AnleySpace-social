@@ -303,6 +303,7 @@ try { db.exec("ALTER TABLE streams ADD COLUMN category TEXT"); } catch (e) {}
 try { db.exec("ALTER TABLE group_messages ADD COLUMN type TEXT DEFAULT 'text'"); } catch (e) {}
 try { db.exec("ALTER TABLE group_messages ADD COLUMN audio_url TEXT"); } catch (e) {}
 try { db.exec("ALTER TABLE group_messages ADD COLUMN image_url TEXT"); } catch (e) {}
+try { db.exec("ALTER TABLE group_posts ADD COLUMN shares INTEGER DEFAULT 0"); } catch (e) {}
 try { db.exec("ALTER TABLE groups ADD COLUMN cover_image TEXT"); } catch (e) {}
 try { db.exec("ALTER TABLE calls ADD COLUMN group_id TEXT"); } catch (e) {}
 try { db.exec("ALTER TABLE stories ADD COLUMN media_url TEXT"); } catch (e) {}

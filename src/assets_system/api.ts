@@ -1,3 +1,5 @@
+import { apiUrl } from '../lib/apiOrigin';
+
 export interface CreatorGem {
   id: string;
   name: string;
@@ -157,10 +159,10 @@ async function requestOrMock<T>(url: string, init?: RequestInit, fallback: () =>
 }
 
 export const assetsApi = {
-  getGems: () => requestOrMock<CreatorGem[]>('/api/assets/gems', undefined, () => mockDb.gems),
+  getGems: () => requestOrMock<CreatorGem[]>(apiUrl('/api/assets/gems'), undefined, () => mockDb.gems),
   buyGem: (payload: { userId: string; gemId: string; quantity: number }) =>
     requestOrMock<{ success: boolean; totalAmount: number }>(
-      '/api/assets/gems/buy',
+      apiUrl('/api/assets/gems/buy'),
       {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -199,7 +201,7 @@ export const assetsApi = {
     ),
   listGem: (payload: { userId: string; gemId: string; quantity: number }) =>
     requestOrMock<{ success: boolean }>(
-      '/api/assets/gems/list',
+      apiUrl('/api/assets/gems/list'),
       {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -223,10 +225,10 @@ export const assetsApi = {
         return { success: true };
       }
     ),
-  getGifts: () => requestOrMock<InfluencerGift[]>('/api/assets/gifts', undefined, () => mockDb.gifts),
+  getGifts: () => requestOrMock<InfluencerGift[]>(apiUrl('/api/assets/gifts'), undefined, () => mockDb.gifts),
   buyGift: (payload: { userId: string; giftId: string; quantity: number }) =>
     requestOrMock<{ success: boolean; totalAmount: number }>(
-      '/api/assets/gifts/buy',
+      apiUrl('/api/assets/gifts/buy'),
       {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -258,7 +260,7 @@ export const assetsApi = {
     ),
   resellGift: (payload: { userId: string; giftId: string; quantity: number; resalePrice: number }) =>
     requestOrMock<{ success: boolean }>(
-      '/api/assets/gifts/resell',
+      apiUrl('/api/assets/gifts/resell'),
       {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -267,7 +269,7 @@ export const assetsApi = {
       () => ({ success: true })
     ),
   getTrending: () =>
-    requestOrMock<TrendingAsset[]>('/api/assets/trending', undefined, () => {
+    requestOrMock<TrendingAsset[]>(apiUrl('/api/assets/trending'), undefined, () => {
       const volume = new Map<string, TrendingAsset>();
       mockDb.holdings.forEach((h) => {
         const key = `${h.asset_type}:${h.asset_id}`;
@@ -287,7 +289,7 @@ export const assetsApi = {
       return [...volume.values()].sort((a, b) => b.total_volume - a.total_volume);
     }),
   getMyAssets: (userId: string) =>
-    requestOrMock<OwnedAsset[]>(`/api/assets/my-assets/${encodeURIComponent(userId)}`, undefined, () => {
+    requestOrMock<OwnedAsset[]>(apiUrl(`/api/assets/my-assets/${encodeURIComponent(userId)}`), undefined, () => {
       const mine = mockDb.holdings.filter((h) => h.user_id === userId);
       if (mine.length === 0) {
         mockDb.holdings.push({
@@ -307,7 +309,7 @@ export const assetsApi = {
     }),
   sellAsset: (payload: { userId: string; assetType: string; assetId: string; quantity: number; sellPrice: number }) =>
     requestOrMock<{ success: boolean }>(
-      '/api/assets/my-assets/sell',
+      apiUrl('/api/assets/my-assets/sell'),
       {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -323,7 +325,7 @@ export const assetsApi = {
     ),
   transferAsset: (payload: { fromUserId: string; toUserId: string; assetType: string; assetId: string; quantity: number }) =>
     requestOrMock<{ success: boolean }>(
-      '/api/assets/my-assets/transfer',
+      apiUrl('/api/assets/my-assets/transfer'),
       {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -332,10 +334,10 @@ export const assetsApi = {
       () => ({ success: true })
     ),
   getRewards: (userId: string) =>
-    requestOrMock<RewardState>(`/api/assets/rewards/${encodeURIComponent(userId)}`, undefined, () => ensureReward(userId)),
+    requestOrMock<RewardState>(apiUrl(`/api/assets/rewards/${encodeURIComponent(userId)}`), undefined, () => ensureReward(userId)),
   claimRewards: (userId: string) =>
     requestOrMock<{ success: boolean; rewardAmount: number }>(
-      `/api/assets/rewards/${encodeURIComponent(userId)}/claim`,
+      apiUrl(`/api/assets/rewards/${encodeURIComponent(userId)}/claim`),
       {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -350,7 +352,7 @@ export const assetsApi = {
       }
     ),
   getOverview: (userId: string) =>
-    requestOrMock<AssetsOverview>(`/api/assets/overview?userId=${encodeURIComponent(userId)}`, undefined, () => {
+    requestOrMock<AssetsOverview>(apiUrl(`/api/assets/overview?userId=${encodeURIComponent(userId)}`), undefined, () => {
       const rw = ensureReward(userId);
       const mine = mockDb.holdings.filter((h) => h.user_id === userId);
       return {
@@ -362,10 +364,10 @@ export const assetsApi = {
         treasury: { holders_pool: 0, platform_pool: 0 },
       };
     }),
-  getMarketplaceListings: () => requestOrMock<MarketplaceListing[]>('/api/assets/marketplace', undefined, () => mockDb.listings),
+  getMarketplaceListings: () => requestOrMock<MarketplaceListing[]>(apiUrl('/api/assets/marketplace'), undefined, () => mockDb.listings),
   buyListing: (payload: { userId: string; listingId: string; quantity: number; assetType: string; assetId: string }) =>
     requestOrMock<{ success: boolean; totalAmount?: number }>(
-      '/api/assets/my-assets/sell',
+      apiUrl('/api/assets/my-assets/sell'),
       {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

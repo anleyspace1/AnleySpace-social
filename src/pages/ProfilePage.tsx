@@ -28,7 +28,7 @@ import { NavLink, useParams, useNavigate, useSearchParams } from 'react-router-d
 import { MOCK_USER, MOCK_VIDEOS } from '../constants';
 import { cn } from '../lib/utils';
 import { Post, Video } from '../types';
-import { API_ORIGIN } from '../lib/apiOrigin';
+import { apiUrl } from '../lib/apiOrigin';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import ShareModal from '../components/ShareModal';
@@ -74,7 +74,7 @@ export default function ProfilePage() {
         let localData = { followers_count: 0, following_count: 0, bio: profileData.bio };
         try {
           console.log(`DEBUG: Fetching local data for ${profileData.id}`);
-          const res = await fetch(`/api/user/${profileData.id}`);
+          const res = await fetch(apiUrl(`/api/user/${profileData.id}`));
           if (!res.ok) {
             console.error(`DEBUG: Local API error: ${res.status} ${res.statusText}`);
           } else {
@@ -294,7 +294,7 @@ export default function ProfilePage() {
   const checkIfFollowing = async () => {
     if (!user || !userProfile) return;
     try {
-      const res = await fetch(`/api/users/${user.id}/following/${userProfile.id}`);
+      const res = await fetch(apiUrl(`/api/users/${user.id}/following/${userProfile.id}`));
       const data = await res.json();
       setIsFollowing(data.isFollowing);
     } catch (err) {
@@ -311,7 +311,7 @@ export default function ProfilePage() {
     const wasFollowing = isFollowing;
     setIsFollowing(!wasFollowing);
     try {
-      const endpoint = wasFollowing ? `${API_ORIGIN}/api/users/unfollow` : `${API_ORIGIN}/api/users/follow`;
+      const endpoint = wasFollowing ? apiUrl('/api/users/unfollow') : apiUrl('/api/users/follow');
       const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -344,7 +344,7 @@ export default function ProfilePage() {
     if (!user) return;
     setIsVerifying(true);
     try {
-      const res = await fetch(`/api/user/${user.id}/verify`, { method: 'POST' });
+      const res = await fetch(apiUrl(`/api/user/${user.id}/verify`), { method: 'POST' });
       if (res.ok) {
         setIsVerified(true);
         alert('Congratulations! Your profile is now verified. 🎖️');
@@ -417,7 +417,7 @@ export default function ProfilePage() {
       let resolvedProfiles = profiles || [];
       // Keep profile counts/list source consistent: if Supabase rows are empty, fallback to local API list.
       if (resolvedProfiles.length === 0) {
-        const res = await fetch(`${API_ORIGIN}/api/users/${encodeURIComponent(userProfile.id)}/followers-list`);
+        const res = await fetch(apiUrl(`/api/users/${encodeURIComponent(userProfile.id)}/followers-list`));
         if (res.ok) {
           const list = await res.json();
           resolvedProfiles = Array.isArray(list) ? list : [];
@@ -430,7 +430,7 @@ export default function ProfilePage() {
     } catch (err) {
       console.error('Error fetching followers:', err);
       try {
-        const res = await fetch(`${API_ORIGIN}/api/users/${encodeURIComponent(userProfile.id)}/followers-list`);
+        const res = await fetch(apiUrl(`/api/users/${encodeURIComponent(userProfile.id)}/followers-list`));
         if (res.ok) {
           const list = await res.json();
           let followingIds: string[] = [];
@@ -493,7 +493,7 @@ export default function ProfilePage() {
       let resolvedProfiles = profiles || [];
       // Keep profile counts/list source consistent: if Supabase rows are empty, fallback to local API list.
       if (resolvedProfiles.length === 0) {
-        const res = await fetch(`${API_ORIGIN}/api/users/${encodeURIComponent(userProfile.id)}/following-list`);
+        const res = await fetch(apiUrl(`/api/users/${encodeURIComponent(userProfile.id)}/following-list`));
         if (res.ok) {
           const list = await res.json();
           resolvedProfiles = Array.isArray(list) ? list : [];
@@ -506,7 +506,7 @@ export default function ProfilePage() {
     } catch (err) {
       console.error('Error fetching following:', err);
       try {
-        const res = await fetch(`${API_ORIGIN}/api/users/${encodeURIComponent(userProfile.id)}/following-list`);
+        const res = await fetch(apiUrl(`/api/users/${encodeURIComponent(userProfile.id)}/following-list`));
         if (res.ok) {
           const list = await res.json();
           let myFollowingIds: string[] = [];
@@ -601,7 +601,7 @@ export default function ProfilePage() {
       // No existing thread yet: ensure target user is present in local cache so Messages page can open immediately.
       if (!existingMessages || existingMessages.length === 0) {
         try {
-          await fetch('/api/users/sync', {
+          await fetch(apiUrl('/api/users/sync'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -950,7 +950,7 @@ function UserListModal({ title, mode, users, onToggleFollow, onClose, loading }:
             placeholder="Search users..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl py-3 pl-12 pr-4 focus:ring-2 focus:ring-indigo-500 transition-all text-sm"
+            className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl py-3 pl-12 pr-4 focus:ring-2 focus:ring-indigo-500 transition-all text-sm text-gray-900 dark:text-gray-100 placeholder:text-gray-500 dark:placeholder:text-gray-400 caret-gray-900 dark:caret-gray-100 opacity-100"
           />
         </div>
 

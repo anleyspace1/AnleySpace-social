@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { motion } from 'motion/react';
 import { UserPlus, UserMinus, Check, X, Search, MoreHorizontal, Loader2 } from 'lucide-react';
 import { cn } from '../lib/utils';
-import { API_ORIGIN } from '../lib/apiOrigin';
+import { apiUrl } from '../lib/apiOrigin';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import { useNavigate } from 'react-router-dom';
@@ -148,7 +148,7 @@ export default function FriendsPage() {
       }
 
       if (followingData.length === 0) {
-        const res = await fetch(`/api/users/${encodeURIComponent(user.id)}/following-list`);
+        const res = await fetch(apiUrl(`/api/users/${encodeURIComponent(user.id)}/following-list`));
         if (res.ok) {
           const list = await res.json();
           followingData = Array.isArray(list) ? list.map(mapProfileRow) : [];
@@ -170,7 +170,7 @@ export default function FriendsPage() {
       console.error('Error fetching following:', err);
       setFollowingIds([]);
       try {
-        const res = await fetch(`/api/users/${encodeURIComponent(user!.id)}/following-list`);
+        const res = await fetch(apiUrl(`/api/users/${encodeURIComponent(user!.id)}/following-list`));
         if (res.ok) {
           const list = await res.json();
           const followingData = Array.isArray(list) ? list.map(mapProfileRow) : [];
@@ -228,7 +228,7 @@ export default function FriendsPage() {
       }
 
       if (followersData.length === 0) {
-        const res = await fetch(`/api/users/${encodeURIComponent(user.id)}/followers-list`);
+        const res = await fetch(apiUrl(`/api/users/${encodeURIComponent(user.id)}/followers-list`));
         if (res.ok) {
           const list = await res.json();
           followersData = Array.isArray(list) ? list.map(mapProfileRow) : [];
@@ -243,7 +243,7 @@ export default function FriendsPage() {
     } catch (err) {
       console.error('Error fetching followers:', err);
       try {
-        const res = await fetch(`/api/users/${encodeURIComponent(user!.id)}/followers-list`);
+        const res = await fetch(apiUrl(`/api/users/${encodeURIComponent(user!.id)}/followers-list`));
         if (res.ok) {
           const list = await res.json();
           const followersData = Array.isArray(list) ? list.map(mapProfileRow) : [];
@@ -327,7 +327,7 @@ export default function FriendsPage() {
 
     try {
       if (wasFollowing) {
-        const res = await fetch(`${API_ORIGIN}/api/users/unfollow`, {
+        const res = await fetch(apiUrl('/api/users/unfollow'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ followerId: user.id, followingId: creatorId }),
@@ -336,7 +336,7 @@ export default function FriendsPage() {
         await supabase.from('follows').delete().eq('follower_id', user.id).eq('following_id', creatorId);
         setFollowing(prev => prev.filter(f => f.id !== creatorId));
       } else {
-        const res = await fetch(`${API_ORIGIN}/api/users/follow`, {
+        const res = await fetch(apiUrl('/api/users/follow'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ followerId: user.id, followingId: creatorId }),
@@ -359,7 +359,7 @@ export default function FriendsPage() {
     if (!user) return;
     if (window.confirm('Are you sure you want to unfollow this user?')) {
       try {
-        const res = await fetch(`${API_ORIGIN}/api/users/unfollow`, {
+        const res = await fetch(apiUrl('/api/users/unfollow'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ followerId: user.id, followingId: id }),

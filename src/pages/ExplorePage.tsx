@@ -20,7 +20,7 @@ import {
 } from 'lucide-react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { cn } from '../lib/utils';
-import { API_ORIGIN } from '../lib/apiOrigin';
+import { apiUrl } from '../lib/apiOrigin';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import { ResponsiveImage } from '../components/ResponsiveImage';
@@ -90,7 +90,7 @@ export default function ExplorePage() {
   React.useEffect(() => {
     // Sync all users from Supabase to local DB for search
     console.log('DEBUG: Triggering sync-all');
-    fetch('/api/users/sync-all', { method: 'POST' })
+    fetch(apiUrl('/api/users/sync-all'), { method: 'POST' })
       .then(res => res.json())
       .then(data => console.log('DEBUG: Sync-all result:', data))
       .catch(err => console.error('DEBUG: Initial sync failed:', err));
@@ -111,7 +111,7 @@ export default function ExplorePage() {
     if (!searchQuery.trim()) return;
     setSearching(true);
     try {
-      const response = await fetch(`/api/users/search?q=${encodeURIComponent(searchQuery)}`);
+      const response = await fetch(apiUrl(`/api/users/search?q=${encodeURIComponent(searchQuery)}`));
       if (!response.ok) throw new Error('Search request failed');
       const data = await response.json();
       console.log('[Explore] /api/users/search sample', Array.isArray(data) ? data.slice(0, 1) : data);
@@ -121,7 +121,7 @@ export default function ExplorePage() {
         const followingMap: Record<string, boolean> = {};
         await Promise.all(data.map(async (p: any) => {
           try {
-            const fRes = await fetch(`/api/users/${user.id}/following/${p.id}`);
+            const fRes = await fetch(apiUrl(`/api/users/${user.id}/following/${p.id}`));
             const fData = await fRes.json();
             if (fData.isFollowing) followingMap[p.id] = true;
           } catch (e) {
@@ -167,7 +167,7 @@ export default function ExplorePage() {
     setFollowing(prev => ({ ...prev, [creatorId]: !wasFollowing }));
 
     try {
-      const endpoint = wasFollowing ? `${API_ORIGIN}/api/users/unfollow` : `${API_ORIGIN}/api/users/follow`;
+      const endpoint = wasFollowing ? apiUrl('/api/users/unfollow') : apiUrl('/api/users/follow');
       const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

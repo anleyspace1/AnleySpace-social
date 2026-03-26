@@ -3,7 +3,7 @@ import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { ArrowLeft } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { supabase, isSupabaseConfigured, getCachedSession } from '../lib/supabase';
-import { API_ORIGIN } from '../lib/apiOrigin';
+import { apiUrl } from '../lib/apiOrigin';
 import { fetchActiveStories } from '../lib/activeStories';
 
 /** Only stories that can be rendered: persisted id, real user, and media from the API (no seed/dummy rows). */
@@ -318,8 +318,7 @@ export default function StoryPage() {
 
   const displayName =
     (isStoryOwner && (profile?.full_name || profile?.display_name)) ||
-    activeStory?.username ||
-    'unknown';
+    (activeStory?.user ?? 'User');
 
   useEffect(() => {
     setShowViewers(false);
@@ -333,7 +332,7 @@ export default function StoryPage() {
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch(`${API_ORIGIN}/api/stories/${activeStory.id}/views`);
+        const res = await fetch(apiUrl(`/api/stories/${activeStory.id}/views`));
         if (!res.ok) return;
         const data = await res.json();
         if (!cancelled && Array.isArray(data)) setViewers(data);
@@ -441,7 +440,7 @@ export default function StoryPage() {
         const session = await getCachedSession();
         const token = session?.access_token;
         if (!token || cancelled) return;
-        const res = await fetch(`${API_ORIGIN}/api/story-views`, {
+        const res = await fetch(apiUrl('/api/story-views'), {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -489,13 +488,13 @@ export default function StoryPage() {
     const receiverId = activeStory.user_id;
     const payload = { storyId, senderId, receiverId, message: msg };
     console.log('[Story reply] sending POST /api/story-replies', {
-      url: `${API_ORIGIN}/api/story-replies`,
+      url: apiUrl('/api/story-replies'),
       ...payload,
     });
     replySubmitLockRef.current = true;
     setReplySending(true);
     try {
-      const res = await fetch(`${API_ORIGIN}/api/story-replies`, {
+      const res = await fetch(apiUrl('/api/story-replies'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),

@@ -37,6 +37,7 @@ import { MOCK_USER } from '../constants';
 import CameraFilters, { CAMERA_FILTERS, Filter } from '../components/CameraFilters';
 import FaceFilterEngine from '../components/FaceFilterEngine';
 import { useAuth } from '../contexts/AuthContext';
+import { apiUrl } from '../lib/apiOrigin';
 
 // Game Types
 type GameType = 'coin_rain' | 'gift_bomb' | 'power_duel' | 'live_kingdom' | 'spin_storm';
@@ -149,8 +150,8 @@ export default function LivePage() {
     const fetchStreams = async () => {
       try {
         const [streamsRes, callsRes] = await Promise.all([
-          fetch('/api/streams'),
-          fetch('/api/live-calls')
+          fetch(apiUrl('/api/streams')),
+          fetch(apiUrl('/api/live-calls'))
         ]);
         const streamsData = await streamsRes.json();
         const callsData = await callsRes.json();
@@ -169,7 +170,7 @@ export default function LivePage() {
       // Check if this is a live call
       const checkCall = async () => {
         try {
-          const res = await fetch('/api/live-calls');
+          const res = await fetch(apiUrl('/api/live-calls'));
           const calls = await res.json();
           const call = calls.find((c: any) => c.stream_id === streamId);
           if (call) {
@@ -510,7 +511,7 @@ export default function LivePage() {
   const fetchInventory = async () => {
     if (!user) return;
     try {
-      const res = await fetch(`/api/inventory/${user.id}`);
+      const res = await fetch(apiUrl(`/api/inventory/${user.id}`));
       const data = await res.json();
       setInventory(data);
     } catch (err) {
@@ -521,7 +522,7 @@ export default function LivePage() {
   const startLiveSelling = async () => {
     if (!user) return;
     try {
-      const res = await fetch('/api/live-selling/start', {
+      const res = await fetch(apiUrl('/api/live-selling/start'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -534,7 +535,7 @@ export default function LivePage() {
       setIsProductSelectionOpen(false);
       
       // Fetch products for the session
-      const prodRes = await fetch(`/api/live-selling/${data.sessionId}/products`);
+      const prodRes = await fetch(apiUrl(`/api/live-selling/${data.sessionId}/products`));
       const prodData = await prodRes.json();
       setLiveProducts(prodData);
     } catch (err) {
@@ -555,7 +556,7 @@ export default function LivePage() {
     }
 
     try {
-      const res = await fetch(`/api/calls/${streamId}/request-join`, {
+      const res = await fetch(apiUrl(`/api/calls/${streamId}/request-join`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId: user.id, amount })

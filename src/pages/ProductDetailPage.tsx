@@ -15,7 +15,7 @@ import {
 } from 'lucide-react';
 import { Product } from '../types';
 import { cn } from '../lib/utils';
-import { API_ORIGIN } from '../lib/apiOrigin';
+import { apiUrl } from '../lib/apiOrigin';
 import { MOCK_USER } from '../constants';
 import { useAuth } from '../contexts/AuthContext';
 
@@ -41,7 +41,7 @@ export default function ProductDetailPage() {
 
   const fetchProduct = async () => {
     try {
-      const res = await fetch(`/api/marketplace/products/${id}`);
+      const res = await fetch(apiUrl(`/api/marketplace/products/${id}`));
       if (res.ok) {
         const data = await res.json();
         setProduct({
@@ -58,7 +58,7 @@ export default function ProductDetailPage() {
 
   const fetchRelatedProducts = async () => {
     try {
-      const res = await fetch('/api/marketplace/products');
+      const res = await fetch(apiUrl('/api/marketplace/products'));
       if (res.ok) {
         const data = await res.json();
         const filtered = data
@@ -78,7 +78,7 @@ export default function ProductDetailPage() {
     }
     setBuying(true);
     try {
-      const res = await fetch(`${API_ORIGIN}/api/marketplace/buy`, {
+      const res = await fetch(apiUrl('/api/marketplace/buy'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

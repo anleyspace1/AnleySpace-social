@@ -1,7 +1,10 @@
 import { createClient, type Session } from '@supabase/supabase-js';
+import { logClientDeployEnvOnce } from './deployDebug';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+
+logClientDeployEnvOnce();
 
 if (!supabaseUrl || !supabaseAnonKey) {
   console.warn('Supabase URL or Anon Key is missing. Please configure it in the Secrets panel.');

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { supabase } from '../lib/supabase';
+import { apiUrl } from '../lib/apiOrigin';
 import { useAuth } from '../contexts/AuthContext';
 import { Send, MessageCircle } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
@@ -72,7 +73,7 @@ export default function LiveChat({ liveId }: LiveChatProps) {
     if (!inputText.trim() || !user) return;
 
     try {
-      await fetch(`/api/lives/${liveId}/message`, {
+      await fetch(apiUrl(`/api/lives/${liveId}/message`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId: user.id, message: inputText.trim() })

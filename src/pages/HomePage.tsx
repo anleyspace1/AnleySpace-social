@@ -269,7 +269,7 @@ function Stories() {
       typeof s.media_url === 'string' && s.media_url.trim() ? s.media_url.trim() : '';
     return {
       id: s.id,
-      user: s.username,
+      user: s.user ?? s.username ?? 'User',
       avatar: s.avatar,
       image: s.image_url || s.media_url,
       media_url: resolvedMedia,
@@ -400,6 +400,7 @@ function Stories() {
     const formData = new FormData();
     formData.append('file', file, file.name);
     formData.append('userId', user.id);
+    formData.append('user_id', user.id);
     formData.append('username', username);
     formData.append('avatar', avatar);
 
@@ -409,20 +410,75 @@ function Stories() {
     });
 
     const text = await res.text();
-    let data: { ok?: boolean; error?: string } | undefined;
+    let payload:
+      | {
+          ok?: boolean;
+          error?: string;
+          id?: string;
+          user_id?: string;
+          media_url?: string;
+          media_type?: string;
+          created_at?: string;
+        }
+      | undefined;
     try {
-      data = text ? JSON.parse(text) : undefined;
+      payload = text ? JSON.parse(text) : undefined;
     } catch {
       console.error('UPLOAD: non-JSON response body:', text.slice(0, 500));
       throw new Error('Invalid server response');
     }
 
-    if (!res.ok || data?.ok === false) {
-      throw new Error(data?.error || 'Upload failed');
+    if (!res.ok || payload?.ok === false) {
+      throw new Error(payload?.error || 'Upload failed');
     }
 
-    await fetchStories();
-    await fetchActiveStoriesMap().then((map) => setAvatarStoriesMap(map));
+    if (payload?.id && payload?.media_url) {
+      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      const optimistic = {
+        id: payload.id,
+        user_id: user.id,
+        username,
+        avatar,
+        image_url: payload.media_url,
+        media_url: payload.media_url,
+        media_type:
+          payload.media_type ||
+          (file.type.startsWith('video') ? 'video' : 'image'),
+        created_at: payload.created_at || new Date().toISOString(),
+        expires_at: expiresAt,
+        user: username,
+      };
+      setRealStories((prev) => {
+        const rest = prev.filter((s) => s.id !== optimistic.id);
+        return [optimistic, ...rest];
+      });
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 4000));
+    const updatedStories = await fetchActiveStories();
+    setRealStories((prev) => {
+      const merged = new Map<string, any>();
+
+      [...prev, ...updatedStories].forEach((story) => {
+        merged.set(story.id, story);
+      });
+
+      const sorted = Array.from(merged.values()).sort(
+        (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+      );
+
+      const avatarMap = sorted.reduce((acc: Record<string, any[]>, story: any) => {
+        const uid = story.user_id || story.username;
+        if (!uid) return acc;
+        if (!acc[uid]) acc[uid] = [];
+        acc[uid].push(story);
+        return acc;
+      }, {});
+
+      setAvatarStoriesMap(avatarMap);
+
+      return sorted;
+    });
   };
 
   const confirmStoryPost = async () => {
@@ -660,7 +716,7 @@ function Stories() {
                     <div className="relative w-full h-full">
                       {videoSrc ? (
                         <video
-                          key={videoSrc}
+                          key={story.id}
                           src={videoSrc}
                           muted
                           playsInline
@@ -678,6 +734,7 @@ function Stories() {
                         />
                       ) : (
                         <img
+                          key={story.id}
                           src={thumbSrc}
                           alt=""
                           className="w-full h-full object-cover rounded-full"
@@ -1225,7 +1282,10 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
         return;
       }
 
-      const basePosts = postsData || [];
+      const basePosts = (postsData || []).filter((p: any) => {
+        const cat = typeof p?.category === 'string' ? p.category.trim().toLowerCase() : '';
+        return !cat.startsWith('group:');
+      });
       if (basePosts.length === 0) {
         setPosts([]);
         return;

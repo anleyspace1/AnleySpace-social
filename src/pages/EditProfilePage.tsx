@@ -6,6 +6,7 @@ import Cropper, { Area } from 'react-easy-crop';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import { cn } from '../lib/utils';
+import { apiUrl } from '../lib/apiOrigin';
 
 // Helper function to create the cropped image
 const getCroppedImg = async (imageSrc: string, pixelCrop: Area): Promise<string> => {
@@ -96,7 +97,7 @@ export default function EditProfilePage() {
       // Sync with local DB immediately
       try {
         console.log('DEBUG: Syncing profile to local DB:', formData);
-        const syncRes = await fetch('/api/users/sync', {
+        const syncRes = await fetch(apiUrl('/api/users/sync'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

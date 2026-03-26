@@ -5,6 +5,123 @@ import { cn } from '../lib/utils';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { MOCK_USER } from '../constants';
+import { apiUrl } from '../lib/apiOrigin';
+import { getBearerAuthHeaders } from '../lib/supabaseAuthHeaders';
+import { supabase } from '../lib/supabase';
+
+/** Prefer JWT user id from Supabase Auth so group_members.user_id matches RLS and .eq('user_id', ...) filters. */
+async function resolveAuthUserId(fallback: { id?: string } | null): Promise<string | null> {
+  const { data: authData, error } = await supabase.auth.getUser();
+  if (error) console.warn('[GroupsPage] getUser', error);
+  let id = authData?.user?.id ?? fallback?.id ?? null;
+  if (!id) {
+    const { data: sessData, error: sessErr } = await supabase.auth.getSession();
+    if (sessErr) console.warn('[GroupsPage] getSession', sessErr);
+    id = sessData?.session?.user?.id ?? null;
+  }
+  if (id) return String(id).trim();
+  return null;
+}
+
+function mergeUniqueGroupsById(...lists: (any[] | undefined)[]): any[] {
+  const map = new Map<string, any>();
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const g of list) {
+      if (g?.id) map.set(String(g.id), g);
+    }
+  }
+  return Array.from(map.values());
+}
+
+function isUuid(value: unknown): value is string {
+  return typeof value === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.trim());
+}
+
+function resolveGroupUuid(group: any): string | null {
+  const candidates = [group?.id, group?.group_id, group?.uuid];
+  for (const c of candidates) {
+    if (isUuid(c)) return c.trim();
+  }
+  return null;
+}
+
+/** Persist group + admin membership in Supabase from the client (JWT satisfies RLS). Complements POST /api/groups. */
+async function insertGroupAndMembershipInSupabase(opts: {
+  id: string;
+  name: string;
+  description: string;
+  image: string;
+  type: string;
+  userId: string;
+}): Promise<void> {
+  const uid = String(opts.userId ?? '').trim();
+  if (!uid) {
+    console.error('[GroupsPage] insertGroupAndMembershipInSupabase: refused — empty userId (would store NULL user_id)');
+    return;
+  }
+
+  const rowCore = {
+    id: opts.id,
+    name: opts.name,
+    description: opts.description ?? '',
+    image: opts.image,
+    type: opts.type,
+    creator_id: uid,
+  };
+
+  let { error: gErr } = await supabase.from('groups').insert({ ...rowCore, user_id: uid });
+  if (gErr) {
+    const msg = String(gErr.message || '');
+    if (/user_id|42703|does not exist|schema cache/i.test(msg)) {
+      ({ error: gErr } = await supabase.from('groups').insert(rowCore));
+    }
+  }
+  const gCode = (gErr as { code?: string } | undefined)?.code;
+  if (gErr && gCode === '23505') {
+    const { error: upErr } = await supabase.from('groups').upsert(rowCore, { onConflict: 'id' });
+    if (upErr) console.error('[GroupsPage] groups upsert (after duplicate):', upErr);
+  } else if (gErr) {
+    console.error('[GroupsPage] groups insert:', gErr);
+  }
+
+  const { error: mErr } = await supabase.from('group_members').insert({
+    group_id: opts.id,
+    user_id: uid,
+    role: 'admin',
+  });
+  const mCode = (mErr as { code?: string } | undefined)?.code;
+  if (mErr && mCode === '23505') {
+    const { error: muErr } = await supabase
+      .from('group_members')
+      .upsert(
+        { group_id: opts.id, user_id: uid, role: 'admin' },
+        { onConflict: 'group_id,user_id' }
+      );
+    if (muErr) console.error('[GroupsPage] group_members upsert:', muErr);
+  } else if (mErr) {
+    console.error('[GroupsPage] group_members insert:', mErr);
+  }
+
+  const { data: memCheck, error: memCheckErr } = await supabase
+    .from('group_members')
+    .select('group_id, user_id, role')
+    .eq('group_id', opts.id)
+    .eq('user_id', uid)
+    .maybeSingle();
+  if (memCheckErr) {
+    console.error('[GroupsPage] group_members post-insert verify:', memCheckErr);
+  } else if (!memCheck?.user_id) {
+    const { error: fixErr } = await supabase
+      .from('group_members')
+      .update({ user_id: uid })
+      .eq('group_id', opts.id)
+      .is('user_id', null);
+    if (fixErr) console.error('[GroupsPage] group_members repair user_id failed:', fixErr);
+    else console.log('[GroupsPage] group_members repaired NULL user_id for group', opts.id);
+  }
+}
 
 export default function GroupsPage() {
   const { user } = useAuth();
@@ -12,6 +129,7 @@ export default function GroupsPage() {
   const categoryFilter = searchParams.get('category');
   const [activeTab, setActiveTab] = useState<'joined' | 'suggested'>('joined');
   const [joinedGroups, setJoinedGroups] = useState<any[]>([]);
+  const [joinedGroupIds, setJoinedGroupIds] = useState<Set<string>>(new Set());
   const [suggestedGroups, setSuggestedGroups] = useState<any[]>([]);
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
@@ -19,28 +137,88 @@ export default function GroupsPage() {
   const navigate = useNavigate();
 
   const fetchGroups = async () => {
-    if (!user) return;
+    const uid = await resolveAuthUserId(user);
+    if (!uid) {
+      console.warn('[GroupsPage] fetchGroups skipped: no auth user id');
+      setIsLoading(false);
+      return;
+    }
     setIsLoading(true);
     try {
-      const [joinedRes, allRes] = await Promise.all([
-        fetch(`/api/groups/joined/${user.id}`),
-        fetch('/api/groups')
-      ]);
-      const joinedData = await joinedRes.json();
-      const allData = await allRes.json();
+      const discoverRes = await supabase
+        .from('groups')
+        .select(`
+          *,
+          group_members ( user_id )
+        `)
+        .order('created_at', { ascending: false });
+
+      if (discoverRes.error) {
+        console.error('[GroupsPage] discover groups select error:', discoverRes.error);
+      }
+      console.log('GROUP WITH MEMBERS:', discoverRes.data);
+      const allData = Array.isArray(discoverRes.data) ? discoverRes.data : [];
+      const mappedAllGroups = await Promise.all(
+        allData.map(async (group: any) => {
+          const members = Array.isArray(group?.group_members) ? group.group_members : [];
+          let membersCount = members.length || 0;
+
+          if (membersCount === 0 && group?.id) {
+            const { count, error: countError } = await supabase
+              .from('group_members')
+              .select('*', { count: 'exact', head: true })
+              .eq('group_id', group.id);
+            if (countError) {
+              console.warn('[GroupsPage] group_members fallback count query failed (check SELECT RLS):', countError);
+            } else {
+              membersCount = count || 0;
+            }
+          }
+
+          const joined = members.some((m: any) => String(m?.user_id || '') === uid);
+          return {
+            ...group,
+            id: resolveGroupUuid(group) || group?.id,
+            name: group?.name || 'Untitled Group',
+            description: group?.description || '',
+            type: group?.type || 'Public',
+            members: membersCount,
+            members_count: membersCount,
+            isJoined: joined,
+            image:
+              (typeof group?.image === 'string' && group.image.trim()) ||
+              `https://picsum.photos/seed/${group?.id || 'group'}/400/200`,
+          };
+        })
+      );
+      let groups = mappedAllGroups.filter((g: any) => g.isJoined);
+      console.log('[GroupsPage] fetchGroups result', {
+        userId: uid,
+        joinedCount: Array.isArray(groups) ? groups.length : 0,
+        allCount: mappedAllGroups.length,
+        joinedIds: Array.isArray(groups) ? groups.map((g: any) => g.id) : []
+      });
       
-      setJoinedGroups(joinedData);
+      setJoinedGroups(groups);
+      setJoinedGroupIds(
+        new Set(
+          (Array.isArray(groups) ? groups : [])
+            .map((g: any) => resolveGroupUuid(g))
+            .filter(Boolean) as string[]
+        )
+      );
       // Suggested are groups not joined
-      const joinedIds = new Set(joinedData.map((g: any) => g.id));
-      let filteredSuggested = allData.filter((g: any) => !joinedIds.has(g.id));
+      let filteredSuggested = mappedAllGroups.filter((g: any) => !g.isJoined);
       
       if (categoryFilter) {
         filteredSuggested = filteredSuggested.filter((g: any) => g.category === categoryFilter);
       }
       
       setSuggestedGroups(filteredSuggested);
+      return { joinedData: groups, allData };
     } catch (err) {
       console.error("Error fetching groups:", err);
+      return { joinedData: [], allData: [] };
     } finally {
       setIsLoading(false);
     }
@@ -50,23 +228,63 @@ export default function GroupsPage() {
     if (user) {
       fetchGroups();
       // Sync users from Supabase to local DB
-      fetch('/api/users/sync-all', { method: 'POST' })
+      fetch(apiUrl('/api/users/sync-all'), { method: 'POST' })
         .then(res => res.json())
         .then(data => console.log('DEBUG: Sync-all result in GroupsPage:', data))
         .catch(err => console.error('DEBUG: Sync-all error in GroupsPage:', err));
     }
   }, [categoryFilter, user]);
 
-  const handleJoinGroup = async (groupId: string) => {
-    if (!user) return;
+  const handleJoinGroup = async (group: any) => {
+    const uid = await resolveAuthUserId(user);
+    if (!uid) return;
+    const groupId = resolveGroupUuid(group);
+    if (!groupId) {
+      console.error('[GroupsPage] join group: missing UUID group.id', group);
+      return;
+    }
     try {
-      const res = await fetch(`/api/groups/${groupId}/join`, {
+      const authHeaders = await getBearerAuthHeaders();
+      if (!authHeaders) {
+        console.error('[GroupsPage] join group: no session / access_token');
+        return;
+      }
+      console.log("JOIN GROUP ID:", groupId);
+      console.log("JOIN REQUEST SENT");
+      const res = await fetch(apiUrl(`/api/groups/${groupId}/join`), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId: user.id })
+        headers: authHeaders,
+        body: JSON.stringify({})
       });
+      const data = await res.json().catch(() => null);
+      console.log("JOIN RESPONSE:", data);
       if (res.ok) {
-        fetchGroups();
+        setJoinedGroupIds((prev) => new Set([...prev, groupId]));
+        setJoinedGroups((prev) => {
+          const exists = prev.some((g: any) => resolveGroupUuid(g) === groupId);
+          if (exists) return prev;
+          return [
+            {
+              ...group,
+              members: Number(group?.members || group?.members_count || 0) + 1,
+              members_count: Number(group?.members_count || group?.members || 0) + 1,
+            },
+            ...prev,
+          ];
+        });
+        setSuggestedGroups((prev) =>
+          prev
+            .map((g: any) => {
+              if (resolveGroupUuid(g) !== groupId) return g;
+              return {
+                ...g,
+                members: Number(g?.members || g?.members_count || 0) + 1,
+                members_count: Number(g?.members_count || g?.members || 0) + 1,
+              };
+            })
+            .filter((g: any) => resolveGroupUuid(g) !== groupId)
+        );
+        await fetchGroups();
       }
     } catch (err) {
       console.error("Error joining group:", err);
@@ -75,15 +293,27 @@ export default function GroupsPage() {
 
   // Updated handleCreateGroup according to prompt
   const handleCreateGroup = async (groupData: any) => {
-    if (!user) return;
+    const memberUserId = await resolveAuthUserId(user);
+    if (!memberUserId) {
+      console.error('[GroupsPage] create group: no auth user id', user);
+      setCreateError('You must be signed in to create a group.');
+      return;
+    }
     setCreateError(null);
     try {
-      const res = await fetch('/api/groups', {
+      const authHeaders = await getBearerAuthHeaders();
+      if (!authHeaders) {
+        setCreateError('You must be signed in (session required for Authorization).');
+        console.error('[GroupsPage] create group: no session / access_token');
+        return;
+      }
+      const res = await fetch(apiUrl('/api/groups'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify({
-          ...groupData,
-          user_id: user.id, // as per prompt: include user_id
+          name: groupData.name,
+          description: groupData.description,
+          type: groupData.type,
         })
       });
       if (!res.ok) {
@@ -97,8 +327,86 @@ export default function GroupsPage() {
         setCreateError(msg);
         return;
       }
+      const created = await res.json().catch(() => ({} as any));
+      const createdGroupId = created?.id ? String(created.id) : '';
+      const imageUrl =
+        created?.image ||
+        groupData?.image ||
+        (createdGroupId ? `https://picsum.photos/seed/${createdGroupId}/400/200` : '');
+      console.log('[GroupsPage] create group response', {
+        ok: res.ok,
+        status: res.status,
+        createdGroupId,
+        payload: created
+      });
+      if (createdGroupId) {
+        await insertGroupAndMembershipInSupabase({
+          id: createdGroupId,
+          name: created?.name ?? groupData?.name ?? 'New Group',
+          description: created?.description ?? groupData?.description ?? '',
+          image: imageUrl,
+          type: created?.type ?? groupData?.type ?? 'Public',
+          userId: memberUserId,
+        });
+        // Ensure membership exists even if backend create payload handling changes.
+        const joinHeaders = await getBearerAuthHeaders();
+        console.log("JOIN REQUEST SENT");
+        const joinRes = await fetch(apiUrl(`/api/groups/${createdGroupId}/join`), {
+          method: 'POST',
+          headers: joinHeaders ?? authHeaders,
+          body: JSON.stringify({})
+        });
+        let joinPayload: any = null;
+        try {
+          joinPayload = await joinRes.json();
+        } catch {
+          joinPayload = null;
+        }
+        console.log('[GroupsPage] join response', {
+          ok: joinRes.ok,
+          status: joinRes.status,
+          groupId: createdGroupId,
+          userId: memberUserId,
+          payload: joinPayload
+        });
+        if (!joinRes.ok) {
+          console.warn('[GroupsPage] join after create failed', {
+            groupId: createdGroupId,
+            userId: memberUserId,
+            status: joinRes.status,
+            payload: joinPayload
+          });
+        }
+        // Membership persisted by POST /api/groups + POST /api/groups/:id/join (service role Supabase sync).
+      }
       setIsCreateModalOpen(false);
-      fetchGroups();
+      const refreshed = await fetchGroups();
+      const refreshedJoined = Array.isArray(refreshed?.joinedData) ? refreshed.joinedData : [];
+      const hasCreatedInJoined = createdGroupId
+        ? refreshedJoined.some((g: any) => String(g?.id) === createdGroupId)
+        : false;
+      console.log('[GroupsPage] post-create joined verification', {
+        groupId: createdGroupId,
+        hasCreatedInJoined
+      });
+      if (createdGroupId && !hasCreatedInJoined) {
+        const fallbackGroup = {
+          id: createdGroupId,
+          name: created?.name || groupData?.name || 'New Group',
+          description: created?.description || groupData?.description || '',
+          image: created?.image || `https://picsum.photos/seed/${createdGroupId}/400/200`,
+          type: created?.type || groupData?.type || 'Public',
+          creator_id: memberUserId
+        };
+        setJoinedGroups((prev) => {
+          if (prev.some((g: any) => String(g?.id) === createdGroupId)) return prev;
+          return [fallbackGroup, ...prev];
+        });
+        setSuggestedGroups((prev) => prev.filter((g: any) => String(g?.id) !== createdGroupId));
+        console.warn('[GroupsPage] created group missing from joined API; injected locally', {
+          groupId: createdGroupId
+        });
+      }
     } catch (err) {
       console.error("Error creating group:", err);
       setCreateError("Unexpected error creating group.");
@@ -154,7 +462,12 @@ export default function GroupsPage() {
                 <GroupCard key={group.id} group={group} joined />
               ))}
               {activeTab === 'suggested' && suggestedGroups.map(group => (
-                <GroupCard key={group.id} group={group} onJoin={() => handleJoinGroup(group.id)} />
+                <GroupCard
+                  key={group.id}
+                  group={group}
+                  joined={Boolean(resolveGroupUuid(group) && joinedGroupIds.has(resolveGroupUuid(group)!))}
+                  onJoin={() => handleJoinGroup(group)}
+                />
               ))}
               {activeTab === 'joined' && joinedGroups.length === 0 && (
                 <div className="col-span-2 py-12 text-center bg-white dark:bg-gray-900 rounded-3xl border border-gray-100 dark:border-gray-800">
@@ -258,7 +571,7 @@ function CreateGroupModal({
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="Enter group name"
-              className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl py-4 px-4 focus:ring-2 focus:ring-indigo-500 transition-all font-bold"
+              className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl py-4 px-4 focus:ring-2 focus:ring-indigo-500 transition-all font-bold text-gray-900 dark:text-white caret-indigo-600 placeholder:text-gray-400 dark:placeholder:text-gray-500"
               disabled={pending}
             />
           </div>
@@ -270,7 +583,7 @@ function CreateGroupModal({
               onChange={(e) => setDescription(e.target.value)}
               placeholder="What is this group about?"
               rows={3}
-              className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl py-4 px-4 focus:ring-2 focus:ring-indigo-500 transition-all font-bold resize-none"
+              className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl py-4 px-4 focus:ring-2 focus:ring-indigo-500 transition-all font-bold resize-none text-gray-900 dark:text-white caret-indigo-600 placeholder:text-gray-400 dark:placeholder:text-gray-500"
               disabled={pending}
             />
           </div>

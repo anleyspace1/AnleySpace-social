@@ -23,6 +23,7 @@ import { MOCK_USER } from '../constants';
 import { cn } from '../lib/utils';
 import { Transaction } from '../types';
 import { useAuth } from '../contexts/AuthContext';
+import { apiUrl } from '../lib/apiOrigin';
 
 export default function WalletPage() {
   const { user } = useAuth();
@@ -36,8 +37,8 @@ export default function WalletPage() {
       if (!user) return;
       try {
         const [userRes, txRes] = await Promise.all([
-          fetch(`/api/user/${user.id}`),
-          fetch(`/api/transactions/${user.id}`)
+          fetch(apiUrl(`/api/user/${user.id}`)),
+          fetch(apiUrl(`/api/transactions/${user.id}`))
         ]);
         const userData = await userRes.json();
         const txData = await txRes.json();

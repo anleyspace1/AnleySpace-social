@@ -23,6 +23,7 @@ import {
 import { MOCK_USER, MOCK_SOUNDS } from '../constants';
 import { cn } from '../lib/utils';
 import { supabase } from '../lib/supabase';
+import { apiUrl } from '../lib/apiOrigin';
 import { useAuth } from '../contexts/AuthContext';
 
 export default function CreateReelPage() {
@@ -131,11 +132,21 @@ export default function CreateReelPage() {
     setIsUploading(true);
 
     try {
+      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined;
+      const { data: authData, error: authError } = await supabase.auth.getUser();
+      console.log('[REELS_DEBUG][CreateReelPage] env + auth', {
+        mode: import.meta.env.MODE,
+        host: typeof window !== 'undefined' ? window.location.host : '(ssr)',
+        supabaseHost: supabaseUrl ? new URL(supabaseUrl).host : '(missing)',
+        authUser: authData?.user ?? null,
+        authError: authError ?? null,
+      });
+
       // Upload directly to the "reels" bucket.
       // This avoids false negatives when listBuckets is restricted for anon keys.
       const fileName = `${Date.now()}-${file.name.replace(/[^a-zA-Z0-9.]/g, '_')}`;
       const { data: uploadData, error: uploadError } = await supabase.storage
-        .from('reels')
+        .from('posts')
         .upload(fileName, file, {
           cacheControl: '3600',
           upsert: false
@@ -150,26 +161,51 @@ export default function CreateReelPage() {
 
       const uploadedPath = uploadData?.path || fileName;
       const { data: { publicUrl } } = supabase.storage
-        .from('reels')
+        .from('posts')
         .getPublicUrl(uploadedPath);
+      console.log('[REELS_DEBUG][CreateReelPage] storage upload result', {
+        uploadData,
+        uploadError: uploadError ?? null,
+        uploadedPath,
+        publicUrl,
+      });
       if (!publicUrl) throw new Error('Failed to generate public URL for uploaded reel');
 
       // Save reel metadata to backend
-      const response = await fetch('/api/reels', {
+      const insertPayload = {
+        userId: user?.id || MOCK_USER.id,
+        url: publicUrl,
+        caption,
+        soundTitle: selectedSound?.title,
+        soundArtist: selectedSound?.artist,
+      };
+      console.log('[REELS_DEBUG][CreateReelPage] /api/reels payload', insertPayload);
+      const response = await fetch(apiUrl('/api/reels'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          userId: user?.id || MOCK_USER.id,
-          url: publicUrl,
-          caption,
-          soundTitle: selectedSound?.title,
-          soundArtist: selectedSound?.artist,
-        }),
+        body: JSON.stringify(insertPayload),
+      });
+      const responseText = await response.text();
+      console.log('[REELS_DEBUG][CreateReelPage] /api/reels response', {
+        status: response.status,
+        ok: response.ok,
+        body: responseText.slice(0, 500),
       });
 
       if (!response.ok) throw new Error('Failed to save reel to database');
+
+      // Diagnostics only: verify whether direct Supabase table access works under current auth/RLS.
+      const { data: probeRows, error: probeError } = await supabase
+        .from('posts')
+        .select('id, user_id, created_at')
+        .order('created_at', { ascending: false })
+        .limit(1);
+      console.log('[REELS_DEBUG][CreateReelPage] supabase reels probe', {
+        rows: probeRows ?? [],
+        error: probeError ?? null,
+      });
 
       setIsUploading(false);
       alert("Reel shared successfully!");

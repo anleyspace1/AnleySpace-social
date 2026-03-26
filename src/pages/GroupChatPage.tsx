@@ -43,6 +43,7 @@ import AgoraCall from '../components/AgoraCall';
 import LiveChat from '../components/LiveChat';
 import { v4 as uuidv4 } from 'uuid';
 import io from 'socket.io-client';
+import { apiUrl } from '../lib/apiOrigin';
 
 interface GroupMessage {
   id: string;
@@ -119,25 +120,64 @@ export default function GroupChatPage() {
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
 
+  const getCurrentAuthUser = async () => {
+    const { data: { user } } = await supabase.auth.getUser();
+    console.log("CURRENT USER:", user?.id);
+    return user ?? null;
+  };
+
   const fetchGroupInfo = async () => {
     try {
-      const res = await fetch(`/api/groups/${id}?userId=${user?.id}`);
-      const data = await res.json();
-      setGroupInfo(data);
-      if (data.activeCall) {
-        setActiveCall({
-          id: data.activeCall.id,
-          type: data.activeCall.type,
-          status: data.activeCall.status,
-          hostId: data.activeCall.host_id,
-          isLive: data.activeCall.is_live === 1,
-          streamId: data.activeCall.stream_id,
-          isSpeaker: data.activeCall.isSpeaker
-        });
+      if (!id) return;
+      const currentUser = await getCurrentAuthUser();
+
+      const { data: groupRow, error: groupError } = await supabase
+        .from('groups')
+        .select('*')
+        .eq('id', id)
+        .maybeSingle();
+      if (groupError) {
+        console.error("Error fetching group info:", groupError);
+        return;
       }
-      if (user && data.members) {
-        setIsMember(data.members.some((m: any) => m.id === user.id));
+
+      const { data: memberRows, error: memberError } = await supabase
+        .from('group_members')
+        .select('group_id, user_id, role')
+        .eq('group_id', id);
+      if (memberError) {
+        console.error("Error fetching group members:", memberError);
       }
+
+      const safeMembers = Array.isArray(memberRows) ? memberRows : [];
+      const memberIds = safeMembers.map((m: any) => m.user_id).filter(Boolean);
+      let profileMap = new Map<string, { username?: string | null }>();
+      if (memberIds.length > 0) {
+        const { data: profiles } = await supabase
+          .from('profiles')
+          .select('id, username')
+          .in('id', memberIds);
+        profileMap = new Map((profiles || []).map((p: any) => [String(p.id), p]));
+      }
+
+      const members = safeMembers.map((m: any) => ({
+        id: String(m.user_id),
+        username: profileMap.get(String(m.user_id))?.username || `user_${String(m.user_id).slice(0, 8)}`,
+        role: m.role || 'member',
+      }));
+
+      const membership = !!(currentUser?.id && safeMembers.some((m: any) => String(m.user_id) === String(currentUser.id)));
+      console.log("MEMBERS FROM DB:", members);
+      console.log("IS MEMBER:", membership);
+
+      setGroupInfo({
+        id: groupRow?.id || id,
+        name: groupRow?.name || 'Group',
+        description: groupRow?.description || '',
+        image: groupRow?.image || `https://picsum.photos/seed/${id}/400/400`,
+        members,
+      });
+      setIsMember(membership);
     } catch (err) {
       console.error("Error fetching group info:", err);
     }
@@ -146,7 +186,7 @@ export default function GroupChatPage() {
   const fetchMessages = async () => {
     if (!id) return;
     try {
-      const res = await fetch(`/api/groups/${id}/messages`);
+      const res = await fetch(apiUrl(`/api/groups/${id}/messages`));
       const data = await res.json();
       setMessages(data || []);
     } catch (err) {
@@ -250,7 +290,19 @@ export default function GroupChatPage() {
     e.preventDefault();
     if ((!inputText.trim() && !selectedFile) || !user || !id) return;
 
-    if (!isMember) {
+    const currentUser = await getCurrentAuthUser();
+    if (!currentUser?.id) {
+      alert("You must be a member of this group to send messages.");
+      return;
+    }
+    const { data: membershipRows } = await supabase
+      .from('group_members')
+      .select('group_id, user_id')
+      .eq('group_id', id)
+      .eq('user_id', currentUser.id);
+    const membership = Array.isArray(membershipRows) && membershipRows.length > 0;
+    console.log("IS MEMBER:", membership);
+    if (!membership) {
       alert("You must be a member of this group to send messages.");
       return;
     }
@@ -316,6 +368,14 @@ export default function GroupChatPage() {
       setSelectedImage(imageUrl);
     };
     reader.readAsDataURL(file);
+  };
+
+  const handleCameraUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    handleImageUpload(e);
+  };
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    handleImageUpload(e);
   };
 
   const startRecording = async () => {
@@ -417,7 +477,7 @@ export default function GroupChatPage() {
     if (!user) return;
     setCallError(null);
     try {
-      const res = await fetch('/api/calls/start', {
+      const res = await fetch(apiUrl('/api/calls/start'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ hostId: user.id, type, groupId: id })
@@ -450,13 +510,13 @@ export default function GroupChatPage() {
       socketRef.current.emit('call:leave', { callId: activeCall.id, userId: user.id });
       if (activeCall.hostId === user.id) {
         socketRef.current.emit('call:ended', { groupId: id, callId: activeCall.id });
-        await fetch(`/api/calls/${activeCall.id}/end`, { method: 'POST' });
+        await fetch(apiUrl(`/api/calls/${activeCall.id}/end`), { method: 'POST' });
       }
       setActiveCall(null);
       setCallParticipants([]);
       setJoinRequests([]);
       if (activeCall.isLive) {
-        fetch(`/api/lives/${activeCall.id}/leave`, {
+        fetch(apiUrl(`/api/lives/${activeCall.id}/leave`), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ userId: user.id })
@@ -470,7 +530,7 @@ export default function GroupChatPage() {
 
     try {
       const channelName = `live_${activeCall.id}`;
-      const res = await fetch(`/api/lives/start`, {
+      const res = await fetch(apiUrl(`/api/lives/start`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId: user.id, channelName })
@@ -488,7 +548,7 @@ export default function GroupChatPage() {
     if (!user) return;
     try {
       // 1. Start a call first
-      const resCall = await fetch('/api/calls/start', {
+      const resCall = await fetch(apiUrl('/api/calls/start'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ hostId: user.id, type: 'video', groupId: id })
@@ -497,7 +557,7 @@ export default function GroupChatPage() {
       
       // 2. Start a live session
       const channelName = `live_${callData.id}`;
-      const resLive = await fetch(`/api/lives/start`, {
+      const resLive = await fetch(apiUrl(`/api/lives/start`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId: user.id, channelName })
@@ -528,7 +588,7 @@ export default function GroupChatPage() {
   const handleRespondJoin = async (requestId: string, userId: string, status: 'accepted' | 'declined') => {
     if (!user) return;
     try {
-      const res = await fetch(`/api/calls/${activeCall?.id}/respond-join`, {
+      const res = await fetch(apiUrl(`/api/calls/${activeCall?.id}/respond-join`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ requestId, status, hostId: user.id })
@@ -555,7 +615,7 @@ export default function GroupChatPage() {
     }
 
     try {
-      const res = await fetch(`/api/calls/${activeCall?.id}/upgrade`, {
+      const res = await fetch(apiUrl(`/api/calls/${activeCall?.id}/upgrade`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ hostId: user?.id, capacity, cost })
@@ -577,7 +637,7 @@ export default function GroupChatPage() {
 
   const handleInvite = async (username: string, userId?: string, avatar?: string) => {
     try {
-      const res = await fetch(`/api/groups/${id}/invite`, {
+      const res = await fetch(apiUrl(`/api/groups/${id}/invite`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, userId, avatar })
@@ -795,18 +855,18 @@ export default function GroupChatPage() {
           <form onSubmit={handleSendMessage} className="flex items-center gap-2">
             <input 
               type="file" 
-              accept="image/*" 
+              accept="image/*,video/*" 
               className="hidden" 
               ref={fileInputRef}
-              onChange={handleImageUpload}
+              onChange={handleFileUpload}
             />
             <input 
               type="file" 
-              accept="image/*" 
+              accept="image/*,video/*" 
               capture="environment"
               className="hidden" 
               ref={cameraInputRef}
-              onChange={handleImageUpload}
+              onChange={handleCameraUpload}
             />
             <button
               type="button"
@@ -830,7 +890,7 @@ export default function GroupChatPage() {
                 value={inputText}
                 onChange={(e) => setInputText(e.target.value)}
                 placeholder="Type a message..."
-                className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl py-3 px-4 text-sm focus:ring-2 focus:ring-indigo-500 transition-all"
+                className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl py-3 px-4 text-sm text-gray-900 dark:text-white placeholder:text-gray-400 caret-gray-900 dark:caret-white focus:ring-2 focus:ring-indigo-500 transition-all"
               />
             </div>
             <button
@@ -1167,7 +1227,7 @@ function InviteModal({ onClose, onConfirm }: { onClose: () => void; onConfirm: (
   const searchUsers = async () => {
     setSearching(true);
     try {
-      const res = await fetch(`/api/users/search?q=${encodeURIComponent(searchQuery)}`);
+      const res = await fetch(apiUrl(`/api/users/search?q=${encodeURIComponent(searchQuery)}`));
       if (!res.ok) throw new Error('Search failed');
       const data = await res.json();
       
@@ -1219,7 +1279,7 @@ function InviteModal({ onClose, onConfirm }: { onClose: () => void; onConfirm: (
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 placeholder="Search by username or name..."
-                className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl py-4 pl-12 pr-4 focus:ring-2 focus:ring-indigo-500 transition-all font-bold"
+                className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl py-4 pl-12 pr-4 focus:ring-2 focus:ring-indigo-500 transition-all font-bold text-gray-900 dark:text-white"
               />
             </div>
           </div>
@@ -1290,7 +1350,7 @@ function MembersModal({ members, onClose }: { members: GroupMember[]; onClose: (
                   <span className="text-indigo-600 font-bold">{member.username[0].toUpperCase()}</span>
                 </div>
                 <div>
-                  <p className="font-bold text-sm">@{member.username}</p>
+                  <p className="font-semibold text-sm text-gray-900 dark:text-white opacity-100">@{member.username}</p>
                   <p className="text-[10px] text-gray-500 capitalize">{member.role}</p>
                 </div>
               </div>

@@ -13,6 +13,25 @@
   body {
     @apply bg-white text-gray-900 dark:bg-black dark:text-white transition-colors duration-200;
   }
+
+  /* Global input readability: visible typed text, placeholder, and caret */
+  input,
+  textarea {
+    color: rgb(17 24 39) !important; /* text-gray-900 */
+    caret-color: rgb(17 24 39) !important; /* caret-gray-900 */
+  }
+
+  .dark input,
+  .dark textarea {
+    color: rgb(255 255 255) !important; /* dark:text-white */
+    caret-color: rgb(255 255 255) !important; /* dark:caret-white */
+  }
+
+  input::placeholder,
+  textarea::placeholder {
+    color: rgb(156 163 175) !important; /* placeholder-gray-400 */
+    opacity: 1 !important;
+  }
 }
 
 /* Custom scrollbar for a cleaner look */
@@ -39,6 +58,15 @@
 }
 
 .no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.scroll-hide::-webkit-scrollbar {
+  display: none;
+}
+
+.scroll-hide {
   -ms-overflow-style: none;
   scrollbar-width: none;
 }
