@@ -52,6 +52,7 @@ interface GroupMessage {
   username: string;
   text: string;
   timestamp: string;
+  created_at?: string;
   type: string;
   audio_url?: string;
   image_url?: string;
@@ -184,19 +185,53 @@ export default function GroupChatPage() {
   };
 
   const fetchMessages = async () => {
-    if (!id) return;
+    const currentGroupId = id;
+    if (!currentGroupId) return;
+    console.log('currentGroupId:', currentGroupId);
     try {
-      const res = await fetch(apiUrl(`/api/groups/${id}/messages`));
-      const data = await res.json();
-      setMessages(data || []);
+      const { data: messagesData, error } = await supabase
+        .from('messages')
+        .select('*')
+        .eq('group_id', currentGroupId)
+        .order('created_at', { ascending: true });
+
+      console.log('fetched messages:', messagesData);
+      console.log('error:', error);
+
+      if (error) throw error;
+
+      const normalized = (messagesData || []).map((m: any) => ({
+        id: String(m.id),
+        group_id: String(m.group_id ?? currentGroupId),
+        user_id: String(m.user_id ?? ''),
+        username: m.username || 'user',
+        text: m.content ?? m.text ?? '',
+        created_at: m.created_at || undefined,
+        timestamp: m.created_at || m.timestamp || new Date().toISOString(),
+        type: m.type || 'text',
+        image_url: m.image_url || undefined,
+        audio_url: m.audio_url || undefined,
+      }));
+
+      setMessages(normalized);
     } catch (err) {
-      console.error("Error fetching group messages:", err);
+      console.error('Error fetching group messages:', err);
+      try {
+        const res = await fetch(apiUrl(`/api/groups/${currentGroupId}/messages`));
+        const data = await res.json();
+        setMessages(data || []);
+      } catch (fallbackErr) {
+        console.error('Error fetching group messages (fallback):', fallbackErr);
+      }
     }
   };
 
   useEffect(() => {
-    // Load chat history even before the socket is ready.
-    fetchMessages();
+    const currentGroupId = id;
+    if (currentGroupId) {
+      // Load chat history even before realtime/socket is ready.
+      void fetchMessages();
+    }
   }, [id]);
 
   useEffect(() => {
@@ -310,6 +345,10 @@ export default function GroupChatPage() {
     scrollToBottom();
   }, [messages]);
 
+  useEffect(() => {
+    console.log('render messages:', messages);
+  }, [messages]);
+
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
@@ -368,6 +407,20 @@ export default function GroupChatPage() {
         image_url: imageUrl,
         timestamp: new Date().toISOString()
       };
+
+      const payload = {
+        content: inputText.trim(),
+        user_id: user.id,
+        group_id: id,
+        username: profile?.username || user.email?.split('@')[0],
+        type: imageUrl ? 'image' : 'text',
+        image_url: imageUrl,
+      };
+      console.log('sending message:', payload);
+      const { error: insertError } = await supabase.from('messages').insert([payload]);
+      if (insertError) {
+        console.error('Error inserting group message:', insertError);
+      }
 
       socketRef.current.emit('send_group_message', messageData);
       // Immediate non-blocking refresh for deploys where realtime delivery can lag.
@@ -685,7 +738,13 @@ export default function GroupChatPage() {
     }
   };
 
-  if (!groupInfo) return null;
+  if (!groupInfo) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-gray-50 dark:bg-black text-sm text-gray-500">
+        Loading group chat...
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col h-screen bg-gray-50 dark:bg-black overflow-hidden">
@@ -760,6 +819,7 @@ export default function GroupChatPage() {
               <Info size={32} className="text-indigo-600" />
             </div>
             <h3 className="font-bold text-sm mb-1">Welcome to {groupInfo.name}</h3>
+            <p className="text-xs text-gray-500">No messages</p>
             <p className="text-xs text-gray-500 max-w-[200px]">{groupInfo.description || 'This is the beginning of the group chat.'}</p>
           </div>
         )}
@@ -833,7 +893,7 @@ export default function GroupChatPage() {
                     )}
                   </div>
                   <span className="text-[8px] text-gray-400 mt-1 px-1">
-                    {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    {new Date(msg.created_at || msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                   </span>
                 </div>
               </motion.div>
