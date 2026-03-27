@@ -1277,7 +1277,9 @@ function PostAction({ icon, label, onClick }: { icon: React.ReactNode; label: st
 // ---------------- FEED COMPONENTS: video, double-tap, avatar ring, nav ---------
 function Feed({ category, refreshKey }: { category?: string | null; refreshKey?: number }) {
   const { user } = useAuth();
+  const navigate = useNavigate();
   const [posts, setPosts] = useState<any[]>([]);
+  const [suggestedReels, setSuggestedReels] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [userStoriesMap, setUserStoriesMap] = useState<Record<string, any[]>>({});
 
@@ -1388,6 +1390,47 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshKey, user?.id]);
 
+  useEffect(() => {
+    const fetchSuggestedReels = async () => {
+      try {
+        const { data: reelRows, error } = await supabase
+          .from('posts')
+          .select('id, user_id, content, video_url, image_url, created_at')
+          .eq('category', 'reel')
+          .not('video_url', 'is', null)
+          .order('created_at', { ascending: false })
+          .limit(10);
+        if (error) throw error;
+        const rows = Array.isArray(reelRows) ? reelRows : [];
+        const userIds = Array.from(new Set(rows.map((r: any) => r.user_id).filter(Boolean)));
+        let profileMap: Record<string, { username?: string | null; avatar_url?: string | null }> = {};
+        if (userIds.length > 0) {
+          const { data: profRows } = await supabase
+            .from('profiles')
+            .select('id, username, avatar_url')
+            .in('id', userIds);
+          profileMap = Object.fromEntries((profRows || []).map((p: any) => [String(p.id), p]));
+        }
+        setSuggestedReels(
+          rows.map((r: any) => ({
+            id: String(r.id),
+            video_url: String(r.video_url || ''),
+            image_url: r.image_url || null,
+            caption: String(r.content || ''),
+            username: profileMap[String(r.user_id)]?.username || 'User',
+            avatar_url:
+              profileMap[String(r.user_id)]?.avatar_url ||
+              `https://picsum.photos/seed/reel-${String(r.user_id || r.id)}/100/100`,
+          }))
+        );
+      } catch (err) {
+        console.error('[Home] fetchSuggestedReels failed:', err);
+        setSuggestedReels([]);
+      }
+    };
+    void fetchSuggestedReels();
+  }, [refreshKey, user?.id]);
+
   // Subscribe to real-time updates once
   useEffect(() => {
     const channel = supabase
@@ -1465,6 +1508,20 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
                 <TrendingSection />
               </div>
             )}
+            {(index + 1) % 6 === 0 && suggestedReels.length > 0 && (
+              <SuggestedReelsStrip
+                reels={suggestedReels}
+                onOpenReel={(reel) => {
+                  navigate(`/reels/${reel.id}?autoplaySound=1`, {
+                    state: {
+                      selectedReelId: reel.id,
+                      videoId: reel.id,
+                      videoUrl: reel.video_url,
+                    },
+                  });
+                }}
+              />
+            )}
           </React.Fragment>
         ))
       ) : (
@@ -1477,6 +1534,102 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
         </div>
       )}
     </div>
+  );
+}
+
+function SuggestedReelsStrip({
+  reels,
+  onOpenReel,
+}: {
+  reels: Array<{
+    id: string;
+    video_url: string;
+    image_url?: string | null;
+    caption?: string;
+    username?: string;
+    avatar_url?: string;
+  }>;
+  onOpenReel: (reel: { id: string; video_url: string }) => void;
+}) {
+  const scrollerRef = useRef<HTMLDivElement | null>(null);
+  const [canScrollLeft, setCanScrollLeft] = useState(false);
+  const [canScrollRight, setCanScrollRight] = useState(false);
+
+  useEffect(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+
+    const updateScrollState = () => {
+      const maxLeft = el.scrollWidth - el.clientWidth;
+      setCanScrollLeft(el.scrollLeft > 0);
+      setCanScrollRight(el.scrollLeft < maxLeft - 1);
+    };
+
+    updateScrollState();
+    el.addEventListener('scroll', updateScrollState, { passive: true });
+    window.addEventListener('resize', updateScrollState);
+    return () => {
+      el.removeEventListener('scroll', updateScrollState);
+      window.removeEventListener('resize', updateScrollState);
+    };
+  }, [reels.length]);
+
+  return (
+    <section className={cn(homeCard, 'p-4')}>
+      <h3 className="text-gray-900 font-black text-sm mb-3">🔥 Suggested Reels</h3>
+      <div className="relative">
+        <div
+          ref={scrollerRef}
+          className="overflow-x-auto overscroll-x-contain [-webkit-overflow-scrolling:touch] touch-pan-x no-scrollbar"
+        >
+          <div className="flex gap-3 min-w-max">
+            {reels.map((reel, idx) => (
+              <button
+                key={reel.id}
+                type="button"
+                onClick={() => onOpenReel(reel)}
+                className="group relative w-[170px] sm:w-[190px] aspect-[9/16] rounded-2xl overflow-hidden bg-black border border-gray-200 shrink-0 text-left"
+              >
+                <video
+                  src={reel.video_url}
+                  muted
+                  autoPlay
+                  loop
+                  playsInline
+                  preload={idx < 3 ? 'metadata' : 'none'}
+                  className="w-full h-full object-cover pointer-events-none"
+                />
+                <div className="absolute inset-0 bg-gradient-to-t from-black/75 via-black/10 to-transparent pointer-events-none" />
+                <div className="absolute left-2 right-2 bottom-2 pointer-events-none">
+                  <p className="text-white text-[10px] font-black truncate">@{reel.username || 'User'}</p>
+                  <p className="text-white/80 text-[10px] truncate">{reel.caption || 'Watch now'}</p>
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+        {canScrollLeft && (
+          <button
+            type="button"
+            aria-label="Scroll suggested reels left"
+            className="hidden md:flex absolute left-2 top-1/2 -translate-y-1/2 z-10 h-9 w-9 items-center justify-center rounded-full bg-white/90 text-gray-700 shadow-sm border border-gray-200 hover:bg-white"
+            onClick={() => scrollerRef.current?.scrollBy({ left: -300, behavior: 'smooth' })}
+          >
+            ←
+          </button>
+        )}
+        {canScrollRight && (
+          <button
+            type="button"
+            aria-label="Scroll suggested reels right"
+            className="hidden md:flex absolute right-2 top-1/2 -translate-y-1/2 z-10 h-9 w-9 items-center justify-center rounded-full bg-white/90 text-gray-700 shadow-sm border border-gray-200 hover:bg-white"
+            onClick={() => scrollerRef.current?.scrollBy({ left: 300, behavior: 'smooth' })}
+          >
+            →
+          </button>
+        )}
+      </div>
+    </section>
   );
 }
 
