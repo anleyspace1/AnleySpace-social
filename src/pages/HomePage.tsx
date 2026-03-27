@@ -1759,10 +1759,10 @@ function PostItem({
   }, []);
 
   useEffect(() => {
-    if (videoRef.current) {
+    if (isTouchDevice && videoRef.current) {
       videoRef.current.muted = isMuted;
     }
-  }, [isMuted]);
+  }, [isMuted, isTouchDevice]);
 
   const postUser = {
     name: displayUsername,
@@ -2476,6 +2476,7 @@ function PostItem({
                   poster={imageUrl || `${videoUrl}#t=0.1`}
                   controls={!isTouchDevice}
                   autoPlay
+                  muted={isTouchDevice ? isMuted : undefined}
                   defaultMuted
                   loop
                   playsInline

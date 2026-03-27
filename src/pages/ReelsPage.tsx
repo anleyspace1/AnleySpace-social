@@ -77,6 +77,7 @@ export default function ReelsPage() {
   const [reelsLoaded, setReelsLoaded] = useState(false);
   const [hasUserInteracted, setHasUserInteracted] = useState(false);
   const [isTouchDevice, setIsTouchDevice] = useState(false);
+  const [isMuted, setIsMuted] = useState(true);
   const feedRef = useRef<HTMLDivElement | null>(null);
   const videoRefs = useRef<(HTMLDivElement | null)[]>([]);
   const reelVideoElsRef = useRef<Record<string, HTMLVideoElement | null>>({});
@@ -481,7 +482,11 @@ export default function ReelsPage() {
             'lg:transition-all lg:duration-500 lg:ease-in-out lg:touch-auto',
             isCommentsOpen ? 'lg:mr-0' : ''
           )}
-          style={isTouchDevice ? { height: '100vh', overflowY: 'scroll', scrollSnapType: 'y mandatory' } : undefined}
+          style={
+            isTouchDevice
+              ? { height: '100vh', overflowY: 'scroll', scrollSnapType: 'y mandatory', backgroundColor: '#000' }
+              : undefined
+          }
           ref={feedRef}
           onClick={() => {
             if (!hasUserInteracted) setHasUserInteracted(true);
@@ -505,12 +510,15 @@ export default function ReelsPage() {
                 'max-lg:h-[100dvh] max-lg:min-h-[100dvh] max-lg:max-h-[100dvh] max-lg:[scroll-snap-stop:always]',
                 'lg:h-full'
               )}
-              style={isTouchDevice ? { height: '100vh', scrollSnapAlign: 'start' } : undefined}
+              style={isTouchDevice ? { height: '100vh', scrollSnapAlign: 'start', backgroundColor: '#000' } : undefined}
             >
               <VideoPost
                 video={video}
                 hasUserInteracted={hasUserInteracted}
                 isTouchDevice={isTouchDevice}
+                globalMuted={isMuted}
+                activeVideoId={activeVideoId}
+                onToggleGlobalMute={() => setIsMuted((prev) => !prev)}
                 onUserInteract={() => setHasUserInteracted(true)}
                 onVideoElementRef={(videoId, el) => {
                   reelVideoElsRef.current[String(videoId)] = el;
@@ -1135,6 +1143,9 @@ function VideoPost({
   video,
   hasUserInteracted,
   isTouchDevice,
+  globalMuted,
+  activeVideoId,
+  onToggleGlobalMute,
   onUserInteract,
   onVideoElementRef,
   onToggleComments,
@@ -1146,6 +1157,9 @@ function VideoPost({
   video: any;
   hasUserInteracted: boolean;
   isTouchDevice: boolean;
+  globalMuted: boolean;
+  activeVideoId: string | null;
+  onToggleGlobalMute: () => void;
   onUserInteract: () => void;
   onVideoElementRef: (videoId: string, el: HTMLVideoElement | null) => void;
   onToggleComments: () => void;
@@ -1166,8 +1180,10 @@ function VideoPost({
   const [floatingHearts, setFloatingHearts] = useState<any[]>([]);
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
   const [isStoryEditorOpen, setIsStoryEditorOpen] = useState(false);
+  const [showSoundIcon, setShowSoundIcon] = useState(false);
+  const [isReady, setIsReady] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
-  const [isMuted, setIsMuted] = useState(true);
+  const soundIconTimerRef = useRef<number | null>(null);
 
   const REEL_GIFTS = [
     { id: 'g1', icon: '🎁', price: 500 },
@@ -1372,6 +1388,14 @@ function VideoPost({
     if (!el) return;
 
     if (isTouchDevice) {
+      onToggleGlobalMute();
+      setShowSoundIcon(true);
+      if (soundIconTimerRef.current) {
+        window.clearTimeout(soundIconTimerRef.current);
+      }
+      soundIconTimerRef.current = window.setTimeout(() => {
+        setShowSoundIcon(false);
+      }, 2000);
       if (el.paused) {
         void el.play().then(() => setIsPlaying(true)).catch(() => {});
       } else {
@@ -1384,18 +1408,29 @@ function VideoPost({
     if (!hasUserInteracted) {
       onUserInteract();
       el.muted = false;
-      setIsMuted(false);
       void el.play().then(() => setIsPlaying(true)).catch(() => {});
       return;
     }
     void togglePlay();
-  }, [hasUserInteracted, onUserInteract, togglePlay, isTouchDevice]);
+  }, [hasUserInteracted, onToggleGlobalMute, onUserInteract, togglePlay, isTouchDevice]);
 
   useEffect(() => {
     if (videoRef.current) {
-      videoRef.current.muted = isMuted;
+      videoRef.current.muted = isTouchDevice ? globalMuted : videoRef.current.muted;
     }
-  }, [isMuted]);
+  }, [globalMuted, activeVideoId, isTouchDevice]);
+
+  useEffect(() => {
+    setIsReady(false);
+  }, [video?.id]);
+
+  useEffect(() => {
+    return () => {
+      if (soundIconTimerRef.current) {
+        window.clearTimeout(soundIconTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const observer = new IntersectionObserver(
@@ -1429,7 +1464,7 @@ function VideoPost({
           }
         });
       },
-      { threshold: 0.8 }
+      { threshold: 0.9 }
     );
 
     if (videoRef.current) observer.observe(videoRef.current);
@@ -1450,6 +1485,7 @@ function VideoPost({
         preload="metadata"
         aria-hidden="true"
         tabIndex={-1}
+        style={{ backgroundColor: '#000' }}
       />
       {/* Video Player */}
       <video
@@ -1463,10 +1499,11 @@ function VideoPost({
         className="relative z-[1] h-full w-full object-contain [will-change:transform]"
         controls={!isTouchDevice}
         loop
-        defaultMuted
+        muted={isTouchDevice ? globalMuted : undefined}
         autoPlay
         playsInline
         preload="metadata"
+        onLoadedData={() => setIsReady(true)}
         onClick={handleVideoSurfaceTap}
         style={
           isTouchDevice
@@ -1475,16 +1512,27 @@ function VideoPost({
                 height: '100%',
                 objectFit: 'cover',
                 backgroundColor: '#000',
+                opacity: isReady ? 1 : 0,
+                transition: 'opacity 0.25s ease',
+                transform: 'translateZ(0)',
+                willChange: 'transform',
               }
             : undefined
         }
       />
 
-      {isTouchDevice && (
+      {isTouchDevice && showSoundIcon && (
         <div
           onClick={(e) => {
             e.stopPropagation();
-            setIsMuted((prev) => !prev);
+            onToggleGlobalMute();
+            setShowSoundIcon(true);
+            if (soundIconTimerRef.current) {
+              window.clearTimeout(soundIconTimerRef.current);
+            }
+            soundIconTimerRef.current = window.setTimeout(() => {
+              setShowSoundIcon(false);
+            }, 2000);
           }}
           style={{
             position: 'absolute',
@@ -1496,7 +1544,7 @@ function VideoPost({
             padding: '8px',
           }}
         >
-          {isMuted ? '🔇' : '🔊'}
+          {globalMuted ? '🔇' : '🔊'}
         </div>
       )}
 
