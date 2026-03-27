@@ -55,7 +55,6 @@ async function insertGroupAndMembershipInSupabase(opts: {
   name: string;
   description: string;
   image: string;
-  type: string;
   userId: string;
 }): Promise<{ error: string | null }> {
   const uidFromCaller = String(opts.userId ?? '').trim();
@@ -90,7 +89,6 @@ async function insertGroupAndMembershipInSupabase(opts: {
     name: opts.name,
     description: opts.description ?? '',
     image: opts.image,
-    type: opts.type,
     creator_id: creatorId,
   };
 
@@ -335,7 +333,6 @@ export default function GroupsPage() {
         name: groupData.name?.trim() || 'New Group',
         description: groupData.description ?? '',
         image: imageUrl,
-        type: groupData.type ?? 'Public',
         userId: memberUserId,
       });
       if (supabaseErr) {
