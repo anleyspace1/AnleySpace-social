@@ -120,6 +120,8 @@ export default function GroupChatPage() {
   const socketRef = useRef<any>(null);
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  /** Set when Supabase select/RLS fails so production issues are not silent. */
+  const [messagesQueryError, setMessagesQueryError] = useState<string | null>(null);
 
   const getCurrentAuthUser = async () => {
     const { data: { user } } = await supabase.auth.getUser();
@@ -189,6 +191,7 @@ export default function GroupChatPage() {
     if (!currentGroupId) return;
     console.log('currentGroupId:', currentGroupId);
     try {
+      setMessagesQueryError(null);
       const { data: messagesData, error } = await supabase
         .from('messages')
         .select('*')
@@ -196,9 +199,14 @@ export default function GroupChatPage() {
         .order('created_at', { ascending: true });
 
       console.log('fetched messages:', messagesData);
-      console.log('error:', error);
+      console.log('messages select error:', error);
 
-      if (error) throw error;
+      if (error) {
+        const msg = [error.message, error.code, error.details].filter(Boolean).join(' — ');
+        console.error('[GroupChat] fetchMessages failed:', error);
+        setMessagesQueryError(msg);
+        throw error;
+      }
 
       const normalized = (messagesData || []).map((m: any) => ({
         id: String(m.id),
@@ -216,6 +224,7 @@ export default function GroupChatPage() {
       setMessages(normalized);
     } catch (err) {
       console.error('Error fetching group messages:', err);
+      setMessagesQueryError((prev) => prev ?? (err instanceof Error ? err.message : String(err)));
     }
   };
 
@@ -248,7 +257,13 @@ export default function GroupChatPage() {
           }
         }
       )
-      .subscribe();
+      .subscribe((status, err) => {
+        if (status === 'SUBSCRIBED') {
+          console.log('[GroupChat] realtime subscribed to messages for group', id);
+        } else {
+          console.warn('[GroupChat] realtime subscription status:', status, err ?? '');
+        }
+      });
 
     return () => {
       supabase.removeChannel(channel);
@@ -387,14 +402,19 @@ export default function GroupChatPage() {
         imageUrl = publicUrl;
       }
 
+      const senderId = currentUser.id;
+      const rawText = inputText.trim();
+      // DB often requires non-null content; image-only messages use a placeholder.
+      const contentForDb = rawText || (imageUrl ? ' ' : '');
+
       const messageData = {
         // Server supports both camelCase and snake_case payloads.
         groupId: id,
-        userId: user.id,
+        userId: senderId,
         group_id: id,
-        user_id: user.id,
+        user_id: senderId,
         username: profile?.username || user.email?.split('@')[0],
-        text: inputText.trim(),
+        text: rawText || (imageUrl ? 'Image' : ''),
         type: imageUrl ? 'image' : 'text',
         imageUrl: imageUrl,
         image_url: imageUrl,
@@ -402,17 +422,26 @@ export default function GroupChatPage() {
       };
 
       const payload = {
-        content: inputText.trim(),
-        user_id: user.id,
+        content: contentForDb,
+        user_id: senderId,
         group_id: id,
         username: profile?.username || user.email?.split('@')[0],
         type: imageUrl ? 'image' : 'text',
         image_url: imageUrl,
       };
       console.log('sending message:', payload);
-      const { error: insertError } = await supabase.from('messages').insert([payload]);
+      const { data: insertedRows, error: insertError } = await supabase
+        .from('messages')
+        .insert([payload])
+        .select('id');
       if (insertError) {
-        console.error('Error inserting group message:', insertError);
+        console.error('[GroupChat] insert messages failed:', insertError);
+        alert(`Failed to send message: ${insertError.message}`);
+        return;
+      }
+      const insertedId = Array.isArray(insertedRows) && insertedRows[0]?.id ? String(insertedRows[0].id) : undefined;
+      if (insertedId) {
+        (messageData as Record<string, unknown>).id = insertedId;
       }
 
       socketRef.current.emit('send_group_message', messageData);
@@ -506,40 +535,76 @@ export default function GroupChatPage() {
 
   const sendVoiceMessage = async (audioUrl: string) => {
     if (!user || !id) return;
-    
+
     try {
+      const currentUser = await getCurrentAuthUser();
+      if (!currentUser?.id) {
+        alert('You must be signed in to send voice messages.');
+        return;
+      }
+      const { data: membershipRows } = await supabase
+        .from('group_members')
+        .select('group_id')
+        .eq('group_id', id)
+        .eq('user_id', currentUser.id);
+      if (!Array.isArray(membershipRows) || membershipRows.length === 0) {
+        alert('You must be a member of this group to send messages.');
+        return;
+      }
+
       const response = await fetch(audioUrl);
       const blob = await response.blob();
-      
+
       const fileName = `${Date.now()}.webm`;
       const filePath = `voice-messages/${fileName}`;
-      
-      const { error: uploadError } = await supabase.storage
-        .from('posts')
-        .upload(filePath, blob);
-        
+
+      const { error: uploadError } = await supabase.storage.from('posts').upload(filePath, blob);
+
       if (uploadError) throw uploadError;
-      
-      const { data: { publicUrl } } = supabase.storage
-        .from('posts')
-        .getPublicUrl(filePath);
+
+      const {
+        data: { publicUrl },
+      } = supabase.storage.from('posts').getPublicUrl(filePath);
+
+      const senderId = currentUser.id;
+      const payload = {
+        content: 'Voice message',
+        user_id: senderId,
+        group_id: id,
+        username: profile?.username || user.email?.split('@')[0],
+        type: 'audio',
+        audio_url: publicUrl,
+      };
+      const { data: insertedRows, error: insertError } = await supabase
+        .from('messages')
+        .insert([payload])
+        .select('id');
+      if (insertError) {
+        console.error('[GroupChat] voice insert failed:', insertError);
+        alert(`Failed to send voice message: ${insertError.message}`);
+        return;
+      }
+      const insertedId =
+        Array.isArray(insertedRows) && insertedRows[0]?.id ? String(insertedRows[0].id) : undefined;
 
       const messageData = {
+        id: insertedId,
         groupId: id,
-        userId: user.id,
+        userId: senderId,
         group_id: id,
-        user_id: user.id,
+        user_id: senderId,
         username: profile?.username || user.email?.split('@')[0],
         text: 'Voice message',
         type: 'audio',
         audioUrl: publicUrl,
         audio_url: publicUrl,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       };
 
       socketRef.current.emit('send_group_message', messageData);
+      void fetchMessages();
     } catch (err) {
-      console.error("Error sending voice message:", err);
+      console.error('Error sending voice message:', err);
     }
   };
 
@@ -831,6 +896,12 @@ export default function GroupChatPage() {
 
       {/* Messages Area */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4 no-scrollbar">
+        {messagesQueryError && (
+          <div className="mb-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100">
+            <span className="font-bold">Could not load messages: </span>
+            {messagesQueryError}
+          </div>
+        )}
         {messages.length === 0 && (
           <div className="flex flex-col items-center justify-center py-8 text-center">
             <div className="w-16 h-16 bg-indigo-50 dark:bg-indigo-900/20 rounded-2xl flex items-center justify-center mb-4">
