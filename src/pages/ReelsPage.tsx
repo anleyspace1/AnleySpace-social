@@ -396,20 +396,6 @@ export default function ReelsPage() {
     videos[currentIndex] ||
     videos[0];
 
-  useEffect(() => {
-    if (!isTouchDevice || !videos.length) return;
-    const activeId = activeVideoId ? String(activeVideoId) : String(videos[0]?.id ?? '');
-    const activeIdx = videos.findIndex((v) => String(v.id) === activeId);
-
-    if (activeIdx >= 0 && activeIdx + 1 < videos.length) {
-      const nextId = String(videos[activeIdx + 1].id);
-      const nextEl = reelVideoElsRef.current[nextId];
-      if (nextEl) {
-        nextEl.preload = 'auto';
-      }
-    }
-  }, [activeVideoId, videos, isTouchDevice]);
-
   if (!reelsLoaded) {
     return (
       <div className="relative h-screen overflow-hidden bg-[#0A0A0A] flex items-center justify-center">
@@ -495,6 +481,7 @@ export default function ReelsPage() {
             'lg:transition-all lg:duration-500 lg:ease-in-out lg:touch-auto',
             isCommentsOpen ? 'lg:mr-0' : ''
           )}
+          style={isTouchDevice ? { height: '100vh', overflowY: 'scroll', scrollSnapType: 'y mandatory' } : undefined}
           ref={feedRef}
           onClick={() => {
             if (!hasUserInteracted) setHasUserInteracted(true);
@@ -518,6 +505,7 @@ export default function ReelsPage() {
                 'max-lg:h-[100dvh] max-lg:min-h-[100dvh] max-lg:max-h-[100dvh] max-lg:[scroll-snap-stop:always]',
                 'lg:h-full'
               )}
+              style={isTouchDevice ? { height: '100vh', scrollSnapAlign: 'start' } : undefined}
             >
               <VideoPost
                 video={video}
@@ -1179,6 +1167,7 @@ function VideoPost({
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
   const [isStoryEditorOpen, setIsStoryEditorOpen] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const [isMuted, setIsMuted] = useState(true);
 
   const REEL_GIFTS = [
     { id: 'g1', icon: '🎁', price: 500 },
@@ -1379,28 +1368,34 @@ function VideoPost({
   }, [isPlaying]);
 
   const handleVideoSurfaceTap = useCallback(() => {
+    const el = videoRef.current;
+    if (!el) return;
+
     if (isTouchDevice) {
-      if (!hasUserInteracted) {
-        onUserInteract();
-      }
-      const el = videoRef.current;
-      if (el) {
-        el.muted = false;
+      if (el.paused) {
         void el.play().then(() => setIsPlaying(true)).catch(() => {});
+      } else {
+        el.pause();
+        setIsPlaying(false);
       }
       return;
     }
+
     if (!hasUserInteracted) {
       onUserInteract();
-      const el = videoRef.current;
-      if (el) {
-        el.muted = false;
-        void el.play().then(() => setIsPlaying(true)).catch(() => {});
-      }
+      el.muted = false;
+      setIsMuted(false);
+      void el.play().then(() => setIsPlaying(true)).catch(() => {});
       return;
     }
     void togglePlay();
   }, [hasUserInteracted, onUserInteract, togglePlay, isTouchDevice]);
+
+  useEffect(() => {
+    if (videoRef.current) {
+      videoRef.current.muted = isMuted;
+    }
+  }, [isMuted]);
 
   useEffect(() => {
     const observer = new IntersectionObserver(
@@ -1434,7 +1429,7 @@ function VideoPost({
           }
         });
       },
-      { threshold: 0.75 }
+      { threshold: 0.8 }
     );
 
     if (videoRef.current) observer.observe(videoRef.current);
@@ -1447,6 +1442,7 @@ function VideoPost({
       <video
         src={(video as any).videoUrl || video.url}
         className="absolute inset-0 h-full w-full object-cover blur-[20px] scale-[1.2] z-0 [will-change:transform]"
+        poster={(video as any).thumbnail || `${(video as any).videoUrl || video.url}#t=0.1`}
         muted
         autoPlay
         loop
@@ -1463,6 +1459,7 @@ function VideoPost({
           onVideoElementRef(String(video.id), el);
         }}
         src={(video as any).videoUrl || video.url}
+        poster={(video as any).thumbnail || `${(video as any).videoUrl || video.url}#t=0.1`}
         className="relative z-[1] h-full w-full object-contain [will-change:transform]"
         controls={!isTouchDevice}
         loop
@@ -1471,7 +1468,37 @@ function VideoPost({
         playsInline
         preload="metadata"
         onClick={handleVideoSurfaceTap}
+        style={
+          isTouchDevice
+            ? {
+                width: '100%',
+                height: '100%',
+                objectFit: 'cover',
+                backgroundColor: '#000',
+              }
+            : undefined
+        }
       />
+
+      {isTouchDevice && (
+        <div
+          onClick={(e) => {
+            e.stopPropagation();
+            setIsMuted((prev) => !prev);
+          }}
+          style={{
+            position: 'absolute',
+            bottom: '80px',
+            right: '16px',
+            zIndex: 20,
+            background: 'rgba(0,0,0,0.4)',
+            borderRadius: '50%',
+            padding: '8px',
+          }}
+        >
+          {isMuted ? '🔇' : '🔊'}
+        </div>
+      )}
 
       {!hasUserInteracted && !isTouchDevice && (
         <button

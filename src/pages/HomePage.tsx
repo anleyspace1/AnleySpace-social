@@ -1713,6 +1713,7 @@ function PostItem({
   // Video player ref for intersection observer
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [isTouchDevice, setIsTouchDevice] = useState(false);
+  const [isMuted, setIsMuted] = useState(true);
 
   /** Prevent overlapping like/comment API calls (avoids aborted requests / race on server). */
   const likeRequestInFlightRef = useRef(false);
@@ -1756,6 +1757,12 @@ function PostItem({
     mq.addEventListener('change', sync);
     return () => mq.removeEventListener('change', sync);
   }, []);
+
+  useEffect(() => {
+    if (videoRef.current) {
+      videoRef.current.muted = isMuted;
+    }
+  }, [isMuted]);
 
   const postUser = {
     name: displayUsername,
@@ -1819,7 +1826,7 @@ function PostItem({
     };
 
     const observer = new window.IntersectionObserver(handler, {
-      threshold: 0.65,
+      threshold: 0.8,
     });
 
     observer.observe(node);
@@ -2466,15 +2473,44 @@ function PostItem({
                 <video
                   ref={videoRef}
                   src={videoUrl}
+                  poster={imageUrl || `${videoUrl}#t=0.1`}
                   controls={!isTouchDevice}
                   autoPlay
-                  muted
+                  defaultMuted
                   loop
                   playsInline
                   preload="metadata"
                   className="w-full h-auto object-contain max-h-[500px] pointer-events-none md:pointer-fine:pointer-events-auto [will-change:transform]"
-                  style={{ cursor: 'pointer' }}
+                  style={
+                    isTouchDevice
+                      ? {
+                          width: '100%',
+                          height: '100%',
+                          objectFit: 'cover',
+                          backgroundColor: '#000',
+                        }
+                      : { cursor: 'pointer' }
+                  }
                 />
+                {isTouchDevice && (
+                  <div
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setIsMuted((prev) => !prev);
+                    }}
+                    style={{
+                      position: 'absolute',
+                      bottom: '80px',
+                      right: '16px',
+                      zIndex: 20,
+                      background: 'rgba(0,0,0,0.4)',
+                      borderRadius: '50%',
+                      padding: '8px',
+                    }}
+                  >
+                    {isMuted ? '🔇' : '🔊'}
+                  </div>
+                )}
                 <HeartOverlay show={showHeart} />
               </div>
             </div>
