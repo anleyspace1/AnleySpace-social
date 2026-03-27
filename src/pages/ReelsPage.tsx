@@ -76,8 +76,18 @@ export default function ReelsPage() {
   const [activeNav, setActiveNav] = useState<string>('for-you');
   const [reelsLoaded, setReelsLoaded] = useState(false);
   const [hasUserInteracted, setHasUserInteracted] = useState(false);
+  const [isTouchDevice, setIsTouchDevice] = useState(false);
   const feedRef = useRef<HTMLDivElement | null>(null);
   const videoRefs = useRef<(HTMLDivElement | null)[]>([]);
+  const reelVideoElsRef = useRef<Record<string, HTMLVideoElement | null>>({});
+
+  useEffect(() => {
+    const mq = window.matchMedia('(pointer: coarse)');
+    const sync = () => setIsTouchDevice(!!mq.matches);
+    sync();
+    mq.addEventListener('change', sync);
+    return () => mq.removeEventListener('change', sync);
+  }, []);
 
   // If navigated from Home with a selected video, prioritize it once the feed loads
   // (do not replace the feed with a single video).
@@ -386,6 +396,20 @@ export default function ReelsPage() {
     videos[currentIndex] ||
     videos[0];
 
+  useEffect(() => {
+    if (!isTouchDevice || !videos.length) return;
+    const activeId = activeVideoId ? String(activeVideoId) : String(videos[0]?.id ?? '');
+    const activeIdx = videos.findIndex((v) => String(v.id) === activeId);
+
+    if (activeIdx >= 0 && activeIdx + 1 < videos.length) {
+      const nextId = String(videos[activeIdx + 1].id);
+      const nextEl = reelVideoElsRef.current[nextId];
+      if (nextEl) {
+        nextEl.preload = 'auto';
+      }
+    }
+  }, [activeVideoId, videos, isTouchDevice]);
+
   if (!reelsLoaded) {
     return (
       <div className="relative h-screen overflow-hidden bg-[#0A0A0A] flex items-center justify-center">
@@ -498,7 +522,11 @@ export default function ReelsPage() {
               <VideoPost
                 video={video}
                 hasUserInteracted={hasUserInteracted}
+                isTouchDevice={isTouchDevice}
                 onUserInteract={() => setHasUserInteracted(true)}
+                onVideoElementRef={(videoId, el) => {
+                  reelVideoElsRef.current[String(videoId)] = el;
+                }}
                 onToggleComments={() => setIsCommentsOpen(!isCommentsOpen)}
                 onActive={() => setActiveVideoId(String(video.id))}
                 onCountsChange={updateVideoCounts}
@@ -1118,7 +1146,9 @@ function SoundSelector({ onClose, onSelect, selectedSoundId }: { onClose: () => 
 function VideoPost({
   video,
   hasUserInteracted,
+  isTouchDevice,
   onUserInteract,
+  onVideoElementRef,
   onToggleComments,
   onActive,
   onUseSound,
@@ -1127,7 +1157,9 @@ function VideoPost({
 }: {
   video: any;
   hasUserInteracted: boolean;
+  isTouchDevice: boolean;
   onUserInteract: () => void;
+  onVideoElementRef: (videoId: string, el: HTMLVideoElement | null) => void;
   onToggleComments: () => void;
   onActive: () => void;
   onUseSound: (sound: any) => void;
@@ -1159,9 +1191,13 @@ function VideoPost({
 
   const handleLike = async () => {
     const reelId = video?.id != null ? String(video.id) : null;
-    const userId = user?.id || MOCK_USER.id;
+    if (!user?.id) {
+      console.error('User not authenticated');
+      return;
+    }
+    const userId = user.id;
     if (!reelId) {
-      console.log('[ReelsPage] like: missing reelId', { reelId, video });
+      console.error('[LikeError]', { message: 'Missing post_id', postId: reelId, userId });
       return;
     }
     const previous = isLiked;
@@ -1200,6 +1236,7 @@ function VideoPost({
         onCountsChange(reelId, { liked: data.liked });
       }
     } catch (err) {
+      console.error('[LikeError]', err);
       console.error('[ReelsPage] like API failed, trying supabase fallback:', err);
       try {
         if (nextLiked) {
@@ -1241,6 +1278,7 @@ function VideoPost({
           /* non-fatal */
         }
       } catch (fallbackErr) {
+        console.error('[LikeError]', fallbackErr);
         console.error('[ReelsPage] like supabase fallback failed:', fallbackErr);
         setIsLiked(previous);
         onCountsChange(reelId, { likes: prevLikesCount, liked: previous });
@@ -1258,10 +1296,10 @@ function VideoPost({
       }
     }
 
-    // Reliable UI sync on Vercel even if realtime is delayed.
-    setTimeout(() => {
-      if (reelId) onRefreshPostCounts(reelId);
-    }, 500);
+    // Deterministic sync with persisted counts.
+    if (reelId) {
+      await onRefreshPostCounts(reelId);
+    }
 
     const newHearts = Array.from({ length: 5 }).map((_, i) => ({
       id: Date.now() + i,
@@ -1341,6 +1379,17 @@ function VideoPost({
   }, [isPlaying]);
 
   const handleVideoSurfaceTap = useCallback(() => {
+    if (isTouchDevice) {
+      if (!hasUserInteracted) {
+        onUserInteract();
+      }
+      const el = videoRef.current;
+      if (el) {
+        el.muted = false;
+        void el.play().then(() => setIsPlaying(true)).catch(() => {});
+      }
+      return;
+    }
     if (!hasUserInteracted) {
       onUserInteract();
       const el = videoRef.current;
@@ -1351,7 +1400,7 @@ function VideoPost({
       return;
     }
     void togglePlay();
-  }, [hasUserInteracted, onUserInteract, togglePlay]);
+  }, [hasUserInteracted, onUserInteract, togglePlay, isTouchDevice]);
 
   useEffect(() => {
     const observer = new IntersectionObserver(
@@ -1373,7 +1422,6 @@ function VideoPost({
               .catch(() => {});
             try {
               if (videoRef.current) {
-                videoRef.current.muted = !hasUserInteracted;
                 await videoRef.current.play();
                 setIsPlaying(true);
               }
@@ -1386,7 +1434,7 @@ function VideoPost({
           }
         });
       },
-      { threshold: 0.5 }
+      { threshold: 0.75 }
     );
 
     if (videoRef.current) observer.observe(videoRef.current);
@@ -1398,7 +1446,7 @@ function VideoPost({
       {/* Blurred background using the same video */}
       <video
         src={(video as any).videoUrl || video.url}
-        className="absolute inset-0 h-full w-full object-cover blur-[20px] scale-[1.2] z-0"
+        className="absolute inset-0 h-full w-full object-cover blur-[20px] scale-[1.2] z-0 [will-change:transform]"
         muted
         autoPlay
         loop
@@ -1410,18 +1458,22 @@ function VideoPost({
       {/* Video Player */}
       <video
         key={video.id}
-        ref={videoRef}
+        ref={(el) => {
+          videoRef.current = el;
+          onVideoElementRef(String(video.id), el);
+        }}
         src={(video as any).videoUrl || video.url}
-        className="relative z-[1] h-full w-full object-contain"
-        controls
+        className="relative z-[1] h-full w-full object-contain [will-change:transform]"
+        controls={!isTouchDevice}
         loop
-        muted={!hasUserInteracted}
+        defaultMuted
         autoPlay
         playsInline
+        preload="metadata"
         onClick={handleVideoSurfaceTap}
       />
 
-      {!hasUserInteracted && (
+      {!hasUserInteracted && !isTouchDevice && (
         <button
           type="button"
           className="absolute left-1/2 top-1/2 z-[12] -translate-x-1/2 -translate-y-1/2 rounded-full bg-black/45 px-3 py-2 text-[12px] font-bold text-white shadow-sm backdrop-blur-md touch-manipulation"
@@ -1790,12 +1842,19 @@ function CommentsSection({
   const handleAddComment = async (e: React.FormEvent) => {
     e.preventDefault();
     const postId = video?.id != null ? String(video.id) : null;
-    const userId = user?.id || MOCK_USER.id;
-    if (!postId) {
-      console.error('[ReelsPage] comment: missing postId', { postId, video });
+    if (!user?.id) {
+      console.error('User not authenticated');
       return;
     }
-    if (!newComment.trim()) return;
+    const userId = user.id;
+    if (!postId) {
+      console.error('[CommentError]', { message: 'Missing post_id', postId, userId });
+      return;
+    }
+    if (!newComment.trim()) {
+      console.error('[CommentError]', { message: 'Comment content is empty', postId, userId });
+      return;
+    }
     const text = newComment.trim();
     console.log('[ReelsPage] comment submit', { postId, userId, text });
     setNewComment('');
@@ -1811,12 +1870,12 @@ function CommentsSection({
       });
       let inserted: any = null;
       if (commentRes.ok) {
-        const payload = await commentRes.json().catch(() => null);
+        const payload = await commentRes.json().catch(() => ({}));
         inserted = payload?.comment ?? null;
       }
 
       // Fallback: direct supabase insert + non-fatal notifications (same pattern as Home).
-      if (!inserted) {
+      if (!inserted && !commentRes.ok) {
         const { data: ins, error } = await supabase
           .from('comments')
           .insert({
@@ -1843,6 +1902,14 @@ function CommentsSection({
         } catch {
           /* non-fatal */
         }
+      }
+      if (!inserted) {
+        inserted = {
+          id: `temp-${Date.now()}`,
+          user_id: userId,
+          content: text,
+          created_at: new Date().toISOString(),
+        };
       }
 
       // Optimistic UI append so the new comment shows immediately.
@@ -1899,11 +1966,12 @@ function CommentsSection({
       if (!countErr && typeof count === 'number') {
         onCountsChange(postId, { comments: count });
       }
-      // Reliable UI sync on Vercel even if realtime is delayed.
-      setTimeout(() => {
-        if (postId) onRefreshPostCounts(postId);
-      }, 500);
+      // Deterministic sync with persisted counts.
+      if (postId) {
+        await onRefreshPostCounts(postId);
+      }
     } catch (err) {
+      console.error('[CommentError]', err);
       console.error('Failed to add reel(post) comment:', err);
       setNewComment(text);
     }

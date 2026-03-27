@@ -56,6 +56,7 @@ const resolveProfileUsername = (username?: string | null) => {
 };
 
 const reelCache = new Map<string, string>();
+let isStoryUploadSupabaseLocked = false;
 
 const normalizeReelUrl = (url: string) => {
   try {
@@ -208,6 +209,7 @@ export default function HomePage() {
 function Stories() {
   const [seenUsers, setSeenUsers] = useState<string[]>([]);
   const [storyUploading, setStoryUploading] = useState(false);
+  const [isUploadingStory, setIsUploadingStory] = useState(false);
   const [realStories, setRealStories] = useState<any[]>([]);
   const [avatarStoriesMap, setAvatarStoriesMap] = useState<Record<string, any[]>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -247,11 +249,13 @@ function Stories() {
 
   // Fetch stories + stories per user
   useEffect(() => {
+    if (isUploadingStory) return;
     fetchStories();
     fetchActiveStoriesMap().then((map) => setAvatarStoriesMap(map));
-  }, []);
+  }, [isUploadingStory]);
 
   const fetchStories = async () => {
+    if (isUploadingStory) return;
     try {
       const data = await fetchActiveStories();
       setRealStories(data);
@@ -399,6 +403,13 @@ function Stories() {
       alert('You must be logged in');
       return;
     }
+    if (!file) {
+      throw new Error('No file selected for story upload.');
+    }
+    if (!file.type.startsWith('image/') && !file.type.startsWith('video/')) {
+      throw new Error('Invalid story file type. Please choose an image or video.');
+    }
+    console.log('[StoryUpload] file:', file);
 
     const username =
       (user as { username?: string }).username ||
@@ -415,61 +426,64 @@ function Stories() {
       user.user_metadata?.avatar_url ||
       '';
 
-    const formData = new FormData();
-    formData.append('file', file, file.name);
-    formData.append('userId', user.id);
-    formData.append('user_id', user.id);
-    formData.append('username', username);
-    formData.append('avatar', avatar);
-
-    const res = await fetch(apiUrl('/api/stories'), {
-      method: 'POST',
-      body: formData,
-    });
-
-    const text = await res.text();
-    let payload:
-      | {
-          ok?: boolean;
-          error?: string;
-          id?: string;
-          user_id?: string;
-          media_url?: string;
-          media_type?: string;
-          created_at?: string;
-        }
-      | undefined;
     try {
-      payload = text ? JSON.parse(text) : undefined;
-    } catch {
-      console.error('UPLOAD: non-JSON response body:', text.slice(0, 500));
-      throw new Error('Invalid server response');
-    }
+      const ext = file.name.includes('.')
+        ? file.name.split('.').pop()
+        : file.type.startsWith('video/')
+          ? 'mp4'
+          : 'jpg';
+      const safeName = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
+      const filePath = `stories/${user.id}/${safeName}`;
 
-    if (!res.ok || payload?.ok === false) {
-      throw new Error(payload?.error || 'Upload failed');
-    }
+      // Reuse the same upload flow used by working post upload.
+      const { error: uploadError } = await supabase.storage.from('posts').upload(filePath, file);
+      if (uploadError) {
+        if (uploadError.message.includes('Bucket not found')) {
+          throw new Error('Storage bucket "posts" not found. Create a public "posts" bucket in Supabase.');
+        }
+        throw uploadError;
+      }
 
-    if (payload?.id && payload?.media_url) {
+      const { data: { publicUrl } } = supabase.storage.from('posts').getPublicUrl(filePath);
+      const mediaType = file.type.startsWith('video/') ? 'video' : 'image';
       const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-      const optimistic = {
-        id: payload.id,
-        user_id: user.id,
-        username,
-        avatar,
-        image_url: payload.media_url,
-        media_url: payload.media_url,
-        media_type:
-          payload.media_type ||
-          (file.type.startsWith('video') ? 'video' : 'image'),
-        created_at: payload.created_at || new Date().toISOString(),
-        expires_at: expiresAt,
-        user: username,
-      };
-      setRealStories((prev) => {
-        const rest = prev.filter((s) => s.id !== optimistic.id);
-        return [optimistic, ...rest];
-      });
+
+      const { data: insertedStory, error: insertError } = await supabase
+        .from('stories')
+        .insert({
+          user_id: user.id,
+          username,
+          avatar,
+          media_url: publicUrl,
+          image_url: publicUrl,
+          media_type: mediaType,
+          expires_at: expiresAt,
+        })
+        .select('id, user_id, media_url, media_type, created_at, expires_at, username, avatar')
+        .single();
+      if (insertError) throw insertError;
+
+      if (insertedStory?.id && insertedStory?.media_url) {
+        const optimistic = {
+          id: insertedStory.id,
+          user_id: insertedStory.user_id || user.id,
+          username: insertedStory.username || username,
+          avatar: insertedStory.avatar || avatar,
+          image_url: insertedStory.media_url,
+          media_url: insertedStory.media_url,
+          media_type: insertedStory.media_type || mediaType,
+          created_at: insertedStory.created_at || new Date().toISOString(),
+          expires_at: insertedStory.expires_at || expiresAt,
+          user: insertedStory.username || username,
+        };
+        setRealStories((prev) => {
+          const rest = prev.filter((s) => s.id !== optimistic.id);
+          return [optimistic, ...rest];
+        });
+      }
+    } catch (error) {
+      console.error('[StoryUpload] upload failed:', error);
+      throw error;
     }
 
     await new Promise((resolve) => setTimeout(resolve, 4000));
@@ -501,6 +515,9 @@ function Stories() {
 
   const confirmStoryPost = async () => {
     if (!previewFile || !user?.id) return;
+    if (isUploadingStory) return;
+    setIsUploadingStory(true);
+    isStoryUploadSupabaseLocked = true;
     setStoryUploading(true);
     try {
       await uploadStoryFile(previewFile);
@@ -510,6 +527,8 @@ function Stories() {
       alert(err instanceof Error ? err.message : 'Failed to upload story. Please try again.');
     } finally {
       setStoryUploading(false);
+      setIsUploadingStory(false);
+      isStoryUploadSupabaseLocked = false;
     }
   };
 
@@ -1693,6 +1712,7 @@ function PostItem({
 
   // Video player ref for intersection observer
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [isTouchDevice, setIsTouchDevice] = useState(false);
 
   /** Prevent overlapping like/comment API calls (avoids aborted requests / race on server). */
   const likeRequestInFlightRef = useRef(false);
@@ -1728,6 +1748,14 @@ function PostItem({
   useEffect(() => {
     setFeedImageMode(null);
   }, [imageUrl]);
+
+  useEffect(() => {
+    const mq = window.matchMedia('(pointer: coarse)');
+    const sync = () => setIsTouchDevice(!!mq.matches);
+    sync();
+    mq.addEventListener('change', sync);
+    return () => mq.removeEventListener('change', sync);
+  }, []);
 
   const postUser = {
     name: displayUsername,
@@ -1868,6 +1896,7 @@ function PostItem({
   };
 
   const checkIfSaved = async () => {
+    if (isStoryUploadSupabaseLocked) return;
     const { data: authData, error: authErr } = await supabase.auth.getUser();
     const userId = authData?.user?.id;
     if (authErr) {
@@ -1940,7 +1969,11 @@ function PostItem({
 
   const handleLike = async () => {
     if (!user) {
-      alert('Please login to like posts');
+      console.error('User not authenticated');
+      return;
+    }
+    if (!post?.id) {
+      console.error('[LikeError]', { message: 'Missing post_id', postId: post?.id, userId: user?.id });
       return;
     }
     if (likeRequestInFlightRef.current) {
@@ -1963,41 +1996,44 @@ function PostItem({
         body: likePayload,
       });
       if (apiRes.ok) {
-        const data = await apiRes.json();
+        const data = await apiRes.json().catch(() => ({}));
         // Server may return only { success: true }; keep optimistic isLiked/likesCount unless server sends fields.
         if (typeof data.liked === 'boolean') setIsLiked(data.liked);
         if (typeof data.likesCount === 'number') setLikesCount(data.likesCount);
-        return;
-      }
-      // Fallback: direct Supabase (e.g. server without service role / feed routes unavailable)
-      if (wasLiked) {
-        const { error } = await supabase
-          .from('likes')
-          .delete()
-          .eq('post_id', post.id)
-          .eq('user_id', user.id);
-        if (error) throw error;
       } else {
-        const { error } = await supabase
-          .from('likes')
-          .insert({
-            post_id: post.id,
-            user_id: user.id,
-          });
-        if (error) throw error;
-        try {
-          const notifyRes = await fetch(apiUrl('/api/notifications/from-feed-like'), {
-            method: 'POST',
-            headers: jsonHeaders,
-            body: likePayload,
-          });
-          await notifyRes.text();
-        } catch {
-          /* non-fatal */
+        // Fallback: direct Supabase (e.g. server without service role / feed routes unavailable)
+        if (wasLiked) {
+          const { error } = await supabase
+            .from('likes')
+            .delete()
+            .eq('post_id', post.id)
+            .eq('user_id', user.id);
+          if (error) throw error;
+        } else {
+          const { error } = await supabase
+            .from('likes')
+            .insert({
+              post_id: post.id,
+              user_id: user.id,
+            });
+          if (error) throw error;
+          try {
+            const notifyRes = await fetch(apiUrl('/api/notifications/from-feed-like'), {
+              method: 'POST',
+              headers: jsonHeaders,
+              body: likePayload,
+            });
+            await notifyRes.text();
+          } catch {
+            /* non-fatal */
+          }
         }
       }
+
+      // Ensure UI remains synced with persisted DB state deterministically.
+      await fetchLikesCount();
     } catch (err) {
-      console.error('Error toggling like:', err);
+      console.error('[LikeError]', err);
       setIsLiked(wasLiked);
       setLikesCount((prev) => (wasLiked ? prev + 1 : prev - 1));
     } finally {
@@ -2010,10 +2046,17 @@ function PostItem({
   const handleAddComment = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!user) {
-      alert('Please login to comment');
+      console.error('User not authenticated');
       return;
     }
-    if (!newComment.trim()) return;
+    if (!post?.id) {
+      console.error('[CommentError]', { message: 'Missing post_id', postId: post?.id, userId: user?.id });
+      return;
+    }
+    if (!newComment.trim()) {
+      console.error('[CommentError]', { message: 'Comment content is empty', postId: post?.id, userId: user?.id });
+      return;
+    }
     if (commentRequestInFlightRef.current) {
       return;
     }
@@ -2038,10 +2081,10 @@ function PostItem({
       });
       let data: { id: string; user_id: string; content: string; created_at?: string } | null = null;
       if (apiRes.ok) {
-        const payload = await apiRes.json();
+        const payload = await apiRes.json().catch(() => ({}));
         data = payload?.comment ?? null;
       }
-      if (!data) {
+      if (!data && !apiRes.ok) {
         const { data: ins, error } = await supabase
           .from('comments')
           .insert({
@@ -2070,6 +2113,14 @@ function PostItem({
           /* non-fatal */
         }
       }
+      if (!data) {
+        data = {
+          id: `temp-${Date.now()}`,
+          user_id: user.id,
+          content: commentText,
+          created_at: new Date().toISOString(),
+        };
+      }
 
       const newCommentObj = {
         id: data.id,
@@ -2081,8 +2132,10 @@ function PostItem({
 
       setComments([...comments, newCommentObj]);
       setCommentsCount((prev) => prev + 1);
+      await fetchComments();
+      await fetchCommentsCount();
     } catch (err) {
-      console.error('Error adding comment:', err);
+      console.error('[CommentError]', err);
       setNewComment(commentText);
       alert('Failed to add comment');
     } finally {
@@ -2413,11 +2466,13 @@ function PostItem({
                 <video
                   ref={videoRef}
                   src={videoUrl}
-                  controls
+                  controls={!isTouchDevice}
+                  autoPlay
                   muted
                   loop
                   playsInline
-                  className="w-full h-auto object-contain max-h-[500px] pointer-events-none md:pointer-fine:pointer-events-auto"
+                  preload="metadata"
+                  className="w-full h-auto object-contain max-h-[500px] pointer-events-none md:pointer-fine:pointer-events-auto [will-change:transform]"
                   style={{ cursor: 'pointer' }}
                 />
                 <HeartOverlay show={showHeart} />
