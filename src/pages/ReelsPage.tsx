@@ -69,7 +69,7 @@ export default function ReelsPage() {
 
   const [videos, setVideos] = useState<any[]>([]);
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
-  const [isCommentsOpen, setIsCommentsOpen] = useState(true); // Default open on tablet
+  const [isCommentsOpen, setIsCommentsOpen] = useState(false);
   const [activeVideoId, setActiveVideoId] = useState<string | null>(null);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [preselectedSound, setPreselectedSound] = useState<any>(null);
@@ -77,9 +77,6 @@ export default function ReelsPage() {
   const [reelsLoaded, setReelsLoaded] = useState(false);
   const feedRef = useRef<HTMLDivElement | null>(null);
   const videoRefs = useRef<(HTMLDivElement | null)[]>([]);
-  const touchStartYRef = useRef<number | null>(null);
-  const touchStartXRef = useRef<number | null>(null);
-  const suppressSwipeRef = useRef(false);
 
   // If navigated from Home with a selected video, prioritize it once the feed loads
   // (do not replace the feed with a single video).
@@ -300,7 +297,9 @@ export default function ReelsPage() {
     if (!activeVideoId || !feedRef.current || videos.length <= 1) return;
     const target = feedRef.current.querySelector(`[data-reel-id="${activeVideoId}"]`) as HTMLElement | null;
     if (target) {
-      target.scrollIntoView({ block: 'start', behavior: 'smooth' });
+      const instantSnap =
+        typeof window !== 'undefined' && window.matchMedia('(max-width: 1023px)').matches;
+      target.scrollIntoView({ block: 'start', behavior: instantSnap ? 'auto' : 'smooth' });
     }
   }, [activeVideoId, videos.length]);
 
@@ -312,9 +311,11 @@ export default function ReelsPage() {
     if (index === -1) return;
     const el = videoRefs.current[index];
     if (!el) return;
+    const instantSnap =
+      typeof window !== 'undefined' && window.matchMedia('(max-width: 1023px)').matches;
     const raf = requestAnimationFrame(() => {
       requestAnimationFrame(() => {
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        el.scrollIntoView({ behavior: instantSnap ? 'auto' : 'smooth', block: 'center' });
       });
     });
     return () => cancelAnimationFrame(raf);
@@ -371,71 +372,6 @@ export default function ReelsPage() {
     }
   }, [user?.id]);
 
-  const goToIndex = (idx: number) => {
-    if (!videos.length) return;
-    const safe = Math.max(0, Math.min(idx, videos.length - 1));
-    const v = videos[safe];
-    if (v) setActiveVideoId(String(v.id));
-    setCurrentIndex(safe);
-  };
-
-  const nextVideo = () => {
-    if (!videos.length) return;
-    if (currentIndex >= videos.length - 1) return;
-    goToIndex(currentIndex + 1);
-  };
-
-  const prevVideo = () => {
-    if (!videos.length) return;
-    if (currentIndex <= 0) return;
-    goToIndex(currentIndex - 1);
-  };
-
-  const handleTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
-    if (videos.length <= 1) return;
-    // If the user is interacting with UI controls (like/comment/gift) or the comments panel
-    // is open, don't treat the gesture as a reel swipe.
-    const target = e.target as HTMLElement | null;
-    const interactiveEl = target?.closest?.('button, input, textarea, form, a, [role="button"]');
-    // Only suppress swipe when the touch started on an interactive control,
-    // so swiping still works (and comments update per-reel).
-    suppressSwipeRef.current = !!interactiveEl;
-    const t = e.touches[0];
-    touchStartYRef.current = t.clientY;
-    touchStartXRef.current = t.clientX;
-  };
-
-  const handleTouchEnd = (e: React.TouchEvent<HTMLDivElement>) => {
-    if (videos.length <= 1) return;
-    if (suppressSwipeRef.current) {
-      touchStartYRef.current = null;
-      touchStartXRef.current = null;
-      suppressSwipeRef.current = false;
-      return;
-    }
-    const startY = touchStartYRef.current;
-    const startX = touchStartXRef.current;
-    if (startY == null || startX == null) return;
-
-    const t = e.changedTouches[0];
-    const dx = t.clientX - startX;
-    const dy = t.clientY - startY;
-
-    // Ignore mostly-horizontal gestures and tiny swipes.
-    const absDx = Math.abs(dx);
-    const absDy = Math.abs(dy);
-    const threshold = 45;
-    if (absDy < threshold || absDy < absDx) return;
-
-    // Swipe up => next, swipe down => previous.
-    if (dy < 0) nextVideo();
-    else prevVideo();
-
-    touchStartYRef.current = null;
-    touchStartXRef.current = null;
-    suppressSwipeRef.current = false;
-  };
-
   const handleUpload = (newVideo: any) => {
     setVideos([newVideo, ...videos]);
     setActiveVideoId(String(newVideo.id));
@@ -469,7 +405,7 @@ export default function ReelsPage() {
   }
 
   return (
-    <div className="relative h-screen overflow-hidden bg-[#0A0A0A] flex flex-col font-sans">
+    <div className="relative flex h-full min-h-0 flex-col bg-[#0A0A0A] font-sans lg:h-screen lg:overflow-hidden">
       {/* Top Navigation Bar */}
       <div className="absolute top-0 left-0 right-0 h-14 sm:h-16 flex items-center justify-between px-4 sm:px-6 z-[100] bg-gradient-to-b from-black/80 to-transparent">
         <div className="w-20" /> {/* Spacer for symmetry */}
@@ -524,17 +460,17 @@ export default function ReelsPage() {
         </div>
       </div>
 
-      {/* Main Content Area */}
-      <div className="flex-1 flex overflow-hidden">
-        {/* Reels Feed */}
+      {/* Main Content Area — on mobile, do not clip overflow so the feed is the sole scroll/snap port */}
+      <div className="flex min-h-0 flex-1 max-lg:overflow-visible lg:overflow-hidden">
+        {/* Reels Feed — sole scroll container on mobile */}
         <div
           className={cn(
-            "relative flex-1 transition-all duration-500 ease-in-out h-full overflow-y-scroll snap-y snap-mandatory no-scrollbar",
-            isCommentsOpen ? "lg:mr-0" : ""
+            'relative min-h-0 w-full flex-1 snap-y snap-mandatory overflow-y-scroll no-scrollbar',
+            'max-lg:h-full max-lg:overscroll-y-contain max-lg:[-webkit-overflow-scrolling:touch] max-lg:touch-pan-y',
+            'lg:transition-all lg:duration-500 lg:ease-in-out lg:touch-auto',
+            isCommentsOpen ? 'lg:mr-0' : ''
           )}
           ref={feedRef}
-          onTouchStart={handleTouchStart}
-          onTouchEnd={handleTouchEnd}
         >
           {videos.map((video, index) => (
             <div
@@ -543,7 +479,11 @@ export default function ReelsPage() {
                 videoRefs.current[index] = el;
               }}
               data-reel-id={video.id}
-              className="h-full w-full snap-start relative"
+              className={cn(
+                'relative box-border w-full shrink-0 snap-start p-0 m-0',
+                'max-lg:h-[100dvh] max-lg:min-h-[100dvh] max-lg:max-h-[100dvh] max-lg:[scroll-snap-stop:always]',
+                'lg:h-full'
+              )}
             >
               <VideoPost
                 video={video}

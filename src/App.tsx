@@ -402,9 +402,11 @@ function AppContent() {
     <div
       className={cn(
         'min-h-screen font-sans overflow-x-hidden',
-        isHome
-          ? 'bg-[#F5F6FA] text-gray-900 flex flex-col min-h-[100dvh] h-[100dvh] overflow-hidden'
-          : 'bg-gradient-to-br from-[#0f172a] via-[#1e1b4b] to-[#312e81] text-white'
+        isReels || isCreateReel
+          ? 'flex h-[100dvh] max-h-[100dvh] flex-col overflow-hidden bg-black text-white'
+          : isHome
+            ? 'bg-[#F5F6FA] text-gray-900 flex flex-col min-h-[100dvh] h-[100dvh] overflow-hidden'
+            : 'bg-gradient-to-br from-[#0f172a] via-[#1e1b4b] to-[#312e81] text-white'
       )}
     >
       <CallManager />
@@ -414,11 +416,13 @@ function AppContent() {
         className={cn(
           'mx-auto flex',
           isReels || isCreateReel
-            ? 'max-w-none p-0'
+            ? 'max-w-none min-h-0 w-full flex-1 flex-col p-0'
             : 'max-w-[1600px] pt-14 sm:pt-16 px-0 lg:px-6 pb-[72px] lg:pb-0',
           isHome
             ? 'flex-1 min-h-0 w-full gap-0 items-stretch overflow-hidden'
-            : 'gap-6'
+            : !isReels && !isCreateReel
+              ? 'gap-6'
+              : ''
         )}
       >
           {!isReels && !isCreateReel && (
@@ -442,7 +446,7 @@ function AppContent() {
             className={cn(
               'flex-1 min-w-0',
               isReels || isCreateReel
-                ? 'p-0 min-h-[calc(100vh-56px)] sm:min-h-[calc(100vh-64px)]'
+                ? 'flex min-h-0 flex-1 flex-col overflow-hidden p-0'
                 : isHome
                   ? 'flex-1 min-h-0 h-full overflow-y-auto overflow-x-hidden home-feed-scroll bg-[#F5F6FA] px-3 sm:px-4 py-4 lg:py-6'
                   : 'min-h-[calc(100vh-56px)] sm:min-h-[calc(100vh-64px)] py-0 lg:py-6'
