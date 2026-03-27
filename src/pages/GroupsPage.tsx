@@ -5,8 +5,6 @@ import { cn } from '../lib/utils';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { MOCK_USER } from '../constants';
-import { apiUrl } from '../lib/apiOrigin';
-import { getBearerAuthHeaders } from '../lib/supabaseAuthHeaders';
 import { supabase } from '../lib/supabase';
 
 /** Prefer JWT user id from Supabase Auth so group_members.user_id matches RLS and .eq('user_id', ...) filters. */
@@ -47,7 +45,11 @@ function resolveGroupUuid(group: any): string | null {
   return null;
 }
 
-/** Persist group + admin membership in Supabase from the client (JWT satisfies RLS). Complements POST /api/groups. */
+/**
+ * Persist group + admin membership in Supabase from the client.
+ * RLS requires `auth.uid() = creator_id` — creator_id MUST match the JWT user id (see migration).
+ * Production (Vercel): ensure session is loaded/refreshed so the anon client sends Authorization.
+ */
 async function insertGroupAndMembershipInSupabase(opts: {
   id: string;
   name: string;
@@ -55,11 +57,32 @@ async function insertGroupAndMembershipInSupabase(opts: {
   image: string;
   type: string;
   userId: string;
-}): Promise<void> {
-  const uid = String(opts.userId ?? '').trim();
-  if (!uid) {
-    console.error('[GroupsPage] insertGroupAndMembershipInSupabase: refused — empty userId (would store NULL user_id)');
-    return;
+}): Promise<{ error: string | null }> {
+  const uidFromCaller = String(opts.userId ?? '').trim();
+  if (!uidFromCaller) {
+    console.error('[GroupsPage] insertGroupAndMembershipInSupabase: refused — empty userId');
+    return { error: 'Missing user id for group insert.' };
+  }
+
+  let {
+    data: { session },
+  } = await supabase.auth.getSession();
+  if (!session) {
+    const { data: refreshed, error: refErr } = await supabase.auth.refreshSession();
+    if (refErr) console.warn('[GroupsPage] refreshSession', refErr);
+    session = refreshed.session ?? null;
+  }
+  const creatorId = session?.user?.id ? String(session.user.id).trim() : '';
+  if (!creatorId) {
+    console.error('[GroupsPage] insertGroupAndMembershipInSupabase: no Supabase session — RLS insert will fail');
+    return {
+      error:
+        'Your session could not be verified with Supabase. Try signing out and back in, then create the group again.',
+    };
+  }
+  if (creatorId !== uidFromCaller) {
+    console.error('[GroupsPage] creator_id mismatch (session vs caller)', { creatorId, uidFromCaller });
+    return { error: 'Account session mismatch. Please sign in again.' };
   }
 
   const rowCore = {
@@ -68,27 +91,38 @@ async function insertGroupAndMembershipInSupabase(opts: {
     description: opts.description ?? '',
     image: opts.image,
     type: opts.type,
-    creator_id: uid,
+    creator_id: creatorId,
   };
 
-  let { error: gErr } = await supabase.from('groups').insert({ ...rowCore, user_id: uid });
+  // Prefer insert without optional `user_id` so WITH CHECK (auth.uid() = creator_id) is the only gate.
+  let { error: gErr } = await supabase.from('groups').insert(rowCore);
   if (gErr) {
     const msg = String(gErr.message || '');
-    if (/user_id|42703|does not exist|schema cache/i.test(msg)) {
-      ({ error: gErr } = await supabase.from('groups').insert(rowCore));
+    const isSchemaUserId =
+      /user_id|42703|does not exist|schema cache|column/i.test(msg) && /user_id/i.test(msg);
+    if (isSchemaUserId) {
+      ({ error: gErr } = await supabase.from('groups').insert({ ...rowCore, user_id: creatorId }));
     }
   }
   const gCode = (gErr as { code?: string } | undefined)?.code;
   if (gErr && gCode === '23505') {
     const { error: upErr } = await supabase.from('groups').upsert(rowCore, { onConflict: 'id' });
     if (upErr) console.error('[GroupsPage] groups upsert (after duplicate):', upErr);
+    if (upErr) {
+      return { error: upErr.message || 'Could not save group to Supabase.' };
+    }
   } else if (gErr) {
     console.error('[GroupsPage] groups insert:', gErr);
+    const rlsHint =
+      /row-level security|RLS|42501|policy/i.test(String(gErr.message))
+        ? ' If this is production, confirm RLS policy allows INSERT when creator_id = auth.uid(), and that creator_id type matches auth.uid().'
+        : '';
+    return { error: (gErr.message || 'Could not create group in Supabase.') + rlsHint };
   }
 
   const { error: mErr } = await supabase.from('group_members').insert({
     group_id: opts.id,
-    user_id: uid,
+    user_id: creatorId,
     role: 'admin',
   });
   const mCode = (mErr as { code?: string } | undefined)?.code;
@@ -96,31 +130,35 @@ async function insertGroupAndMembershipInSupabase(opts: {
     const { error: muErr } = await supabase
       .from('group_members')
       .upsert(
-        { group_id: opts.id, user_id: uid, role: 'admin' },
+        { group_id: opts.id, user_id: creatorId, role: 'admin' },
         { onConflict: 'group_id,user_id' }
       );
     if (muErr) console.error('[GroupsPage] group_members upsert:', muErr);
+    if (muErr) return { error: muErr.message || 'Could not add group membership.' };
   } else if (mErr) {
     console.error('[GroupsPage] group_members insert:', mErr);
+    return { error: mErr.message || 'Could not add group membership.' };
   }
 
   const { data: memCheck, error: memCheckErr } = await supabase
     .from('group_members')
     .select('group_id, user_id, role')
     .eq('group_id', opts.id)
-    .eq('user_id', uid)
+    .eq('user_id', creatorId)
     .maybeSingle();
   if (memCheckErr) {
     console.error('[GroupsPage] group_members post-insert verify:', memCheckErr);
   } else if (!memCheck?.user_id) {
     const { error: fixErr } = await supabase
       .from('group_members')
-      .update({ user_id: uid })
+      .update({ user_id: creatorId })
       .eq('group_id', opts.id)
       .is('user_id', null);
     if (fixErr) console.error('[GroupsPage] group_members repair user_id failed:', fixErr);
     else console.log('[GroupsPage] group_members repaired NULL user_id for group', opts.id);
   }
+
+  return { error: null };
 }
 
 export default function GroupsPage() {
@@ -227,11 +265,6 @@ export default function GroupsPage() {
   useEffect(() => {
     if (user) {
       fetchGroups();
-      // Sync users from Supabase to local DB
-      fetch(apiUrl('/api/users/sync-all'), { method: 'POST' })
-        .then(res => res.json())
-        .then(data => console.log('DEBUG: Sync-all result in GroupsPage:', data))
-        .catch(err => console.error('DEBUG: Sync-all error in GroupsPage:', err));
     }
   }, [categoryFilter, user]);
 
@@ -244,54 +277,48 @@ export default function GroupsPage() {
       return;
     }
     try {
-      const authHeaders = await getBearerAuthHeaders();
-      if (!authHeaders) {
-        console.error('[GroupsPage] join group: no session / access_token');
+      const { error } = await supabase.from('group_members').insert({
+        group_id: groupId,
+        user_id: uid,
+        role: 'member',
+      });
+      const code = (error as { code?: string } | undefined)?.code;
+      if (error && code !== '23505') {
+        console.error('[GroupsPage] join group_members insert:', error);
         return;
       }
-      console.log("JOIN GROUP ID:", groupId);
-      console.log("JOIN REQUEST SENT");
-      const res = await fetch(apiUrl(`/api/groups/${groupId}/join`), {
-        method: 'POST',
-        headers: authHeaders,
-        body: JSON.stringify({})
+      console.log('JOIN GROUP ID:', groupId);
+      setJoinedGroupIds((prev) => new Set([...prev, groupId]));
+      setJoinedGroups((prev) => {
+        const exists = prev.some((g: any) => resolveGroupUuid(g) === groupId);
+        if (exists) return prev;
+        return [
+          {
+            ...group,
+            members: Number(group?.members || group?.members_count || 0) + 1,
+            members_count: Number(group?.members_count || group?.members || 0) + 1,
+          },
+          ...prev,
+        ];
       });
-      const data = await res.json().catch(() => null);
-      console.log("JOIN RESPONSE:", data);
-      if (res.ok) {
-        setJoinedGroupIds((prev) => new Set([...prev, groupId]));
-        setJoinedGroups((prev) => {
-          const exists = prev.some((g: any) => resolveGroupUuid(g) === groupId);
-          if (exists) return prev;
-          return [
-            {
-              ...group,
-              members: Number(group?.members || group?.members_count || 0) + 1,
-              members_count: Number(group?.members_count || group?.members || 0) + 1,
-            },
-            ...prev,
-          ];
-        });
-        setSuggestedGroups((prev) =>
-          prev
-            .map((g: any) => {
-              if (resolveGroupUuid(g) !== groupId) return g;
-              return {
-                ...g,
-                members: Number(g?.members || g?.members_count || 0) + 1,
-                members_count: Number(g?.members_count || g?.members || 0) + 1,
-              };
-            })
-            .filter((g: any) => resolveGroupUuid(g) !== groupId)
-        );
-        await fetchGroups();
-      }
+      setSuggestedGroups((prev) =>
+        prev
+          .map((g: any) => {
+            if (resolveGroupUuid(g) !== groupId) return g;
+            return {
+              ...g,
+              members: Number(g?.members || g?.members_count || 0) + 1,
+              members_count: Number(g?.members_count || g?.members || 0) + 1,
+            };
+          })
+          .filter((g: any) => resolveGroupUuid(g) !== groupId)
+      );
+      await fetchGroups();
     } catch (err) {
-      console.error("Error joining group:", err);
+      console.error('Error joining group:', err);
     }
   };
 
-  // Updated handleCreateGroup according to prompt
   const handleCreateGroup = async (groupData: any) => {
     const memberUserId = await resolveAuthUserId(user);
     if (!memberUserId) {
@@ -301,84 +328,31 @@ export default function GroupsPage() {
     }
     setCreateError(null);
     try {
-      const authHeaders = await getBearerAuthHeaders();
-      if (!authHeaders) {
-        setCreateError('You must be signed in (session required for Authorization).');
-        console.error('[GroupsPage] create group: no session / access_token');
+      const newId = crypto.randomUUID();
+      const imageUrl = `https://picsum.photos/seed/${newId}/400/200`;
+      const { error: supabaseErr } = await insertGroupAndMembershipInSupabase({
+        id: newId,
+        name: groupData.name?.trim() || 'New Group',
+        description: groupData.description ?? '',
+        image: imageUrl,
+        type: groupData.type ?? 'Public',
+        userId: memberUserId,
+      });
+      if (supabaseErr) {
+        setCreateError(supabaseErr);
+        console.error('[GroupsPage] group create failed:', supabaseErr);
         return;
       }
-      const res = await fetch(apiUrl('/api/groups'), {
-        method: 'POST',
-        headers: authHeaders,
-        body: JSON.stringify({
-          name: groupData.name,
-          description: groupData.description,
-          type: groupData.type,
-        })
-      });
-      if (!res.ok) {
-        let msg: string;
-        try {
-          const errData = await res.json();
-          msg = errData?.message || (errData?.error ?? "Failed to create group.");
-        } catch {
-          msg = "Failed to create group.";
-        }
-        setCreateError(msg);
-        return;
-      }
-      const created = await res.json().catch(() => ({} as any));
-      const createdGroupId = created?.id ? String(created.id) : '';
-      const imageUrl =
-        created?.image ||
-        groupData?.image ||
-        (createdGroupId ? `https://picsum.photos/seed/${createdGroupId}/400/200` : '');
-      console.log('[GroupsPage] create group response', {
-        ok: res.ok,
-        status: res.status,
-        createdGroupId,
-        payload: created
-      });
-      if (createdGroupId) {
-        await insertGroupAndMembershipInSupabase({
-          id: createdGroupId,
-          name: created?.name ?? groupData?.name ?? 'New Group',
-          description: created?.description ?? groupData?.description ?? '',
-          image: imageUrl,
-          type: created?.type ?? groupData?.type ?? 'Public',
-          userId: memberUserId,
-        });
-        // Ensure membership exists even if backend create payload handling changes.
-        const joinHeaders = await getBearerAuthHeaders();
-        console.log("JOIN REQUEST SENT");
-        const joinRes = await fetch(apiUrl(`/api/groups/${createdGroupId}/join`), {
-          method: 'POST',
-          headers: joinHeaders ?? authHeaders,
-          body: JSON.stringify({})
-        });
-        let joinPayload: any = null;
-        try {
-          joinPayload = await joinRes.json();
-        } catch {
-          joinPayload = null;
-        }
-        console.log('[GroupsPage] join response', {
-          ok: joinRes.ok,
-          status: joinRes.status,
-          groupId: createdGroupId,
-          userId: memberUserId,
-          payload: joinPayload
-        });
-        if (!joinRes.ok) {
-          console.warn('[GroupsPage] join after create failed', {
-            groupId: createdGroupId,
-            userId: memberUserId,
-            status: joinRes.status,
-            payload: joinPayload
-          });
-        }
-        // Membership persisted by POST /api/groups + POST /api/groups/:id/join (service role Supabase sync).
-      }
+
+      const createdGroupId = newId;
+      const created = {
+        id: newId,
+        name: groupData.name,
+        description: groupData.description,
+        type: groupData.type,
+        image: imageUrl,
+      };
+
       setIsCreateModalOpen(false);
       const refreshed = await fetchGroups();
       const refreshedJoined = Array.isArray(refreshed?.joinedData) ? refreshed.joinedData : [];
@@ -387,29 +361,29 @@ export default function GroupsPage() {
         : false;
       console.log('[GroupsPage] post-create joined verification', {
         groupId: createdGroupId,
-        hasCreatedInJoined
+        hasCreatedInJoined,
       });
       if (createdGroupId && !hasCreatedInJoined) {
         const fallbackGroup = {
           id: createdGroupId,
-          name: created?.name || groupData?.name || 'New Group',
-          description: created?.description || groupData?.description || '',
-          image: created?.image || `https://picsum.photos/seed/${createdGroupId}/400/200`,
-          type: created?.type || groupData?.type || 'Public',
-          creator_id: memberUserId
+          name: (created.name as string) || groupData?.name || 'New Group',
+          description: (created.description as string) || groupData?.description || '',
+          image: imageUrl,
+          type: (created.type as string) || groupData?.type || 'Public',
+          creator_id: memberUserId,
         };
         setJoinedGroups((prev) => {
           if (prev.some((g: any) => String(g?.id) === createdGroupId)) return prev;
           return [fallbackGroup, ...prev];
         });
         setSuggestedGroups((prev) => prev.filter((g: any) => String(g?.id) !== createdGroupId));
-        console.warn('[GroupsPage] created group missing from joined API; injected locally', {
-          groupId: createdGroupId
+        console.warn('[GroupsPage] created group missing from joined list; injected locally', {
+          groupId: createdGroupId,
         });
       }
     } catch (err) {
-      console.error("Error creating group:", err);
-      setCreateError("Unexpected error creating group.");
+      console.error('Error creating group:', err);
+      setCreateError('Unexpected error creating group.');
     }
   };
 

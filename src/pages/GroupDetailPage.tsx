@@ -27,8 +27,6 @@ import {
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { MOCK_USER } from '../constants';
-import { apiUrl } from '../lib/apiOrigin';
-import { getBearerAuthHeaders } from '../lib/supabaseAuthHeaders';
 import { supabase } from '../lib/supabase';
 
 /** Detect Postgres/Supabase permission / RLS-style failures for clearer production alerts. */
@@ -114,39 +112,65 @@ export default function GroupDetailPage() {
   }, [groupMenuOpen]);
 
   const fetchGroup = async () => {
+    if (!id) return;
     try {
-      const [apiRes, supabaseRes] = await Promise.all([
-        fetch(apiUrl(`/api/groups/${id}`)),
-        id
-          ? supabase
-              .from('groups')
-              .select(`
+      const supabaseRes = await supabase
+        .from('groups')
+        .select(
+          `
                 *,
                 group_members ( user_id, role )
-              `)
-              .eq('id', id)
-              .single()
-          : Promise.resolve({ data: null, error: null } as any),
-      ]);
+              `
+        )
+        .eq('id', id)
+        .single();
 
-      const data = await apiRes.json();
-      const membersFromDb = Array.isArray(supabaseRes?.data?.group_members)
-        ? supabaseRes.data.group_members
-        : [];
-      console.log("GROUP WITH MEMBERS:", supabaseRes?.data);
-      const membersCount = Array.isArray(data?.members)
-        ? data.members.length
-        : membersFromDb.length;
+      const row = supabaseRes?.data;
+      const membersFromDb = Array.isArray(row?.group_members) ? row.group_members : [];
+      console.log('GROUP WITH MEMBERS:', supabaseRes?.data);
+
+      if (supabaseRes.error && !row) {
+        console.error('Error loading group from Supabase:', supabaseRes.error);
+        setGroupInfo(null);
+        return;
+      }
+
+      let membersForUi: any[] = [];
+      if (membersFromDb.length) {
+        const memberIds = membersFromDb.map((m: any) => m.user_id).filter(Boolean);
+        let profileMap: Record<string, { username?: string | null; avatar_url?: string | null }> = {};
+        if (memberIds.length > 0) {
+          const { data: profiles } = await supabase
+            .from('profiles')
+            .select('id, username, avatar_url')
+            .in('id', memberIds);
+          profileMap = Object.fromEntries((profiles || []).map((p: any) => [p.id, p]));
+        }
+        membersForUi = membersFromDb.map((m: any) => ({
+          id: String(m.user_id),
+          username: profileMap[m.user_id]?.username || `user_${String(m.user_id).slice(0, 8)}`,
+          avatar: profileMap[m.user_id]?.avatar_url || MOCK_USER.avatar,
+          role: m.role || 'member',
+        }));
+      }
+
+      const membersCount = membersForUi.length || membersFromDb.length;
+
       const joinedFromDb =
         !!user?.id &&
-        (Array.isArray(data?.members)
-          ? data.members.some((m: any) => String(m?.id || '') === String(user.id))
+        (membersForUi.length
+          ? membersForUi.some((m: any) => String(m?.id || '') === String(user.id))
           : membersFromDb.some((m: any) => String(m?.user_id || '') === String(user.id)));
 
-      const creatorId = data?.creator_id ?? supabaseRes?.data?.creator_id ?? null;
+      const creatorId = row?.creator_id ?? null;
 
       setGroupInfo({
-        ...data,
+        id: row?.id ?? id,
+        name: row?.name ?? 'Group',
+        description: row?.description ?? '',
+        image: row?.image,
+        type: row?.type ?? 'Public',
+        members: membersForUi.length ? membersForUi : membersFromDb,
         members_count: membersCount,
         creator_id: creatorId,
         _myRoleSupabase: user?.id
@@ -157,7 +181,7 @@ export default function GroupDetailPage() {
         setIsJoined(joinedFromDb);
       }
     } catch (err) {
-      console.error("Error fetching group:", err);
+      console.error('Error fetching group:', err);
     }
   };
 
@@ -280,38 +304,44 @@ export default function GroupDetailPage() {
   const handleJoinToggle = async () => {
     if (!user || !id) return;
     try {
-      const authHeaders = await getBearerAuthHeaders();
-      if (!authHeaders) {
-        console.error('[GroupDetailPage] join/leave: no session / access_token');
-        return;
-      }
-      const endpoint = isJoined ? apiUrl(`/api/groups/${id}/leave`) : apiUrl(`/api/groups/${id}/join`);
-      if (!isJoined) {
-        console.log("JOIN GROUP ID:", id);
-        console.log("JOIN REQUEST SENT");
-      }
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: authHeaders,
-        body: JSON.stringify({})
-      });
-      if (res.ok) {
-        setIsJoined(!isJoined);
-        setGroupInfo((prev: any) => {
-          if (!prev) return prev;
-          const currentMembers = Array.isArray(prev.members) ? prev.members : [];
-          const userAlreadyListed = currentMembers.some((m: any) => m?.id === user.id);
-          const nextMembers = isJoined
-            ? currentMembers.filter((m: any) => m?.id !== user.id)
-            : userAlreadyListed
-              ? currentMembers
-              : [{ id: user.id, username: user.username, avatar: user.avatar, role: 'member' }, ...currentMembers];
-          return { ...prev, members: nextMembers };
+      if (isJoined) {
+        const { error } = await supabase
+          .from('group_members')
+          .delete()
+          .eq('group_id', id)
+          .eq('user_id', user.id);
+        if (error) {
+          console.error('[GroupDetailPage] leave group_members:', error);
+          return;
+        }
+      } else {
+        console.log('JOIN GROUP ID:', id);
+        const { error } = await supabase.from('group_members').insert({
+          group_id: id,
+          user_id: user.id,
+          role: 'member',
         });
-        await fetchGroup();
+        const code = (error as { code?: string } | undefined)?.code;
+        if (error && code !== '23505') {
+          console.error('[GroupDetailPage] join group_members:', error);
+          return;
+        }
       }
+      setIsJoined(!isJoined);
+      setGroupInfo((prev: any) => {
+        if (!prev) return prev;
+        const currentMembers = Array.isArray(prev.members) ? prev.members : [];
+        const userAlreadyListed = currentMembers.some((m: any) => m?.id === user.id);
+        const nextMembers = isJoined
+          ? currentMembers.filter((m: any) => m?.id !== user.id)
+          : userAlreadyListed
+            ? currentMembers
+            : [{ id: user.id, username: user.username, avatar: user.avatar, role: 'member' }, ...currentMembers];
+        return { ...prev, members: nextMembers };
+      });
+      await fetchGroup();
     } catch (err) {
-      console.error("Error toggling group join:", err);
+      console.error('Error toggling group join:', err);
     }
   };
 
@@ -431,33 +461,19 @@ export default function GroupDetailPage() {
     !!musicUrl.trim();
 
   const handleUpdateImage = async (type: 'image' | 'cover_image', url: string) => {
+    if (!id) return;
     try {
-      const urlField = type === 'image' ? 'image_url' : 'cover_image_url';
-      const res = await fetch(apiUrl(`/api/groups/${id}`), {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ [type]: url, [urlField]: url })
-      });
-      if (res.ok) {
-        setGroupInfo((prev: any) => {
-          if (!prev) return prev;
-          if (type === 'image') {
-            return { ...prev, image: url, image_url: url };
-          }
-          return { ...prev, cover_image: url, cover_image_url: url };
-        });
-        fetchGroup();
-      } else {
-        let payload: { error?: string } | null = null;
-        try {
-          payload = await res.json();
-        } catch {
-          /* ignore */
+      const patch = type === 'image' ? { image: url } : { cover_image: url };
+      const { error } = await supabase.from('groups').update(patch).eq('id', id);
+      if (error) throw error;
+      setGroupInfo((prev: any) => {
+        if (!prev) return prev;
+        if (type === 'image') {
+          return { ...prev, image: url, image_url: url };
         }
-        const errObj = payload?.error ? { message: payload.error } : new Error(`HTTP ${res.status}`);
-        console.error(`Error updating group ${type}:`, res.status, payload);
-        alert(describeGroupMutationFailure(errObj, 'update'));
-      }
+        return { ...prev, cover_image: url, cover_image_url: url };
+      });
+      fetchGroup();
     } catch (err) {
       console.error(`Error updating group ${type}:`, err);
       alert(describeGroupMutationFailure(err, 'update'));
@@ -492,24 +508,40 @@ export default function GroupDetailPage() {
   };
 
   const handleInvite = async () => {
-    if (!inviteUsername.trim()) return;
+    if (!inviteUsername.trim() || !id) return;
+    const trimmed = inviteUsername.trim().replace(/^@/, '');
     try {
-      const res = await fetch(apiUrl(`/api/groups/${id}/invite`), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: inviteUsername })
-      });
-      if (res.ok) {
-        setInviteUsername('');
-        setIsInviteOpen(false);
-        fetchGroup();
-        alert('Invite sent successfully!');
-      } else {
-        const data = await res.json();
-        alert(data.error || 'Failed to send invite');
+      const { data: profileRow, error: findErr } = await supabase
+        .from('profiles')
+        .select('id')
+        .ilike('username', trimmed)
+        .maybeSingle();
+      if (findErr) {
+        console.error('[GroupDetailPage] invite profile lookup:', findErr);
+        alert('Could not look up that user.');
+        return;
       }
+      if (!profileRow?.id) {
+        alert('No user found with that username.');
+        return;
+      }
+      const { error } = await supabase.from('group_members').insert({
+        group_id: id,
+        user_id: profileRow.id,
+        role: 'member',
+      });
+      const code = (error as { code?: string } | undefined)?.code;
+      if (error && code !== '23505') {
+        console.error('[GroupDetailPage] invite group_members:', error);
+        alert(error.message || 'Could not add member.');
+        return;
+      }
+      setInviteUsername('');
+      setIsInviteOpen(false);
+      fetchGroup();
+      alert(code === '23505' ? 'That user is already in the group.' : 'Member added successfully!');
     } catch (err) {
-      console.error("Error inviting user:", err);
+      console.error('Error inviting user:', err);
     }
   };
 
@@ -542,31 +574,7 @@ export default function GroupDetailPage() {
       await fetchGroup();
     } catch (err) {
       console.error(err);
-      try {
-        const res = await fetch(apiUrl(`/api/groups/${id}`), {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ description: draftDescription }),
-        });
-        if (res.ok) {
-          setEditDescriptionOpen(false);
-          await fetchGroup();
-        } else {
-          let payload: { error?: string } | null = null;
-          try {
-            payload = await res.json();
-          } catch {
-            /* ignore */
-          }
-          const combined = payload?.error
-            ? { message: payload.error }
-            : { message: `Request failed (${res.status})` };
-          alert(describeGroupMutationFailure(combined, 'update'));
-        }
-      } catch (e) {
-        console.error(e);
-        alert(describeGroupMutationFailure(e, 'update'));
-      }
+      alert(describeGroupMutationFailure(err, 'update'));
     } finally {
       setSavingDescription(false);
     }
@@ -1254,34 +1262,28 @@ function GroupPost({ post, groupName, groupId, onUpdate }: { post: any; groupNam
   
   const handleEdit = async () => {
     const newContent = prompt('Edit your post:', post.content);
-    if (newContent && newContent !== post.content) {
-      try {
-        const res = await fetch(apiUrl(`/api/groups/${groupId}/posts/${post.id}`), {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: newContent })
-        });
-        if (res.ok) {
-          onUpdate();
-        }
-      } catch (err) {
-        console.error("Error updating post:", err);
-      }
+    if (!newContent || newContent === post.content || !user?.id) return;
+    try {
+      const { error } = await supabase
+        .from('posts')
+        .update({ content: newContent })
+        .eq('id', post.id)
+        .eq('user_id', user.id);
+      if (error) throw error;
+      onUpdate();
+    } catch (err) {
+      console.error('Error updating post:', err);
     }
   };
 
   const handleDelete = async () => {
-    if (confirm('Are you sure you want to delete this post?')) {
-      try {
-        const res = await fetch(apiUrl(`/api/groups/${groupId}/posts/${post.id}`), {
-          method: 'DELETE'
-        });
-        if (res.ok) {
-          onUpdate();
-        }
-      } catch (err) {
-        console.error("Error deleting post:", err);
-      }
+    if (!confirm('Are you sure you want to delete this post?') || !user?.id) return;
+    try {
+      const { error } = await supabase.from('posts').delete().eq('id', post.id).eq('user_id', user.id);
+      if (error) throw error;
+      onUpdate();
+    } catch (err) {
+      console.error('Error deleting post:', err);
     }
   };
 
@@ -1292,33 +1294,19 @@ function GroupPost({ post, groupName, groupId, onUpdate }: { post: any; groupNam
     setIsLiked(nextLiked);
     setLikesCount((prev) => Math.max(0, prev + (nextLiked ? 1 : -1)));
     try {
-      const res = await fetch(apiUrl('/api/feed/post-like'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId: user.id, postId: post.id }),
-      });
-
-      if (res.ok) {
-        const payload = await res.json().catch(() => ({}));
-        if (typeof payload?.liked === 'boolean') setIsLiked(payload.liked);
-        if (typeof payload?.likesCount === 'number') setLikesCount(payload.likesCount);
+      if (nextLiked) {
+        const { error } = await supabase.from('likes').insert({
+          post_id: post.id,
+          user_id: user.id,
+        });
+        if (error) throw error;
       } else {
-        if (wasLiked) {
-          const { error } = await supabase
-            .from('likes')
-            .delete()
-            .eq('post_id', post.id)
-            .eq('user_id', user.id);
-          if (error) throw error;
-        } else {
-          const { error } = await supabase
-            .from('likes')
-            .insert({
-              post_id: post.id,
-              user_id: user.id,
-            });
-          if (error) throw error;
-        }
+        const { error } = await supabase
+          .from('likes')
+          .delete()
+          .eq('post_id', post.id)
+          .eq('user_id', user.id);
+        if (error) throw error;
       }
       onUpdate();
     } catch (err) {
@@ -1401,15 +1389,6 @@ function GroupPost({ post, groupName, groupId, onUpdate }: { post: any; groupNam
         prompt('Copy post link:', shareUrl);
       }
       setSharesCount((prev) => prev + 1);
-      const res = await fetch(apiUrl(`/api/groups/${groupId}/posts/${post.id}/share`), {
-        method: 'POST',
-      });
-      if (res.ok) {
-        const payload = await res.json();
-        if (payload?.post) {
-          setSharesCount(Number(payload.post.shares || 0));
-        }
-      }
     } catch (err) {
       console.error('Error sharing group post:', err);
     }

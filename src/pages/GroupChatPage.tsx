@@ -216,13 +216,6 @@ export default function GroupChatPage() {
       setMessages(normalized);
     } catch (err) {
       console.error('Error fetching group messages:', err);
-      try {
-        const res = await fetch(apiUrl(`/api/groups/${currentGroupId}/messages`));
-        const data = await res.json();
-        setMessages(data || []);
-      } catch (fallbackErr) {
-        console.error('Error fetching group messages (fallback):', fallbackErr);
-      }
     }
   };
 
@@ -245,7 +238,7 @@ export default function GroupChatPage() {
         {
           event: 'INSERT',
           schema: 'public',
-          table: 'group_messages',
+          table: 'messages',
           filter: `group_id=eq.${id}`,
         },
         (payload) => {
@@ -719,22 +712,47 @@ export default function GroupChatPage() {
   };
 
   const handleInvite = async (username: string, userId?: string, avatar?: string) => {
+    if (!id) return;
     try {
-      const res = await fetch(apiUrl(`/api/groups/${id}/invite`), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, userId, avatar })
-      });
-      if (res.ok) {
-        setIsInviteModalOpen(false);
-        fetchGroupInfo();
-        alert(`Successfully invited @${username}`);
-      } else {
-        const data = await res.json();
-        alert(data.error || 'Failed to invite user');
+      let targetId = userId?.trim();
+      if (!targetId) {
+        const q = username.trim().replace(/^@/, '');
+        const { data: row, error: findErr } = await supabase
+          .from('profiles')
+          .select('id')
+          .ilike('username', q)
+          .maybeSingle();
+        if (findErr) {
+          console.error('[GroupChatPage] invite profile lookup:', findErr);
+          alert('Could not look up that user.');
+          return;
+        }
+        targetId = row?.id;
       }
+      if (!targetId) {
+        alert('No user found.');
+        return;
+      }
+      const { error } = await supabase.from('group_members').insert({
+        group_id: id,
+        user_id: targetId,
+        role: 'member',
+      });
+      const code = (error as { code?: string } | undefined)?.code;
+      if (error && code !== '23505') {
+        console.error('[GroupChatPage] invite group_members:', error);
+        alert(error.message || 'Could not add member.');
+        return;
+      }
+      setIsInviteModalOpen(false);
+      fetchGroupInfo();
+      alert(
+        code === '23505'
+          ? `That user is already in the group.`
+          : `Successfully invited @${username}`
+      );
     } catch (err) {
-      console.error("Error inviting user:", err);
+      console.error('Error inviting user:', err);
     }
   };
 
@@ -1317,18 +1335,19 @@ function InviteModal({ onClose, onConfirm }: { onClose: () => void; onConfirm: (
   const searchUsers = async () => {
     setSearching(true);
     try {
-      const res = await fetch(apiUrl(`/api/users/search?q=${encodeURIComponent(searchQuery)}`));
-      if (!res.ok) throw new Error('Search failed');
-      const data = await res.json();
-      
-      // Map local user fields to what the component expects
-      const formattedResults = data.map((u: any) => ({
+      const q = searchQuery.trim();
+      const { data, error } = await supabase
+        .from('profiles')
+        .select('id, username, avatar_url')
+        .ilike('username', `%${q}%`)
+        .limit(20);
+      if (error) throw error;
+      const formattedResults = (data || []).map((u: any) => ({
         id: u.id,
         username: u.username,
-        display_name: u.full_name || u.username,
-        avatar_url: u.avatar
+        display_name: u.username,
+        avatar_url: u.avatar_url,
       }));
-      
       setResults(formattedResults || []);
     } catch (err) {
       console.error('Error searching users for invite:', err);
