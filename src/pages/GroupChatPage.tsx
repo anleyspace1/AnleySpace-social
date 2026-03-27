@@ -45,6 +45,39 @@ import { v4 as uuidv4 } from 'uuid';
 import io from 'socket.io-client';
 import { apiUrl } from '../lib/apiOrigin';
 
+/**
+ * `messages` only persists `content`, `group_id`, `user_id` (no username / image_url / type).
+ * Image and voice URLs are stored inside `content`; this derives UI fields.
+ */
+function parseGroupMessageContentForUi(content: string | null | undefined): {
+  text: string;
+  image_url?: string;
+  audio_url?: string;
+} {
+  const raw = (content ?? '').trim();
+  if (!raw) return { text: '' };
+
+  const lines = raw.split('\n').map((l) => l.trim()).filter(Boolean);
+  const urlLines = lines.filter((l) => /^https?:\/\//i.test(l));
+
+  for (const url of urlLines) {
+    if (url.includes('voice-messages') || /\.webm(\?|$)/i.test(url)) {
+      return { text: '', audio_url: url };
+    }
+  }
+  for (const url of urlLines) {
+    if (url.includes('/chat/') || /\.(jpe?g|png|gif|webp)(\?|$)/i.test(url)) {
+      const textOnly = lines.filter((l) => l !== url && !/^https?:\/\//i.test(l)).join('\n');
+      return { text: textOnly, image_url: url };
+    }
+  }
+  if (lines.length === 1 && /^https?:\/\//i.test(lines[0])) {
+    const u = lines[0];
+    if (/\.(jpe?g|png|gif|webp)(\?|$)/i.test(u)) return { text: '', image_url: u };
+  }
+  return { text: raw };
+}
+
 interface GroupMessage {
   id: string;
   group_id: string;
@@ -56,6 +89,8 @@ interface GroupMessage {
   type: string;
   audio_url?: string;
   image_url?: string;
+  /** Optional raw content (e.g. socket); UI prefers normalized text + media fields */
+  content?: string;
 }
 
 interface GroupMember {
@@ -73,7 +108,9 @@ interface GroupInfo {
 }
 
 export default function GroupChatPage() {
-  const { id } = useParams();
+  const { groupId: groupIdParam } = useParams<{ groupId: string }>();
+  /** Route is `/groups/:groupId/chat` — trim so Supabase always gets a stable group id for `messages.group_id`. */
+  const groupId = (groupIdParam ?? '').trim();
   const navigate = useNavigate();
   const { user, profile } = useAuth();
   const [callError, setCallError] = useState<string | null>(null);
@@ -131,13 +168,13 @@ export default function GroupChatPage() {
 
   const fetchGroupInfo = async () => {
     try {
-      if (!id) return;
+      if (!groupId) return;
       const currentUser = await getCurrentAuthUser();
 
       const { data: groupRow, error: groupError } = await supabase
         .from('groups')
         .select('*')
-        .eq('id', id)
+        .eq('id', groupId)
         .maybeSingle();
       if (groupError) {
         console.error("Error fetching group info:", groupError);
@@ -147,7 +184,7 @@ export default function GroupChatPage() {
       const { data: memberRows, error: memberError } = await supabase
         .from('group_members')
         .select('group_id, user_id, role')
-        .eq('group_id', id);
+        .eq('group_id', groupId);
       if (memberError) {
         console.error("Error fetching group members:", memberError);
       }
@@ -174,10 +211,10 @@ export default function GroupChatPage() {
       console.log("IS MEMBER:", membership);
 
       setGroupInfo({
-        id: groupRow?.id || id,
+        id: groupRow?.id || groupId,
         name: groupRow?.name || 'Group',
         description: groupRow?.description || '',
-        image: groupRow?.image || `https://picsum.photos/seed/${id}/400/400`,
+        image: groupRow?.image || `https://picsum.photos/seed/${groupId}/400/400`,
         members,
       });
       setIsMember(membership);
@@ -187,39 +224,91 @@ export default function GroupChatPage() {
   };
 
   const fetchMessages = async () => {
-    const currentGroupId = id;
+    const currentGroupId = groupId;
     if (!currentGroupId) return;
     console.log('currentGroupId:', currentGroupId);
     try {
       setMessagesQueryError(null);
-      const { data: messagesData, error } = await supabase
+
+      const withProfiles = await supabase
         .from('messages')
-        .select('*')
+        .select(
+          `
+          id,
+          content,
+          group_id,
+          user_id,
+          created_at,
+          profiles (
+            username,
+            avatar_url
+          )
+        `
+        )
         .eq('group_id', currentGroupId)
         .order('created_at', { ascending: true });
 
-      console.log('fetched messages:', messagesData);
-      console.log('messages select error:', error);
+      let rows: any[] = [];
+      let profileByUserId: Record<string, { username?: string | null; avatar_url?: string | null }> = {};
 
-      if (error) {
-        const msg = [error.message, error.code, error.details].filter(Boolean).join(' — ');
-        console.error('[GroupChat] fetchMessages failed:', error);
-        setMessagesQueryError(msg);
-        throw error;
+      if (withProfiles.error) {
+        console.warn('[GroupChat] messages select with profiles failed, using fallback:', withProfiles.error);
+        const plain = await supabase
+          .from('messages')
+          .select('id, content, group_id, user_id, created_at')
+          .eq('group_id', currentGroupId)
+          .order('created_at', { ascending: true });
+
+        if (plain.error) {
+          const msg = [plain.error.message, plain.error.code, plain.error.details].filter(Boolean).join(' — ');
+          console.error('[GroupChat] fetchMessages failed:', plain.error);
+          setMessagesQueryError(msg);
+          throw plain.error;
+        }
+
+        rows = Array.isArray(plain.data) ? plain.data : [];
+        const userIds = Array.from(new Set(rows.map((r: any) => r?.user_id).filter(Boolean)));
+        if (userIds.length > 0) {
+          const { data: profs, error: pErr } = await supabase
+            .from('profiles')
+            .select('id, username, avatar_url')
+            .in('id', userIds as string[]);
+          if (pErr) {
+            console.warn('[GroupChat] profiles batch for messages:', pErr);
+          } else {
+            profileByUserId = Object.fromEntries((profs || []).map((p: any) => [String(p.id), p]));
+          }
+        }
+      } else {
+        rows = Array.isArray(withProfiles.data) ? withProfiles.data : [];
       }
 
-      const normalized = (messagesData || []).map((m: any) => ({
-        id: String(m.id),
-        group_id: String(m.group_id ?? currentGroupId),
-        user_id: String(m.user_id ?? ''),
-        username: m.username || 'user',
-        text: m.content ?? m.text ?? '',
-        created_at: m.created_at || undefined,
-        timestamp: m.created_at || m.timestamp || new Date().toISOString(),
-        type: m.type || 'text',
-        image_url: m.image_url || undefined,
-        audio_url: m.audio_url || undefined,
-      }));
+      console.log('fetched messages:', rows);
+
+      const normalized: GroupMessage[] = (rows || []).map((m: any) => {
+        const prof = m.profiles;
+        const pRow = Array.isArray(prof) ? prof[0] : prof;
+        const fallbackProf = m.user_id ? profileByUserId[String(m.user_id)] : undefined;
+        const username =
+          pRow?.username ?? fallbackProf?.username ?? `user_${String(m.user_id ?? '').slice(0, 8)}`;
+
+        const { text, image_url, audio_url } = parseGroupMessageContentForUi(m.content);
+        const type = audio_url ? 'audio' : image_url ? 'image' : 'text';
+
+        return {
+          id: String(m.id),
+          group_id: String(m.group_id ?? currentGroupId),
+          user_id: String(m.user_id ?? ''),
+          username,
+          content: m.content != null ? String(m.content) : undefined,
+          text,
+          created_at: m.created_at || undefined,
+          timestamp: m.created_at || new Date().toISOString(),
+          type,
+          image_url,
+          audio_url,
+        };
+      });
 
       setMessages(normalized);
     } catch (err) {
@@ -229,37 +318,37 @@ export default function GroupChatPage() {
   };
 
   useEffect(() => {
-    const currentGroupId = id;
+    const currentGroupId = groupId;
     if (currentGroupId) {
       // Load chat history even before realtime/socket is ready.
       void fetchMessages();
     }
-  }, [id]);
+  }, [groupId]);
 
   useEffect(() => {
-    if (!id) return;
+    if (!groupId) return;
 
     // Reuse DM-style Supabase realtime fallback for environments where socket events can lag (e.g. Vercel).
     const channel = supabase
-      .channel(`group-chat:${id}`)
+      .channel(`group-chat:${groupId}`)
       .on(
         'postgres_changes',
         {
           event: 'INSERT',
           schema: 'public',
           table: 'messages',
-          filter: `group_id=eq.${id}`,
+          filter: `group_id=eq.${groupId}`,
         },
         (payload) => {
           const newMessage = payload.new as Record<string, unknown>;
-          if (String(newMessage.group_id ?? '') === String(id)) {
+          if (String(newMessage.group_id ?? '') === String(groupId)) {
             void fetchMessages();
           }
         }
       )
       .subscribe((status, err) => {
         if (status === 'SUBSCRIBED') {
-          console.log('[GroupChat] realtime subscribed to messages for group', id);
+          console.log('[GroupChat] realtime subscribed to messages for group', groupId);
         } else {
           console.warn('[GroupChat] realtime subscription status:', status, err ?? '');
         }
@@ -268,7 +357,7 @@ export default function GroupChatPage() {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [id]);
+  }, [groupId]);
 
   useEffect(() => {
     // Initialize Socket.IO
@@ -288,9 +377,9 @@ export default function GroupChatPage() {
       setMessages(history || []);
     });
 
-    if (id) {
+    if (groupId) {
       // Join the group room and request history (after listeners are attached).
-      socket.emit('join_group', id);
+      socket.emit('join_group', groupId);
     }
 
     socket.on('call:started', (data: any) => {
@@ -343,11 +432,11 @@ export default function GroupChatPage() {
     return () => {
       socket.disconnect();
     };
-  }, [id]);
+  }, [groupId]);
 
   useEffect(() => {
     fetchGroupInfo();
-  }, [id]);
+  }, [groupId]);
 
   useEffect(() => {
     scrollToBottom();
@@ -363,7 +452,7 @@ export default function GroupChatPage() {
 
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if ((!inputText.trim() && !selectedFile) || !user || !id) return;
+    if ((!inputText.trim() && !selectedFile) || !user || !groupId) return;
 
     const currentUser = await getCurrentAuthUser();
     if (!currentUser?.id) {
@@ -373,7 +462,7 @@ export default function GroupChatPage() {
     const { data: membershipRows } = await supabase
       .from('group_members')
       .select('group_id, user_id')
-      .eq('group_id', id)
+      .eq('group_id', groupId)
       .eq('user_id', currentUser.id);
     const membership = Array.isArray(membershipRows) && membershipRows.length > 0;
     console.log("IS MEMBER:", membership);
@@ -404,30 +493,31 @@ export default function GroupChatPage() {
 
       const senderId = currentUser.id;
       const rawText = inputText.trim();
-      // DB often requires non-null content; image-only messages use a placeholder.
-      const contentForDb = rawText || (imageUrl ? ' ' : '');
+      // DB columns: content, group_id, user_id only — embed image URL in content when needed.
+      const contentForDb = imageUrl
+        ? rawText
+          ? `${rawText}\n${imageUrl}`
+          : imageUrl
+        : rawText;
+      if (!contentForDb.trim()) return;
 
       const messageData = {
-        // Server supports both camelCase and snake_case payloads.
-        groupId: id,
+        groupId: groupId,
         userId: senderId,
-        group_id: id,
+        group_id: groupId,
         user_id: senderId,
         username: profile?.username || user.email?.split('@')[0],
         text: rawText || (imageUrl ? 'Image' : ''),
         type: imageUrl ? 'image' : 'text',
         imageUrl: imageUrl,
         image_url: imageUrl,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       };
 
       const payload = {
         content: contentForDb,
         user_id: senderId,
-        group_id: id,
-        username: profile?.username || user.email?.split('@')[0],
-        type: imageUrl ? 'image' : 'text',
-        image_url: imageUrl,
+        group_id: groupId,
       };
       console.log('sending message:', payload);
       const { data: insertedRows, error: insertError } = await supabase
@@ -534,7 +624,7 @@ export default function GroupChatPage() {
   };
 
   const sendVoiceMessage = async (audioUrl: string) => {
-    if (!user || !id) return;
+    if (!user || !groupId) return;
 
     try {
       const currentUser = await getCurrentAuthUser();
@@ -545,7 +635,7 @@ export default function GroupChatPage() {
       const { data: membershipRows } = await supabase
         .from('group_members')
         .select('group_id')
-        .eq('group_id', id)
+        .eq('group_id', groupId)
         .eq('user_id', currentUser.id);
       if (!Array.isArray(membershipRows) || membershipRows.length === 0) {
         alert('You must be a member of this group to send messages.');
@@ -568,12 +658,9 @@ export default function GroupChatPage() {
 
       const senderId = currentUser.id;
       const payload = {
-        content: 'Voice message',
+        content: publicUrl,
         user_id: senderId,
-        group_id: id,
-        username: profile?.username || user.email?.split('@')[0],
-        type: 'audio',
-        audio_url: publicUrl,
+        group_id: groupId,
       };
       const { data: insertedRows, error: insertError } = await supabase
         .from('messages')
@@ -589,9 +676,9 @@ export default function GroupChatPage() {
 
       const messageData = {
         id: insertedId,
-        groupId: id,
+        groupId: groupId,
         userId: senderId,
-        group_id: id,
+        group_id: groupId,
         user_id: senderId,
         username: profile?.username || user.email?.split('@')[0],
         text: 'Voice message',
@@ -621,7 +708,7 @@ export default function GroupChatPage() {
       const res = await fetch(apiUrl('/api/calls/start'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ hostId: user.id, type, groupId: id })
+        body: JSON.stringify({ hostId: user.id, type, groupId: groupId })
       });
       const data = await res.json();
       
@@ -629,7 +716,7 @@ export default function GroupChatPage() {
       setCallCapacity(data.capacity);
       
       socketRef.current.emit('call:started', { 
-        groupId: id,
+        groupId: groupId,
         callId: data.id, 
         hostId: user.id,
         type 
@@ -650,7 +737,7 @@ export default function GroupChatPage() {
     if (activeCall && user) {
       socketRef.current.emit('call:leave', { callId: activeCall.id, userId: user.id });
       if (activeCall.hostId === user.id) {
-        socketRef.current.emit('call:ended', { groupId: id, callId: activeCall.id });
+        socketRef.current.emit('call:ended', { groupId: groupId, callId: activeCall.id });
         await fetch(apiUrl(`/api/calls/${activeCall.id}/end`), { method: 'POST' });
       }
       setActiveCall(null);
@@ -692,7 +779,7 @@ export default function GroupChatPage() {
       const resCall = await fetch(apiUrl('/api/calls/start'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ hostId: user.id, type: 'video', groupId: id })
+        body: JSON.stringify({ hostId: user.id, type: 'video', groupId: groupId })
       });
       const callData = await resCall.json();
       
@@ -777,7 +864,7 @@ export default function GroupChatPage() {
   };
 
   const handleInvite = async (username: string, userId?: string, avatar?: string) => {
-    if (!id) return;
+    if (!groupId) return;
     try {
       let targetId = userId?.trim();
       if (!targetId) {
@@ -799,7 +886,7 @@ export default function GroupChatPage() {
         return;
       }
       const { error } = await supabase.from('group_members').insert({
-        group_id: id,
+        group_id: groupId,
         user_id: targetId,
         role: 'member',
       });
@@ -916,8 +1003,14 @@ export default function GroupChatPage() {
         <AnimatePresence initial={false}>
           {messages.map((msg) => {
             const isMe = msg.user_id === user?.id;
-            const isImage = msg.type === 'image' || (msg.image_url && msg.image_url.startsWith('http'));
-            const isVoice = msg.type === 'audio' || (msg.audio_url && msg.audio_url.startsWith('http'));
+            const parsed = parseGroupMessageContentForUi(msg.content ?? msg.text ?? '');
+            const imageUrl = msg.image_url || parsed.image_url;
+            const audioUrl = msg.audio_url || parsed.audio_url;
+            const displayText = msg.text || parsed.text;
+            const isImage =
+              msg.type === 'image' || (!!imageUrl && imageUrl.startsWith('http'));
+            const isVoice =
+              msg.type === 'audio' || (!!audioUrl && audioUrl.startsWith('http'));
             const username = msg.username || 'User';
             const avatar = `https://ui-avatars.com/api/?name=${encodeURIComponent(username)}&background=random`;
 
@@ -951,7 +1044,7 @@ export default function GroupChatPage() {
                       <div className="flex items-center gap-3 min-w-[160px] py-1">
                         <button 
                           onClick={() => {
-                            const audio = new Audio(msg.audio_url);
+                            const audio = new Audio(audioUrl!);
                             audio.play();
                           }}
                           className={cn(
@@ -970,15 +1063,18 @@ export default function GroupChatPage() {
                       </div>
                     ) : isImage ? (
                       <div className="py-1">
+                        {displayText ? (
+                          <p className="text-sm mb-2 break-words whitespace-pre-wrap">{displayText}</p>
+                        ) : null}
                         <img 
-                          src={msg.image_url} 
+                          src={imageUrl} 
                           alt="Shared image" 
                           className="max-w-[250px] max-h-[250px] rounded-[12px] object-cover cursor-pointer hover:opacity-90 transition-opacity"
-                          onClick={() => window.open(msg.image_url, '_blank')}
+                          onClick={() => window.open(imageUrl, '_blank')}
                         />
                       </div>
                     ) : (
-                      msg.text
+                      displayText
                     )}
                   </div>
                   <span className="text-[8px] text-gray-400 mt-1 px-1">
