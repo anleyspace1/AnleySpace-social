@@ -3214,6 +3214,7 @@ async function startServer() {
         description: '',
         stock: 10,
         created_at: m.created_at,
+        view_count: m.view_count != null ? Number(m.view_count) : 0,
       }));
 
       const mergedById = new Map<string, Record<string, unknown>>();
@@ -3300,6 +3301,7 @@ async function startServer() {
           description: '',
           stock: 10,
           created_at: m.created_at,
+          view_count: m.view_count != null ? Number(m.view_count) : 0,
         };
       }
 

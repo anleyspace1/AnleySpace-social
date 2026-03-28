@@ -16,7 +16,8 @@ import {
   AlertCircle,
   PlaySquare,
   Grid,
-  Image as ImageIcon
+  Image as ImageIcon,
+  Eye
 } from 'lucide-react';
 import { Product, Video, Post } from '../types';
 
@@ -569,6 +570,10 @@ export default function MarketplacePage() {
                         <Coins size={16} />
                         <span>{(product.price || 0).toLocaleString()}</span>
                       </div>
+                      <p className="flex items-center gap-1 text-gray-400 text-[10px] font-medium mt-1">
+                        <Eye size={11} className="shrink-0 opacity-80" aria-hidden />
+                        <span>{(product.view_count ?? 0).toLocaleString()} views</span>
+                      </p>
                     </div>
                     
                     <div 

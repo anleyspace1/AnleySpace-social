@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { motion } from 'motion/react';
 import { 
@@ -11,7 +11,8 @@ import {
   MessageCircle,
   ShoppingBag,
   ChevronRight,
-  Star
+  Star,
+  Eye
 } from 'lucide-react';
 import { Product } from '../types';
 import { cn } from '../lib/utils';
@@ -23,11 +24,13 @@ import {
   mapMarketplaceRowsToProducts,
 } from '../lib/marketplaceRemote';
 import { isProductSavedInMarketplace, setSavedMarketplaceProduct } from '../lib/savedMarketplace';
+import { incrementMarketplaceView } from '../lib/incrementMarketplaceView';
 import { MOCK_USER } from '../constants';
 import { useAuth } from '../contexts/AuthContext';
 
 export default function ProductDetailPage() {
   const { id } = useParams();
+  console.log("ProductDetailPage mounted", { routeParamId: id });
   const navigate = useNavigate();
   const { user } = useAuth();
   const [product, setProduct] = useState<Product | null>(null);
@@ -36,6 +39,12 @@ export default function ProductDetailPage() {
 
   const [relatedProducts, setRelatedProducts] = useState<Product[]>([]);
   const [isProductSaved, setIsProductSaved] = useState(false);
+  /** Lowercase listing id — one increment per successful load for that listing. */
+  const viewIncrementedKeyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    viewIncrementedKeyRef.current = null;
+  }, [id]);
 
   useEffect(() => {
     fetchProduct();
@@ -60,6 +69,43 @@ export default function ProductDetailPage() {
       cancelled = true;
     };
   }, [user?.id, product?.id]);
+
+  useEffect(() => {
+    console.log('[VIEW EFFECT TRIGGER]', {
+      productId: product?.id,
+      routeId: id,
+    });
+
+    if (!product || !product.id || !id) return;
+
+    const pid = String(product.id).toLowerCase();
+
+    if (viewIncrementedKeyRef.current === pid) {
+      console.log('[VIEW] skipped (already incremented)', pid);
+      return;
+    }
+
+    viewIncrementedKeyRef.current = pid;
+
+    console.log('[VIEW] increment start', pid);
+
+    incrementMarketplaceView(product.id)
+      .then((res) => {
+        if (!res?.ok) {
+          console.warn('[VIEW] increment failed', res?.error);
+          return;
+        }
+
+        console.log('[VIEW] increment success');
+
+        setProduct((prev) =>
+          prev ? { ...prev, view_count: (prev.view_count || 0) + 1 } : prev
+        );
+      })
+      .catch((err) => {
+        console.warn('[VIEW] increment error', err);
+      });
+  }, [product, id]);
 
   const fetchProduct = async () => {
     try {
@@ -298,6 +344,10 @@ export default function ProductDetailPage() {
                 <span className="group-hover:underline">{product.location}</span>
               </div>
             </div>
+            <p className="flex items-center gap-1.5 text-gray-500 dark:text-gray-400 text-sm font-medium mb-4">
+              <Eye size={16} className="shrink-0 opacity-80" aria-hidden />
+              <span>{(product.view_count ?? 0).toLocaleString()} views</span>
+            </p>
             
             <h1 className="text-2xl lg:text-3xl font-black mb-3 leading-tight tracking-tight">{product.title}</h1>
             

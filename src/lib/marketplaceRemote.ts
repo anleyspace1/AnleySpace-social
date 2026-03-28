@@ -62,6 +62,7 @@ export function mapMarketplaceRowsToProducts(payload: Record<string, unknown>[])
         image,
         category: String(p.category ?? ''),
         stock: p.stock != null ? Number(p.stock) : undefined,
+        view_count: p.view_count != null ? Math.max(0, Number(p.view_count)) : 0,
         seller: { username: String(p.seller_username ?? 'seller').trim() || 'seller' },
       } as Product;
     })

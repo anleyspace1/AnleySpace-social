@@ -40,6 +40,8 @@ export type Product = {
   category: string;
   seller: Partial<User>;
   stock?: number;
+  /** Marketplace listing views (Supabase `marketplace.view_count`). */
+  view_count?: number;
 };
 
 export type Message = {
