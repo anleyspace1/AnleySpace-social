@@ -75,9 +75,11 @@ import BottomNav from './components/BottomNav';
 import CallManager from './components/CallManager';
 
 import { supabase } from './lib/supabase';
+import { buyCoins, COIN_PURCHASE_PACKAGES } from './lib/buyCoins';
 
 function Header({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (val: boolean) => void }) {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const [buyCoinsOpen, setBuyCoinsOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<any[]>([]);
   const [isSearching, setIsSearching] = useState(false);
@@ -281,6 +283,50 @@ function Header({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (va
             <Radio size={14} className="sm:size-[18px]" />
             <span className="hidden xs:inline sm:inline">Live</span>
           </NavLink>
+
+          {user && (
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setBuyCoinsOpen((o) => !o)}
+                className="flex items-center gap-1 text-indigo-600 dark:text-indigo-400 px-2 sm:px-3 py-1.5 rounded-full font-bold hover:bg-indigo-50 dark:hover:bg-indigo-950/40 transition-colors text-[10px] sm:text-sm"
+                title="Buy coins"
+              >
+                <Wallet size={14} className="sm:size-[18px]" />
+                <span className="hidden sm:inline">Buy coins</span>
+              </button>
+              {buyCoinsOpen && (
+                <>
+                  <button
+                    type="button"
+                    aria-label="Close buy coins menu"
+                    className="fixed inset-0 z-[55] cursor-default bg-transparent"
+                    onClick={() => setBuyCoinsOpen(false)}
+                  />
+                  <div className="absolute right-0 top-full mt-1 z-[56] w-52 rounded-xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-[#1a1c26] shadow-xl py-2 px-1">
+                    <p className="px-2 pb-1 text-[10px] font-bold uppercase tracking-wide text-gray-500">Buy coins</p>
+                    {COIN_PURCHASE_PACKAGES.map(({ coins, label, priceUsd }) => (
+                      <button
+                        key={coins}
+                        type="button"
+                        className="w-full text-left px-2 py-2 rounded-lg text-sm hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors flex justify-between gap-2"
+                        onClick={() => {
+                          void buyCoins(coins).catch((err: unknown) => {
+                            const msg = err instanceof Error ? err.message : 'Could not start checkout';
+                            window.alert(msg);
+                          });
+                          setBuyCoinsOpen(false);
+                        }}
+                      >
+                        <span className="font-semibold">{label}</span>
+                        <span className="text-indigo-600 dark:text-indigo-400 font-bold">{priceUsd}</span>
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
 
           <button 
             onClick={() => setDarkMode(!darkMode)}

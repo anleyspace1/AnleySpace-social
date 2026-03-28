@@ -42,6 +42,13 @@ export type Product = {
   stock?: number;
   /** Marketplace listing views (Supabase `marketplace.view_count`). */
   view_count?: number;
+  /** Supabase `marketplace.user_id` (seller); used for owner-only actions. */
+  user_id?: string;
+  /** DB `marketplace.is_featured` (raw); use for admin/analytics; UI uses effective `is_featured`. */
+  is_featured_raw?: boolean;
+  /** Effective featured (raw flag + `featured_until` window). Used by UI. */
+  is_featured?: boolean;
+  featured_until?: string | null;
 };
 
 export type Message = {

@@ -6,10 +6,12 @@ import db from "./src/lib/db.ts";
 import { v4 as uuidv4 } from 'uuid';
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
+import Stripe from 'stripe';
 import path from 'path';
 import fs from 'fs';
 import multer from 'multer';
 import { registerAssetsSystem } from './assets_system/registerAssetsSystem.ts';
+import { isMarketplaceEffectivelyFeatured } from './src/lib/marketplaceFeatured.ts';
 
 dotenv.config();
 
@@ -62,6 +64,21 @@ if (supabaseServiceUrl && supabaseServiceKey) {
     "SERVER: SUPABASE_SERVICE_ROLE_KEY or Supabase URL missing — feed likes/comments inserts will fail until configured."
   );
 }
+
+const stripeSecretKey = process.env.STRIPE_SECRET_KEY?.trim();
+const stripeWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET?.trim();
+const stripeClient: Stripe | null =
+  stripeSecretKey && stripeSecretKey.length > 0 ? new Stripe(stripeSecretKey) : null;
+if (!stripeClient) {
+  console.warn("SERVER: STRIPE_SECRET_KEY not set — coin checkout and webhook will return 503 until configured.");
+}
+
+/** USD cents per coin package (Stripe Checkout). */
+const STRIPE_COIN_PACKAGES: Record<number, { cents: number }> = {
+  100: { cents: 500 },
+  250: { cents: 1000 },
+  700: { cents: 2000 },
+};
 
 /**
  * Reads (GET /api/groups, joined list): prefer service role, else anon — avoids empty lists when only one key is set.
@@ -952,9 +969,124 @@ async function startServer() {
     });
   });
 
+  // Stripe webhook — raw body required for signature verification (must be before express.json()).
+  app.post(
+    '/api/stripe-webhook',
+    express.raw({ type: 'application/json' }),
+    async (req: Request, res: Response) => {
+      if (!stripeClient || !stripeWebhookSecret) {
+        return res.status(503).json({ error: 'Stripe webhook not configured' });
+      }
+      const sig = req.headers['stripe-signature'];
+      if (typeof sig !== 'string' || !sig) {
+        return res.status(400).json({ error: 'Missing stripe-signature' });
+      }
+      let event: Stripe.Event;
+      try {
+        const buf = req.body;
+        const payload = Buffer.isBuffer(buf) ? buf : Buffer.from(typeof buf === 'string' ? buf : JSON.stringify(buf ?? ''));
+        event = stripeClient.webhooks.constructEvent(payload, sig, stripeWebhookSecret);
+      } catch (err) {
+        console.warn('[stripe-webhook] signature verification failed', err);
+        return res.status(400).send('Webhook signature verification failed');
+      }
+
+      if (event.type === 'checkout.session.completed') {
+        const session = event.data.object as Stripe.Checkout.Session;
+        console.log('[stripe-webhook] checkout.session.completed', {
+          id: session.id,
+          amount_total: session.amount_total,
+          currency: session.currency,
+          customer_email: session.customer_email,
+          payment_status: session.payment_status,
+          metadata: session.metadata,
+          mode: session.mode,
+        });
+        const meta = session.metadata ?? {};
+        const userId = typeof meta.user_id === 'string' ? meta.user_id.trim() : '';
+        const coinsRaw = typeof meta.coins === 'string' ? meta.coins.trim() : '';
+        const coins = coinsRaw ? parseInt(coinsRaw, 10) : NaN;
+
+        if (!userId || !Number.isFinite(coins) || coins <= 0) {
+          console.warn('[stripe-webhook] checkout.session.completed missing or invalid metadata', {
+            hasUserId: !!userId,
+            coinsRaw,
+          });
+        } else if (!supabaseAdmin) {
+          console.error('[stripe-webhook] SUPABASE_SERVICE_ROLE_KEY missing — cannot credit wallet');
+        } else {
+          const { error: creditErr } = await supabaseAdmin.rpc('credit_wallet_coins', {
+            p_user_id: userId,
+            p_amount: coins,
+          });
+          if (creditErr) {
+            console.error('[stripe-webhook] credit_wallet_coins failed', creditErr);
+          }
+        }
+      }
+
+      return res.status(200).json({ received: true });
+    }
+  );
+
   // JSON/urlencoded parsers — must be registered before any route that reads req.body (e.g. POST /api/story-replies).
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ limit: '10mb', extended: true }));
+
+  app.post('/api/create-checkout-session', async (req, res) => {
+    try {
+      if (!stripeClient) {
+        return res.status(503).json({ error: 'Stripe not configured' });
+      }
+      const userId = await getAuthUserIdFromJwtHeader(req);
+      if (!userId) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+
+      const rawPkg = req.body?.coinsPackage;
+      const pkgKey = typeof rawPkg === 'string' ? parseInt(rawPkg, 10) : Number(rawPkg);
+      const pkg = STRIPE_COIN_PACKAGES[pkgKey];
+      if (!pkg || ![100, 250, 700].includes(pkgKey)) {
+        return res.status(400).json({ error: 'Invalid coins package' });
+      }
+
+      const baseRaw =
+        (process.env.APP_URL && String(process.env.APP_URL).trim()) ||
+        (process.env.CLIENT_URL && String(process.env.CLIENT_URL).trim()) ||
+        getRequestOrigin(req) ||
+        '';
+      const base = baseRaw.replace(/\/$/, '') || 'http://localhost:5173';
+
+      const checkoutSession = await stripeClient.checkout.sessions.create({
+        mode: 'payment',
+        line_items: [
+          {
+            price_data: {
+              currency: 'usd',
+              product_data: { name: `${pkgKey} AnleySpace coins` },
+              unit_amount: pkg.cents,
+            },
+            quantity: 1,
+          },
+        ],
+        success_url: `${base}/wallet?purchase=success`,
+        cancel_url: `${base}/wallet?purchase=cancel`,
+        metadata: {
+          user_id: userId,
+          coins: String(pkgKey),
+        },
+      });
+
+      if (!checkoutSession.url) {
+        return res.status(500).json({ error: 'No checkout URL' });
+      }
+
+      return res.json({ url: checkoutSession.url });
+    } catch (e) {
+      console.error('[create-checkout-session]', e);
+      return res.status(500).json({ error: 'Checkout failed' });
+    }
+  });
 
   // JSON body story (e.g. StoryEditor) — runs after body parsers via next() from multipart gate above
   app.post('/api/stories', async (req, res) => {
@@ -3196,6 +3328,7 @@ async function startServer() {
       const { data, error } = await client
         .from('marketplace')
         .select('*')
+        .order('is_featured', { ascending: false })
         .order('created_at', { ascending: false });
 
       console.log("marketplace data:", data);
@@ -3215,6 +3348,12 @@ async function startServer() {
         stock: 10,
         created_at: m.created_at,
         view_count: m.view_count != null ? Number(m.view_count) : 0,
+        is_featured_raw: Boolean(m.is_featured),
+        is_featured: isMarketplaceEffectivelyFeatured({
+          is_featured: m.is_featured,
+          featured_until: m.featured_until,
+        }),
+        featured_until: m.featured_until ?? null,
       }));
 
       const mergedById = new Map<string, Record<string, unknown>>();
@@ -3222,6 +3361,13 @@ async function startServer() {
         if (p && (p as { id?: string }).id) mergedById.set(String((p as { id: string }).id), p as Record<string, unknown>);
       }
       const rows = [...mergedById.values()].sort((a, b) => {
+        const fa = isMarketplaceEffectivelyFeatured(a as { is_featured?: unknown; featured_until?: unknown })
+          ? 1
+          : 0;
+        const fb = isMarketplaceEffectivelyFeatured(b as { is_featured?: unknown; featured_until?: unknown })
+          ? 1
+          : 0;
+        if (fa !== fb) return fb - fa;
         const ta = new Date((a as { created_at?: string }).created_at || 0).getTime();
         const tb = new Date((b as { created_at?: string }).created_at || 0).getTime();
         return tb - ta;
@@ -3302,6 +3448,12 @@ async function startServer() {
           stock: 10,
           created_at: m.created_at,
           view_count: m.view_count != null ? Number(m.view_count) : 0,
+          is_featured_raw: Boolean(m.is_featured),
+          is_featured: isMarketplaceEffectivelyFeatured({
+            is_featured: m.is_featured,
+            featured_until: m.featured_until,
+          }),
+          featured_until: m.featured_until ?? null,
         };
       }
 

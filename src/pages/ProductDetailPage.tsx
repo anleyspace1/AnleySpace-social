@@ -24,7 +24,12 @@ import {
   mapMarketplaceRowsToProducts,
 } from '../lib/marketplaceRemote';
 import { isProductSavedInMarketplace, setSavedMarketplaceProduct } from '../lib/savedMarketplace';
+import { BOOST_OPTIONS, boostMarketplaceProduct } from '../lib/marketplaceBoost';
+import { BOOST_COST, fetchOrCreateWalletBalance } from '../lib/marketplaceCoins';
+import { isMarketplaceEffectivelyFeatured } from '../lib/marketplaceFeatured';
 import { incrementMarketplaceView } from '../lib/incrementMarketplaceView';
+import { toggleMarketplaceLike } from '../lib/toggleMarketplaceLike';
+import { supabase } from '../lib/supabase';
 import { MOCK_USER } from '../constants';
 import { useAuth } from '../contexts/AuthContext';
 
@@ -39,6 +44,9 @@ export default function ProductDetailPage() {
 
   const [relatedProducts, setRelatedProducts] = useState<Product[]>([]);
   const [isProductSaved, setIsProductSaved] = useState(false);
+  const [liked, setLiked] = useState(false);
+  const [likeCount, setLikeCount] = useState<number | null>(null);
+  const [walletBalance, setWalletBalance] = useState<number | null>(null);
   /** Lowercase listing id — one increment per successful load for that listing. */
   const viewIncrementedKeyRef = useRef<string | null>(null);
 
@@ -69,6 +77,49 @@ export default function ProductDetailPage() {
       cancelled = true;
     };
   }, [user?.id, product?.id]);
+
+  useEffect(() => {
+    if (!user || !product?.id) return;
+
+    supabase
+      .from('marketplace_likes')
+      .select('id')
+      .eq('product_id', product.id)
+      .eq('user_id', user.id)
+      .maybeSingle()
+      .then(({ data }) => {
+        setLiked(!!data);
+      });
+  }, [user?.id, product?.id]);
+
+  useEffect(() => {
+    if (!product?.id) return;
+    supabase
+      .from('marketplace_likes')
+      .select('*', { count: 'exact', head: true })
+      .eq('product_id', product.id)
+      .then(({ count, error }) => {
+        if (error) {
+          setLikeCount(null);
+          return;
+        }
+        setLikeCount(count ?? 0);
+      });
+  }, [product?.id, user?.id]);
+
+  useEffect(() => {
+    if (!user?.id || !product?.user_id || user.id !== product.user_id) {
+      setWalletBalance(null);
+      return;
+    }
+    let cancelled = false;
+    void fetchOrCreateWalletBalance(user.id).then((b) => {
+      if (!cancelled && b !== null) setWalletBalance(b);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id, product?.user_id]);
 
   useEffect(() => {
     console.log('[VIEW EFFECT TRIGGER]', {
@@ -133,6 +184,7 @@ export default function ProductDetailPage() {
       const sellerId = String((data as { seller_id?: string }).seller_id ?? '').trim();
       setProduct({
         ...(data as Product),
+        user_id: sellerId || (data as { user_id?: string }).user_id,
         seller: {
           username: (data.seller_username as string) || 'seller',
           ...(sellerId ? { id: sellerId } : {}),
@@ -145,6 +197,7 @@ export default function ProductDetailPage() {
         const sid = String((direct as { seller_id?: string }).seller_id ?? '').trim();
         setProduct({
           ...(direct as Product),
+          user_id: sid || (direct as { user_id?: string }).user_id,
           seller: {
             username: (direct.seller_username as string) || 'seller',
             ...(sid ? { id: sid } : {}),
@@ -230,6 +283,44 @@ export default function ProductDetailPage() {
     }
   };
 
+  const handleLike = async () => {
+    if (!user || !product?.id) return;
+
+    const res = await toggleMarketplaceLike(product.id, user.id);
+
+    setLiked(res.liked);
+    setLikeCount((c) => {
+      if (c != null) return res.liked ? c + 1 : c - 1;
+      return res.liked ? 1 : 0;
+    });
+  };
+
+  const toggleFeatured = async () => {
+    if (!user || !product?.id) return;
+
+    const prevRaw = product.is_featured_raw ?? product.is_featured;
+    const newRaw = !prevRaw;
+
+    const { error } = await supabase
+      .from('marketplace')
+      .update({ is_featured: newRaw })
+      .eq('id', product.id);
+
+    if (error) {
+      console.warn('[ProductDetail] toggle featured', error);
+      return;
+    }
+
+    setProduct((prev) => {
+      if (!prev) return prev;
+      const effective = isMarketplaceEffectivelyFeatured({
+        is_featured: newRaw,
+        featured_until: prev.featured_until,
+      });
+      return { ...prev, is_featured_raw: newRaw, is_featured: effective };
+    });
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-[60vh]">
@@ -277,30 +368,43 @@ export default function ProductDetailPage() {
               alt={product.title} 
               className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-700" 
             />
-            <button
-              type="button"
-              aria-label={isProductSaved ? 'Unsave' : 'Save'}
-              onClick={async (e) => {
-                e.stopPropagation();
-                if (!user?.id || !product?.id) {
-                  alert('Please log in to save items');
-                  return;
-                }
-                const next = !isProductSaved;
-                try {
-                  await setSavedMarketplaceProduct(user.id, product.id, next);
-                  setIsProductSaved(next);
-                } catch (err) {
-                  console.error('[ProductDetail] save toggle', err);
-                }
-              }}
-              className={cn(
-                'absolute top-4 right-4 w-10 h-10 bg-white/90 dark:bg-black/90 backdrop-blur-md rounded-full flex items-center justify-center transition-colors shadow-md',
-                isProductSaved ? 'text-red-500' : 'text-gray-600 dark:text-white hover:text-red-500'
-              )}
-            >
-              <Heart size={20} className={isProductSaved ? 'fill-current' : ''} />
-            </button>
+            <div className="absolute top-4 right-4 z-10 flex gap-2 items-center">
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void handleLike();
+                }}
+                className="h-10 w-10 flex shrink-0 items-center justify-center rounded-full bg-white/90 text-lg shadow-md backdrop-blur-md dark:bg-black/90"
+                aria-label={liked ? 'Unlike' : 'Like'}
+              >
+                {liked ? '❤️' : '🤍'}
+              </button>
+              <button
+                type="button"
+                aria-label={isProductSaved ? 'Unsave' : 'Save'}
+                onClick={async (e) => {
+                  e.stopPropagation();
+                  if (!user?.id || !product?.id) {
+                    alert('Please log in to save items');
+                    return;
+                  }
+                  const next = !isProductSaved;
+                  try {
+                    await setSavedMarketplaceProduct(user.id, product.id, next);
+                    setIsProductSaved(next);
+                  } catch (err) {
+                    console.error('[ProductDetail] save toggle', err);
+                  }
+                }}
+                className={cn(
+                  'flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white/90 shadow-md backdrop-blur-md transition-colors dark:bg-black/90',
+                  isProductSaved ? 'text-red-500' : 'text-gray-600 dark:text-white hover:text-red-500'
+                )}
+              >
+                <Heart size={20} className={isProductSaved ? 'fill-current' : ''} />
+              </button>
+            </div>
             <div className="absolute top-4 left-4 flex flex-col gap-2">
               <span className="bg-indigo-600 text-white px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest shadow-lg shadow-indigo-600/20">
                 {product.category}
@@ -329,9 +433,14 @@ export default function ProductDetailPage() {
         <div className="lg:col-span-5 flex flex-col">
           <div className="mb-6">
             <div className="flex items-center justify-between items-start mb-4">
-              <div className="flex items-center gap-2 text-indigo-600 font-black text-3xl">
-                <Coins size={28} />
-                <span>{product.price.toLocaleString()}</span>
+              <div className="flex flex-col gap-1">
+                <div className="flex items-center gap-2 text-indigo-600 font-black text-3xl">
+                  <Coins size={28} />
+                  <span>{product.price.toLocaleString()}</span>
+                </div>
+                {product.is_featured ? (
+                  <p className="text-sm font-bold text-amber-600 dark:text-amber-400">⭐ Featured Listing</p>
+                ) : null}
               </div>
               <div 
                 onClick={() => {
@@ -344,6 +453,79 @@ export default function ProductDetailPage() {
                 <span className="group-hover:underline">{product.location}</span>
               </div>
             </div>
+            {user?.id === product?.user_id && (
+              <div style={{ marginTop: '12px' }} className="mb-3">
+                {walletBalance !== null && (
+                  <p className="mb-2 text-sm font-semibold text-gray-800 dark:text-gray-200">
+                    Coins: {walletBalance.toLocaleString()}
+                  </p>
+                )}
+                <strong className="text-sm text-gray-900 dark:text-gray-100">Boost this listing</strong>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {BOOST_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.days}
+                      type="button"
+                      onClick={async () => {
+                        const res = await boostMarketplaceProduct(product.id, opt.days);
+
+                        if (!res.ok) {
+                          const err = res.error;
+                          const msg =
+                            typeof err === 'string'
+                              ? err
+                              : err && typeof err === 'object' && 'message' in err
+                                ? String((err as { message?: string }).message)
+                                : 'Boost failed';
+                          alert(msg);
+                          return;
+                        }
+
+                        const untilStr = res.until.toISOString();
+                        setProduct((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                is_featured_raw: true,
+                                is_featured: isMarketplaceEffectivelyFeatured({
+                                  is_featured: true,
+                                  featured_until: untilStr,
+                                }),
+                                featured_until: untilStr,
+                              }
+                            : prev
+                        );
+                        if (user?.id) {
+                          const b = await fetchOrCreateWalletBalance(user.id);
+                          if (b !== null) setWalletBalance(b);
+                        }
+                      }}
+                      className="rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-1.5 text-xs font-semibold text-indigo-800 hover:bg-indigo-100 dark:border-indigo-800 dark:bg-indigo-950/50 dark:text-indigo-200 dark:hover:bg-indigo-900/50"
+                    >
+                      {opt.label}{' '}
+                      <span className="opacity-80">({BOOST_COST[opt.days]} coins)</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {user?.id &&
+            (user.id === product.user_id || user.id === product.seller?.id) ? (
+              <div className="mb-3">
+                <button
+                  type="button"
+                  onClick={() => void toggleFeatured()}
+                  className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5 text-xs font-semibold text-gray-700 hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
+                >
+                  Toggle Featured
+                </button>
+              </div>
+            ) : null}
+            {likeCount !== null && (
+              <p className="mb-2 text-sm text-gray-500 dark:text-gray-400">
+                {likeCount.toLocaleString()} likes
+              </p>
+            )}
             <p className="flex items-center gap-1.5 text-gray-500 dark:text-gray-400 text-sm font-medium mb-4">
               <Eye size={16} className="shrink-0 opacity-80" aria-hidden />
               <span>{(product.view_count ?? 0).toLocaleString()} views</span>

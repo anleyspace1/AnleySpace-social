@@ -3,6 +3,7 @@
  * GET /api/marketplace/products returns HTML — use Supabase directly for public.marketplace rows.
  */
 import type { Product } from '../types';
+import { isMarketplaceEffectivelyFeatured } from './marketplaceFeatured';
 import { resolveMarketplaceListingImageUrl } from './marketplaceImage';
 import { supabase } from './supabase';
 
@@ -10,6 +11,7 @@ export async function fetchMarketplaceTableRowsAsApiProducts(): Promise<Record<s
   const { data, error } = await supabase
     .from('marketplace')
     .select('*')
+    .order('is_featured', { ascending: false })
     .order('created_at', { ascending: false });
 
   console.log('Marketplace rows:', data ?? null, error ? { error } : null);
@@ -20,7 +22,16 @@ export async function fetchMarketplaceTableRowsAsApiProducts(): Promise<Record<s
   }
   if (!data?.length) return [];
 
-  const ids = [...new Set(data.map((r: { user_id?: string }) => r.user_id).filter(Boolean))] as string[];
+  const sortedRows = [...data].sort((a, b) => {
+    const fa = isMarketplaceEffectivelyFeatured(a as Record<string, unknown>) ? 1 : 0;
+    const fb = isMarketplaceEffectivelyFeatured(b as Record<string, unknown>) ? 1 : 0;
+    if (fa !== fb) return fb - fa;
+    const ta = new Date(String((a as { created_at?: string }).created_at || 0)).getTime();
+    const tb = new Date(String((b as { created_at?: string }).created_at || 0)).getTime();
+    return tb - ta;
+  });
+
+  const ids = [...new Set(sortedRows.map((r: { user_id?: string }) => r.user_id).filter(Boolean))] as string[];
   const profileMap = new Map<string, string>();
   if (ids.length) {
     const { data: profs } = await supabase.from('profiles').select('id, username').in('id', ids);
@@ -28,7 +39,7 @@ export async function fetchMarketplaceTableRowsAsApiProducts(): Promise<Record<s
       if (p.id) profileMap.set(p.id, p.username || 'Unknown');
     });
   }
-  return data.map((m: Record<string, unknown>) => ({
+  return sortedRows.map((m: Record<string, unknown>) => ({
     ...m,
     id: m.id,
     title: m.title,
@@ -40,6 +51,8 @@ export async function fetchMarketplaceTableRowsAsApiProducts(): Promise<Record<s
     description: '',
     stock: 10,
     created_at: m.created_at,
+    is_featured_raw: Boolean(m.is_featured),
+    is_featured: isMarketplaceEffectivelyFeatured(m),
     seller_username: profileMap.get(String(m.user_id)) || 'Unknown',
   }));
 }
@@ -52,10 +65,19 @@ export function mapMarketplaceRowsToProducts(payload: Record<string, unknown>[])
       const sellerId = String(p.seller_id ?? '').trim();
       if (!id || !sellerId) return null;
       const image = resolveMarketplaceListingImageUrl(String(p.image ?? ''));
+      const is_featured_raw =
+        p.is_featured_raw !== undefined && p.is_featured_raw !== null
+          ? Boolean(p.is_featured_raw)
+          : Boolean(p.is_featured);
+      const effectiveFeatured = isMarketplaceEffectivelyFeatured({
+        is_featured: is_featured_raw,
+        featured_until: p.featured_until,
+      });
       return {
         ...p,
         id,
         seller_id: sellerId,
+        user_id: sellerId,
         title: String(p.title ?? ''),
         price: Number(p.price) || 0,
         location: String(p.location ?? ''),
@@ -63,6 +85,12 @@ export function mapMarketplaceRowsToProducts(payload: Record<string, unknown>[])
         category: String(p.category ?? ''),
         stock: p.stock != null ? Number(p.stock) : undefined,
         view_count: p.view_count != null ? Math.max(0, Number(p.view_count)) : 0,
+        is_featured_raw,
+        is_featured: effectiveFeatured,
+        featured_until:
+          p.featured_until != null && String(p.featured_until).trim() !== ''
+            ? String(p.featured_until)
+            : null,
         seller: { username: String(p.seller_username ?? 'seller').trim() || 'seller' },
       } as Product;
     })
@@ -77,6 +105,7 @@ export async function fetchSingleProductAsApiShape(id: string): Promise<Record<s
       const { data: prof } = await supabase.from('profiles').select('username').eq('id', m.user_id).maybeSingle();
       if (prof?.username) seller_username = prof.username;
     }
+    const row = m as Record<string, unknown>;
     return {
       ...m,
       id: m.id,
@@ -89,6 +118,8 @@ export async function fetchSingleProductAsApiShape(id: string): Promise<Record<s
       description: '',
       stock: 10,
       created_at: m.created_at,
+      is_featured_raw: Boolean(m.is_featured),
+      is_featured: isMarketplaceEffectivelyFeatured(row),
       seller_username,
     };
   }
