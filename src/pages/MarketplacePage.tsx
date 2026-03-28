@@ -25,6 +25,7 @@ import { cn } from '../lib/utils';
 import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../lib/supabase';
 import { apiUrl } from '../lib/apiOrigin';
+import { productImagePublicUrl } from '../lib/marketplaceImage';
 import { ResponsiveImage } from '../components/ResponsiveImage';
 
 export default function MarketplacePage() {
@@ -67,17 +68,21 @@ export default function MarketplacePage() {
         .from('posts')
         .select('*')
         .order('created_at', { ascending: false });
-      
+
+      console.log('marketplace data:', data);
+      console.log('marketplace error:', error);
+
       if (error) throw error;
-      if (data) {
-        setPosts(data.map((p: any) => ({
+      setPosts(
+        (data || []).map((p: any) => ({
           ...p,
           user: { username: p.username || 'unknown', avatar: p.avatar_url || `https://picsum.photos/seed/${p.user_id}/100/100` },
           timestamp: p.created_at
-        })));
-      }
+        }))
+      );
     } catch (err) {
-      console.error("Error fetching posts:", err);
+      console.log('marketplace error:', err);
+      setPosts([]);
     }
   };
 
@@ -119,14 +124,35 @@ export default function MarketplacePage() {
   const fetchProducts = async () => {
     try {
       const res = await fetch(apiUrl('/api/marketplace/products'));
-      const data = await res.json();
-      setProducts(data.map((p: any) => ({
-        ...p,
-        image: p.image || `https://picsum.photos/seed/${p.id}/400/400`,
-        seller: { username: p.seller_username }
-      })));
+      let payload: unknown;
+      try {
+        payload = await res.json();
+      } catch (parseErr) {
+        console.log('marketplace error:', parseErr);
+        setProducts([]);
+        return;
+      }
+      console.log('marketplace data:', payload);
+      if (!res.ok) {
+        console.log('marketplace error:', (payload as { error?: string })?.error ?? res.statusText);
+        setProducts([]);
+        return;
+      }
+      if (!Array.isArray(payload)) {
+        console.log('marketplace error:', 'Expected array of products');
+        setProducts([]);
+        return;
+      }
+      setProducts(
+        payload.map((p: any) => ({
+          ...p,
+          image: productImagePublicUrl(p.image) || `https://picsum.photos/seed/${p.id}/400/400`,
+          seller: { username: p.seller_username }
+        }))
+      );
     } catch (err) {
-      console.error("Error fetching products:", err);
+      console.log('marketplace error:', err);
+      setProducts([]);
     }
   };
 
@@ -213,26 +239,30 @@ export default function MarketplacePage() {
     
     let finalImageUrl = `https://picsum.photos/seed/${Date.now()}/400/400`;
 
-    // Upload first image to Supabase if available
+    // Same upload + public URL flow as Home feed post images (`feed/{userId}/...` in `posts` bucket)
     if (selectedImages.length > 0) {
       try {
         const file = selectedImages[0];
-        const fileExt = file.name.split('.').pop();
-        const fileName = `${user.id}/${Date.now()}.${fileExt}`;
-        const filePath = `marketplace/${fileName}`;
+        const ext = file.name.includes('.') ? file.name.split('.').pop() : 'jpg';
+        const safeName = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
+        const filePath = `feed/${user.id}/${safeName}`;
 
-        const { data: uploadData, error: uploadError } = await supabase.storage
-          .from('posts') // Reusing posts bucket
-          .upload(filePath, file);
+        const { data: uploadData, error: uploadError } = await supabase.storage.from('posts').upload(filePath, file);
 
-        if (!uploadError) {
-          const { data: publicUrlData } = supabase.storage
-            .from('posts')
-            .getPublicUrl(filePath);
-          finalImageUrl = publicUrlData.publicUrl;
+        if (uploadError) {
+          if (uploadError.message.includes('Bucket not found')) {
+            console.log('marketplace error:', 'Storage bucket "posts" not found. Create a public "posts" bucket in Supabase.');
+          } else {
+            console.log('marketplace error:', uploadError);
+          }
+        } else {
+          const uploadedPath = uploadData?.path ?? filePath;
+          const { data: { publicUrl } } = supabase.storage.from('posts').getPublicUrl(uploadedPath);
+          console.log('PRODUCT IMAGE URL:', publicUrl);
+          finalImageUrl = publicUrl;
         }
       } catch (err) {
-        console.error("Error uploading product image:", err);
+        console.log('marketplace error:', err);
       }
     }
     
@@ -253,13 +283,21 @@ export default function MarketplacePage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      
-      if (res.ok) {
-        fetchProducts();
-        closePostModal();
+      let body: unknown;
+      try {
+        body = await res.json();
+      } catch {
+        body = null;
       }
+      console.log('marketplace data:', body);
+      if (!res.ok) {
+        console.log('marketplace error:', (body as { error?: string })?.error ?? res.statusText);
+        return;
+      }
+      fetchProducts();
+      closePostModal();
     } catch (err) {
-      console.error("Error posting product:", err);
+      console.log('marketplace error:', err);
     }
   };
 
@@ -419,7 +457,7 @@ export default function MarketplacePage() {
                       onClick={() => handleLocationClick(product.location)}
                     >
                       <MapPin size={12} />
-                      <span className="truncate">{product.location.split(',')[0]}</span>
+                      <span className="truncate">{(product.location || '').split(',')[0] || '—'}</span>
                     </div>
                     
                     <div className="mt-auto">

@@ -21,6 +21,7 @@ import {
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { cn } from '../lib/utils';
 import { apiUrl } from '../lib/apiOrigin';
+import { productImagePublicUrl } from '../lib/marketplaceImage';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import { ResponsiveImage } from '../components/ResponsiveImage';
@@ -313,7 +314,7 @@ export default function ExplorePage() {
                           className="bg-[#1a1c26] p-3 rounded-2xl flex items-center gap-3 group cursor-pointer"
                         >
                           <div className="w-10 h-10 bg-[#252836] rounded-lg flex items-center justify-center p-1">
-                            <ResponsiveImage src={product.image} width={100} height={100} className="w-full h-full object-contain" alt="" />
+                            <ResponsiveImage src={productImagePublicUrl(product.image) || product.image} width={100} height={100} className="w-full h-full object-contain" alt="" />
                           </div>
                           <div className="flex-1">
                             <h3 className="text-sm font-bold">{product.name}</h3>

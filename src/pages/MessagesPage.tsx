@@ -527,7 +527,9 @@ export default function MessagesPage() {
   const [userCoins, setUserCoins] = useState(profile?.coins || 0);
   
   const [callError, setCallError] = useState<string | null>(null);
-  
+  const [callStatus, setCallStatus] = useState<'calling' | 'ringing' | 'connected' | 'ended'>('calling');
+  const [callDuration, setCallDuration] = useState(0);
+
   const socketRef = useRef<any>(null);
   const peersRef = useRef<any[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
@@ -597,9 +599,22 @@ export default function MessagesPage() {
       }, 2000);
     });
 
+    socketRef.current.on('call_ringing', () => {
+      setCallStatus('ringing');
+    });
+
+    socketRef.current.on('call_accepted', () => {
+      setCallStatus('connected');
+    });
+
+    socketRef.current.on('call_ended', () => {
+      setCallStatus('ended');
+    });
+
     socketRef.current.on('call:response', (data: any) => {
       console.log('Call response received:', data);
       if (data.response === 'accepted') {
+        setCallStatus('connected');
         setActiveCall(prev => prev ? { ...prev, status: 'active' } : null);
       } else {
         setActiveCall(null);
@@ -610,6 +625,7 @@ export default function MessagesPage() {
 
     socketRef.current.on('call:ended', (data: any) => {
       console.log('Call ended by remote user');
+      setCallStatus('ended');
       setActiveCall(null);
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(track => track.stop());
@@ -620,6 +636,46 @@ export default function MessagesPage() {
       socketRef.current?.disconnect();
     };
   }, []);
+
+  useEffect(() => {
+    if (!activeCall) {
+      setCallDuration(0);
+      setCallStatus('calling');
+      return;
+    }
+    setCallDuration(0);
+    if (activeCall.status === 'active') {
+      setCallStatus('connected');
+    } else {
+      setCallStatus('calling');
+    }
+  }, [activeCall?.id]);
+
+  useEffect(() => {
+    if (activeCall?.status === 'active') {
+      setCallStatus('connected');
+    }
+  }, [activeCall?.status]);
+
+  useEffect(() => {
+    let interval: ReturnType<typeof setInterval> | undefined;
+    if (callStatus === 'connected') {
+      interval = setInterval(() => {
+        setCallDuration((prev) => prev + 1);
+      }, 1000);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [callStatus]);
+
+  useEffect(() => {
+    if (activeCall?.status !== 'calling' || activeCall.hostId !== user?.id) return;
+    const t = setTimeout(() => {
+      setCallStatus((prev) => (prev === 'calling' ? 'ringing' : prev));
+    }, 700);
+    return () => clearTimeout(t);
+  }, [activeCall?.id, activeCall?.status, activeCall?.hostId, user?.id]);
 
   useEffect(() => {
     const socket = socketRef.current;
@@ -1492,8 +1548,17 @@ export default function MessagesPage() {
                 <div>
                   <h3 className="font-bold">{selectedChat.user.displayName}</h3>
                   <p className="text-xs opacity-80">
-                    {activeCall.status === 'calling' ? 'Calling...' : `${participants.length + 1} participants • ${activeCall.type === 'audio' ? 'Audio' : 'Video'} Call`}
-                    {isLive && ` • ${viewerCount} Viewers`}
+                    {callStatus === 'connected' && (
+                      <>
+                        {participants.length + 1} participants • {activeCall.type === 'audio' ? 'Audio' : 'Video'} Call
+                        {isLive && ` • ${viewerCount} Viewers`}
+                      </>
+                    )}
+                  </p>
+                  <p className="text-gray-400 mt-2">
+                    {callStatus === 'calling' && 'Calling...'}
+                    {callStatus === 'ringing' && 'Ringing...'}
+                    {callStatus === 'connected' && formatTime(callDuration)}
                   </p>
                 </div>
               </div>
@@ -1644,8 +1709,10 @@ export default function MessagesPage() {
                     <img src={selectedChat.user.avatar} alt="" className="w-40 h-40 rounded-full border-4 border-indigo-500 object-cover" />
                   </motion.div>
                   <h2 className="text-3xl font-bold text-white mb-2">{selectedChat.user.displayName}</h2>
-                  <p className="text-indigo-400 font-bold tracking-widest uppercase text-sm">
-                    {activeCall.status === 'calling' ? 'Calling...' : 'Active Call'}
+                  <p className="text-gray-400 mt-2">
+                    {callStatus === 'calling' && 'Calling...'}
+                    {callStatus === 'ringing' && 'Ringing...'}
+                    {callStatus === 'connected' && formatTime(callDuration)}
                   </p>
                   
                   {/* Participant List for Audio Call */}

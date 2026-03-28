@@ -3168,24 +3168,58 @@ async function startServer() {
     res.json(orders);
   });
 
-  // Marketplace Endpoints
+  // Marketplace Endpoints (prefer service role so reads match production DB; avoid fragile embeds)
   app.get("/api/marketplace/products", async (req, res) => {
     try {
-      const { data, error } = await supabase
+      const client = supabaseAdmin || supabase;
+      if (!client) {
+        const products = db.prepare(`
+          SELECT p.*, u.username as seller_username
+          FROM products p
+          JOIN users u ON p.seller_id = u.id
+          ORDER BY p.id DESC
+        `).all();
+        console.log("marketplace data:", products);
+        console.log("marketplace error:", null);
+        return res.json(products);
+      }
+
+      const { data, error } = await client
         .from('products')
-        .select('*, profiles(username)')
+        .select('*')
         .order('created_at', { ascending: false });
-      
+
+      console.log("marketplace data:", data);
+      console.log("marketplace error:", error);
+
       if (error) throw error;
-      
-      const products = (data || []).map(p => ({
+
+      const rows = data || [];
+      const sellerIds = [...new Set(rows.map((p: { seller_id?: string }) => p.seller_id).filter(Boolean))] as string[];
+      const profileMap = new Map<string, string>();
+      if (sellerIds.length > 0) {
+        const { data: profs, error: pErr } = await client
+          .from('profiles')
+          .select('id, username')
+          .in('id', sellerIds);
+        console.log("marketplace profiles:", profs);
+        console.log("marketplace profiles error:", pErr);
+        if (!pErr && profs) {
+          (profs as { id: string; username?: string }[]).forEach((p) => {
+            if (p.id) profileMap.set(p.id, p.username || 'Unknown');
+          });
+        }
+      }
+
+      const products = rows.map((p: Record<string, unknown>) => ({
         ...p,
-        seller_username: p.profiles?.username || 'Unknown'
+        seller_username: profileMap.get(p.seller_id as string) || 'Unknown',
       }));
-      
+
       res.json(products);
     } catch (err) {
       logToFile(`SERVER: Supabase products fetch error: ${err}`);
+      console.log("marketplace error:", err);
       const products = db.prepare(`
         SELECT p.*, u.username as seller_username
         FROM products p
@@ -3198,30 +3232,59 @@ async function startServer() {
 
   app.get("/api/marketplace/products/:id", async (req, res) => {
     try {
-      const { data, error } = await supabase
+      const client = supabaseAdmin || supabase;
+      if (!client) {
+        const product = db.prepare(`
+          SELECT p.*, u.username as seller_username
+          FROM products p
+          JOIN users u ON p.seller_id = u.id
+          WHERE p.id = ?
+        `).get(req.params.id);
+        console.log("marketplace data:", product);
+        console.log("marketplace error:", null);
+        if (!product) return res.status(404).json({ error: 'Product not found' });
+        return res.json(product);
+      }
+
+      const { data, error } = await client
         .from('products')
-        .select('*, profiles(username)')
+        .select('*')
         .eq('id', req.params.id)
         .single();
-      
+
+      console.log("marketplace data:", data);
+      console.log("marketplace error:", error);
+
       if (error) throw error;
       if (!data) return res.status(404).json({ error: 'Product not found' });
-      
+
+      let seller_username = 'Unknown';
+      if (data.seller_id) {
+        const { data: prof, error: pErr } = await client
+          .from('profiles')
+          .select('username')
+          .eq('id', data.seller_id)
+          .single();
+        console.log("marketplace profiles error:", pErr);
+        if (!pErr && prof?.username) seller_username = prof.username;
+      }
+
       const product = {
         ...data,
-        seller_username: data.profiles?.username || 'Unknown'
+        seller_username,
       };
-      
+
       res.json(product);
     } catch (err) {
       logToFile(`SERVER: Supabase product fetch error: ${err}`);
+      console.log("marketplace error:", err);
       const product = db.prepare(`
         SELECT p.*, u.username as seller_username
         FROM products p
         JOIN users u ON p.seller_id = u.id
         WHERE p.id = ?
       `).get(req.params.id);
-      
+
       if (!product) return res.status(404).json({ error: 'Product not found' });
       res.json(product);
     }
@@ -3236,20 +3299,23 @@ async function startServer() {
       db.prepare('INSERT INTO products (id, title, price, category, location, image, seller_id, description, stock) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
         .run(id, title, price, category, location, image, sellerId, description || '', stock || 10);
       
-      // Sync to Supabase
+      // Sync to Supabase (prefer service role so RLS never blocks server-side upsert)
       try {
-        const { error: syncError } = await supabase.from('products').upsert({
-          id,
-          title,
-          price,
-          category,
-          location,
-          image,
-          seller_id: sellerId,
-          description: description || '',
-          stock: stock || 10
-        });
-        if (syncError) logToFile(`SERVER: Supabase product sync error: ${syncError.message}`);
+        const syncClient = supabaseAdmin || supabase;
+        if (syncClient) {
+          const { error: syncError } = await syncClient.from('products').upsert({
+            id,
+            title,
+            price,
+            category,
+            location,
+            image,
+            seller_id: sellerId,
+            description: description || '',
+            stock: stock || 10
+          });
+          if (syncError) logToFile(`SERVER: Supabase product sync error: ${syncError.message}`);
+        }
       } catch (e) {
         logToFile(`SERVER: Supabase product sync exception: ${e}`);
       }
@@ -4002,6 +4068,8 @@ async function startServer() {
   // Game Sessions State
   const activeGames = new Map<string, any>();
   const socketToRoom = new Map<string, string>();
+  /** userId -> socket.id for presence (user_online / user_offline). */
+  const onlineUsers = new Map<string, string>();
   const hostSockets = new Set<string>();
 
   io.on("connection", (socket) => {
@@ -4030,6 +4098,32 @@ async function startServer() {
       });
     });
 
+    socket.on("typing", ({ groupId, userId, username }: { groupId?: string; userId?: string; username?: string }) => {
+      if (!groupId || !userId) return;
+      socket.to(`group_${groupId}`).emit("user_typing", {
+        userId,
+        username: username || "Someone",
+      });
+    });
+
+    socket.on("stop_typing", ({ groupId, userId }: { groupId?: string; userId?: string }) => {
+      if (!groupId || !userId) return;
+      socket.to(`group_${groupId}`).emit("user_stop_typing", {
+        userId,
+      });
+    });
+
+    socket.on(
+      "message_seen",
+      ({ messageId, userId, groupId }: { messageId?: string; userId?: string; groupId?: string }) => {
+        if (!messageId || !groupId) return;
+        socket.to(`group_${groupId}`).emit("message_seen_update", {
+          messageId,
+          userId,
+        });
+      }
+    );
+
     socket.on("send_group_message", async (data) => {
       const groupId = data?.groupId ?? data?.group_id;
       const userId = data?.userId ?? data?.user_id;
@@ -4052,6 +4146,9 @@ async function startServer() {
       }
 
       const messageId = uuidv4();
+      /** Prefer Supabase `messages.id` from the client when present (group chat uses `messages`, not only SQLite history). */
+      const clientMessageId =
+        data?.id != null && String(data.id).trim() !== "" ? String(data.id) : messageId;
       const timestamp = new Date().toISOString();
 
       // Save to local DB
@@ -4092,6 +4189,39 @@ async function startServer() {
           audio_url: audioUrl || null,
           image_url: imageUrl || null
         });
+
+        // Group message notifications (Supabase + socket ping for clients in the room)
+        socket.to(`group_${groupId}`).emit("new_notification", {
+          groupId,
+          messageId: clientMessageId,
+          senderId: userId,
+        });
+
+        if (supabaseAdmin) {
+          const members = db
+            .prepare(
+              "SELECT user_id FROM group_members WHERE group_id = ? AND user_id != ?"
+            )
+            .all(groupId, userId) as { user_id: string }[];
+          if (members.length > 0) {
+            const rows = members.map((m) => ({
+              user_id: m.user_id,
+              type: "group_message",
+              message_id: clientMessageId,
+              group_id: groupId,
+              is_read: false,
+            }));
+            void supabaseAdmin.from("notifications").insert(rows).then(({ error }: { error: { code?: string; message?: string } | null }) => {
+              if (error) {
+                if (error.code === "42P01") {
+                  console.warn('Supabase table "notifications" does not exist. Skipping group notification inserts.');
+                } else {
+                  console.warn("Supabase group notifications insert:", error.message);
+                }
+              }
+            });
+          }
+        }
       } catch (err) {
         console.error('Error saving group message:', err);
       }
@@ -4421,8 +4551,13 @@ async function startServer() {
       io.to(`call:${callId}`).emit('call:is_live', { streamId });
     });
 
-    socket.on('register_user', (userId) => {
+    socket.on('register_user', (payload: string | { userId?: string } | undefined) => {
+      const userId =
+        typeof payload === 'string' ? payload : payload && typeof payload === 'object' ? payload.userId : undefined;
+      if (!userId) return;
       socket.join(`user_${userId}`);
+      onlineUsers.set(userId, socket.id);
+      io.emit('user_online', { userId });
       console.log(`User ${userId} registered with socket ${socket.id}`);
     });
 
@@ -4486,6 +4621,13 @@ async function startServer() {
 
     socket.on("disconnect", () => {
       console.log("Client disconnected:", socket.id);
+      for (const [userId, socketId] of onlineUsers.entries()) {
+        if (socketId === socket.id) {
+          onlineUsers.delete(userId);
+          io.emit("user_offline", { userId });
+          break;
+        }
+      }
       const streamId = socketToRoom.get(socket.id);
       if (streamId) {
         if (hostSockets.has(socket.id)) {

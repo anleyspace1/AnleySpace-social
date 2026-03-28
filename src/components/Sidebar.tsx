@@ -19,6 +19,7 @@ import { MOCK_USER } from '../constants';
 import { useAuth } from '../contexts/AuthContext';
 import { ResponsiveImage } from './ResponsiveImage';
 import { supabase } from '../lib/supabase';
+import { useGroupNotificationsOptional } from '../contexts/GroupNotificationsContext';
 
 export type SidebarNavAppearance = 'default' | 'darkColumn';
 
@@ -35,6 +36,8 @@ export default function Sidebar({
   navAppearance?: SidebarNavAppearance;
 }) {
   const { user, signOut } = useAuth();
+  const groupNotif = useGroupNotificationsOptional();
+  const groupUnread = groupNotif?.unreadCount ?? 0;
   const [displayUser, setDisplayUser] = useState({
     displayName: 'User',
     username: 'user',
@@ -119,7 +122,14 @@ export default function Sidebar({
         <nav className="space-y-1">
           <SidebarLink to="/" icon={<Home size={20} />} label="Home" onClick={onClose} navAppearance={navAppearance} />
           <SidebarLink to="/friends" icon={<Users size={20} />} label="Friends" onClick={onClose} navAppearance={navAppearance} />
-          <SidebarLink to="/groups" icon={<LayoutGrid size={20} />} label="Groups" onClick={onClose} navAppearance={navAppearance} />
+          <SidebarLink
+            to="/groups"
+            icon={<LayoutGrid size={20} />}
+            label="Groups"
+            onClick={onClose}
+            navAppearance={navAppearance}
+            badgeCount={groupUnread > 0 ? groupUnread : undefined}
+          />
           <SidebarLink to="/marketplace" icon={<ShoppingBag size={20} />} label="Marketplace" onClick={onClose} navAppearance={navAppearance} />
           <SidebarLink to="/assets" icon={<Wallet size={20} />} label="Assets" onClick={onClose} navAppearance={navAppearance} />
           <SidebarLink to="/notifications" icon={<Bell size={20} />} label="Notifications" onClick={onClose} navAppearance={navAppearance} />
@@ -197,12 +207,15 @@ function SidebarLink({
   label,
   onClick,
   navAppearance,
+  badgeCount,
 }: {
   to: string;
   icon: React.ReactNode;
   label: string;
   onClick?: () => void;
   navAppearance: SidebarNavAppearance;
+  /** Optional unread badge (e.g. group message notifications). */
+  badgeCount?: number;
 }) {
   return (
     <motion.div whileHover={{ x: 4 }} whileTap={{ scale: 0.98 }}>
@@ -210,7 +223,7 @@ function SidebarLink({
         to={to}
         onClick={onClick}
         className={({ isActive }) => cn(
-          'w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all',
+          'w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all relative',
           navAppearance === 'darkColumn'
             ? isActive
               ? 'bg-gradient-to-r from-indigo-500/25 to-violet-500/20 text-indigo-200 font-bold border border-indigo-400/35 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]'
@@ -222,6 +235,11 @@ function SidebarLink({
       >
         {icon}
         <span className="text-sm">{label}</span>
+        {badgeCount != null && badgeCount > 0 && (
+          <span className="ml-auto min-w-[18px] h-[18px] px-1 flex items-center justify-center rounded-full bg-indigo-600 text-white text-[10px] font-bold leading-none">
+            {badgeCount > 99 ? '99+' : badgeCount}
+          </span>
+        )}
       </NavLink>
     </motion.div>
   );

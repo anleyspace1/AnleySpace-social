@@ -63,6 +63,7 @@ import { MOCK_USER } from './constants';
 
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { NotificationProvider, useNotificationsOptional } from './contexts/NotificationContext';
+import { GroupNotificationsProvider } from './contexts/GroupNotificationsContext';
 import ProtectedRoute from './components/ProtectedRoute';
 import LoginPage from './pages/LoginPage';
 import SignupPage from './pages/SignupPage';
@@ -357,7 +358,9 @@ export default function App() {
     <AuthProvider>
       <Router>
         <NotificationProvider>
-          <AppContent />
+          <GroupNotificationsProvider>
+            <AppContent />
+          </GroupNotificationsProvider>
         </NotificationProvider>
       </Router>
     </AuthProvider>

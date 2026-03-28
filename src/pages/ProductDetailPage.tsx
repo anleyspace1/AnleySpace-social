@@ -16,6 +16,7 @@ import {
 import { Product } from '../types';
 import { cn } from '../lib/utils';
 import { apiUrl } from '../lib/apiOrigin';
+import { productImagePublicUrl } from '../lib/marketplaceImage';
 import { MOCK_USER } from '../constants';
 import { useAuth } from '../contexts/AuthContext';
 
@@ -42,15 +43,28 @@ export default function ProductDetailPage() {
   const fetchProduct = async () => {
     try {
       const res = await fetch(apiUrl(`/api/marketplace/products/${id}`));
-      if (res.ok) {
-        const data = await res.json();
-        setProduct({
-          ...data,
-          seller: { username: data.seller_username }
-        });
+      let payload: unknown;
+      try {
+        payload = await res.json();
+      } catch (parseErr) {
+        console.log('marketplace error:', parseErr);
+        setProduct(null);
+        return;
       }
+      console.log('marketplace data:', payload);
+      if (!res.ok) {
+        console.log('marketplace error:', (payload as { error?: string })?.error ?? res.statusText);
+        setProduct(null);
+        return;
+      }
+      const data = payload as Record<string, unknown>;
+      setProduct({
+        ...(data as Product),
+        seller: { username: data.seller_username as string }
+      } as Product);
     } catch (err) {
-      console.error("Error fetching product:", err);
+      console.log('marketplace error:', err);
+      setProduct(null);
     } finally {
       setLoading(false);
     }
@@ -59,15 +73,32 @@ export default function ProductDetailPage() {
   const fetchRelatedProducts = async () => {
     try {
       const res = await fetch(apiUrl('/api/marketplace/products'));
-      if (res.ok) {
-        const data = await res.json();
-        const filtered = data
-          .filter((p: any) => p.location === product?.location && p.id !== product?.id)
-          .slice(0, 4);
-        setRelatedProducts(filtered);
+      let payload: unknown;
+      try {
+        payload = await res.json();
+      } catch (parseErr) {
+        console.log('marketplace error:', parseErr);
+        setRelatedProducts([]);
+        return;
       }
+      console.log('marketplace data:', payload);
+      if (!res.ok) {
+        console.log('marketplace error:', (payload as { error?: string })?.error ?? res.statusText);
+        setRelatedProducts([]);
+        return;
+      }
+      if (!Array.isArray(payload)) {
+        console.log('marketplace error:', 'Expected array of products');
+        setRelatedProducts([]);
+        return;
+      }
+      const filtered = payload
+        .filter((p: any) => p.location === product?.location && p.id !== product?.id)
+        .slice(0, 4);
+      setRelatedProducts(filtered);
     } catch (err) {
-      console.error("Error fetching related products:", err);
+      console.log('marketplace error:', err);
+      setRelatedProducts([]);
     }
   };
 
@@ -124,6 +155,8 @@ export default function ProductDetailPage() {
     );
   }
 
+  const mainImageUrl = productImagePublicUrl(product.image) || `https://picsum.photos/seed/${product.id}/800/800`;
+
   return (
     <motion.div 
       initial={{ opacity: 0, y: 20 }}
@@ -143,7 +176,7 @@ export default function ProductDetailPage() {
         <div className="lg:col-span-7 space-y-4">
           <div className="aspect-square rounded-[2.5rem] overflow-hidden bg-gray-100 dark:bg-gray-900 border border-gray-100 dark:border-gray-800 shadow-xl relative group">
             <img 
-              src={product.image} 
+              src={mainImageUrl} 
               alt={product.title} 
               className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-700" 
             />
@@ -299,7 +332,7 @@ export default function ProductDetailPage() {
                 className="bg-white dark:bg-gray-900 rounded-2xl overflow-hidden border border-gray-100 dark:border-gray-800 shadow-sm cursor-pointer group"
               >
                 <div className="aspect-square overflow-hidden">
-                  <img src={p.image} alt={p.title} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" />
+                  <img src={productImagePublicUrl(p.image) || `https://picsum.photos/seed/${p.id}/400/400`} alt={p.title} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" />
                 </div>
                 <div className="p-3">
                   <h4 className="font-bold text-sm truncate mb-1">{p.title}</h4>

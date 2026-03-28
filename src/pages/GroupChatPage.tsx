@@ -38,6 +38,7 @@ import {
 } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
+import { useGroupNotificationsOptional } from '../contexts/GroupNotificationsContext';
 import { cn } from '../lib/utils';
 import AgoraCall from '../components/AgoraCall';
 import LiveChat from '../components/LiveChat';
@@ -78,6 +79,11 @@ function parseGroupMessageContentForUi(content: string | null | undefined): {
   return { text: raw };
 }
 
+function normalizeSeenBy(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((x) => String(x));
+}
+
 interface GroupMessage {
   id: string;
   group_id: string;
@@ -91,6 +97,8 @@ interface GroupMessage {
   image_url?: string;
   /** Optional raw content (e.g. socket); UI prefers normalized text + media fields */
   content?: string;
+  /** User ids who have read this message (group chat; Supabase `seen_by`). */
+  seen_by?: string[];
 }
 
 interface GroupMember {
@@ -113,7 +121,12 @@ export default function GroupChatPage() {
   const groupId = (groupIdParam ?? '').trim();
   const navigate = useNavigate();
   const { user, profile } = useAuth();
+  const groupNotif = useGroupNotificationsOptional();
+  const groupNotifRef = useRef(groupNotif);
+  groupNotifRef.current = groupNotif;
   const [callError, setCallError] = useState<string | null>(null);
+  const [callStatus, setCallStatus] = useState<'calling' | 'ringing' | 'connected' | 'ended'>('calling');
+  const [callDuration, setCallDuration] = useState(0);
   const [messages, setMessages] = useState<GroupMessage[]>([]);
   const [inputText, setInputText] = useState('');
   const [groupInfo, setGroupInfo] = useState<GroupInfo | null>(null);
@@ -159,6 +172,13 @@ export default function GroupChatPage() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   /** Set when Supabase select/RLS fails so production issues are not silent. */
   const [messagesQueryError, setMessagesQueryError] = useState<string | null>(null);
+
+  /** Other users currently typing (socket); we store userId for accurate stop_typing handling. */
+  const [typingUsers, setTypingUsers] = useState<Array<{ userId: string; username: string }>>([]);
+  const typingStopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /** User ids currently connected (socket presence). */
+  const [onlineUsers, setOnlineUsers] = useState<string[]>([]);
 
   const getCurrentAuthUser = async () => {
     const { data: { user } } = await supabase.auth.getUser();
@@ -239,6 +259,7 @@ export default function GroupChatPage() {
           group_id,
           user_id,
           created_at,
+          seen_by,
           profiles (
             username,
             avatar_url
@@ -255,7 +276,7 @@ export default function GroupChatPage() {
         console.warn('[GroupChat] messages select with profiles failed, using fallback:', withProfiles.error);
         const plain = await supabase
           .from('messages')
-          .select('id, content, group_id, user_id, created_at')
+          .select('id, content, group_id, user_id, created_at, seen_by')
           .eq('group_id', currentGroupId)
           .order('created_at', { ascending: true });
 
@@ -294,6 +315,7 @@ export default function GroupChatPage() {
 
         const { text, image_url, audio_url } = parseGroupMessageContentForUi(m.content);
         const type = audio_url ? 'audio' : image_url ? 'image' : 'text';
+        const seenBy = normalizeSeenBy(m.seen_by);
 
         return {
           id: String(m.id),
@@ -307,10 +329,39 @@ export default function GroupChatPage() {
           type,
           image_url,
           audio_url,
+          seen_by: seenBy,
         };
       });
 
-      setMessages(normalized);
+      const {
+        data: { user: authUser },
+      } = await supabase.auth.getUser();
+      const readerId = authUser?.id ? String(authUser.id) : null;
+      if (readerId && currentGroupId) {
+        const merged = normalized.map((m) => ({ ...m }));
+        for (let i = 0; i < merged.length; i++) {
+          const msg = merged[i];
+          if (msg.user_id === readerId) continue;
+          const seen = msg.seen_by || [];
+          if (seen.includes(readerId)) continue;
+          const nextSeen = [...seen, readerId];
+          const { error: upErr } = await supabase
+            .from('messages')
+            .update({ seen_by: nextSeen })
+            .eq('id', msg.id);
+          if (!upErr) {
+            merged[i] = { ...msg, seen_by: nextSeen };
+            socketRef.current?.emit('message_seen', {
+              messageId: msg.id,
+              userId: readerId,
+              groupId: currentGroupId,
+            });
+          }
+        }
+        setMessages(merged);
+      } else {
+        setMessages(normalized);
+      }
     } catch (err) {
       console.error('Error fetching group messages:', err);
       setMessagesQueryError((prev) => prev ?? (err instanceof Error ? err.message : String(err)));
@@ -346,6 +397,24 @@ export default function GroupChatPage() {
           }
         }
       )
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'messages',
+          filter: `group_id=eq.${groupId}`,
+        },
+        (payload) => {
+          const row = payload.new as Record<string, unknown>;
+          if (!row?.id) return;
+          setMessages((prev) =>
+            prev.map((m) =>
+              String(m.id) === String(row.id) ? { ...m, seen_by: normalizeSeenBy(row.seen_by) } : m
+            )
+          );
+        }
+      )
       .subscribe((status, err) => {
         if (status === 'SUBSCRIBED') {
           console.log('[GroupChat] realtime subscribed to messages for group', groupId);
@@ -360,27 +429,120 @@ export default function GroupChatPage() {
   }, [groupId]);
 
   useEffect(() => {
+    setTypingUsers([]);
+    if (typingStopTimeoutRef.current) {
+      clearTimeout(typingStopTimeoutRef.current);
+      typingStopTimeoutRef.current = null;
+    }
+  }, [groupId]);
+
+  useEffect(() => {
+    return () => {
+      if (typingStopTimeoutRef.current) {
+        clearTimeout(typingStopTimeoutRef.current);
+        typingStopTimeoutRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     // Initialize Socket.IO
     const socket = io();
     socketRef.current = socket;
 
+    const onUserTyping = (payload: { userId?: string; username?: string }) => {
+      if (!payload?.userId || payload.userId === user?.id) return;
+      setTypingUsers((prev) => {
+        if (prev.some((t) => t.userId === payload.userId)) return prev;
+        return [...prev, { userId: payload.userId!, username: payload.username || 'Someone' }];
+      });
+    };
+
+    const onUserStopTyping = (payload: { userId?: string }) => {
+      if (!payload?.userId) return;
+      setTypingUsers((prev) => prev.filter((t) => t.userId !== payload.userId));
+    };
+
+    const onUserOnline = (payload: { userId?: string }) => {
+      if (!payload?.userId) return;
+      setOnlineUsers((prev) => (prev.includes(payload.userId!) ? prev : [...prev, payload.userId!]));
+    };
+
+    const onUserOffline = (payload: { userId?: string }) => {
+      if (!payload?.userId) return;
+      setOnlineUsers((prev) => prev.filter((id) => id !== payload.userId));
+    };
+
+    const onMessageSeenUpdate = (payload: { messageId?: string; userId?: string }) => {
+      if (!payload?.messageId || !payload?.userId) return;
+      setMessages((prev) =>
+        prev.map((msg) => {
+          if (String(msg.id) !== String(payload.messageId)) return msg;
+          const seen = msg.seen_by || [];
+          if (seen.includes(payload.userId!)) return msg;
+          return { ...msg, seen_by: [...seen, payload.userId!] };
+        })
+      );
+    };
+
     socket.on('group_message', (message: GroupMessage) => {
       console.log('DEBUG: Received group message:', message);
-      setMessages(prev => {
-        if (prev.find(m => m.id === message.id)) return prev;
-        return [...prev, message];
+      if (user?.id && message.user_id && message.user_id !== user.id) {
+        const gid = String(message.group_id ?? groupId ?? '');
+        if (gid) void groupNotifRef.current?.markGroupNotificationsRead(gid);
+      }
+      setMessages((prev) => {
+        if (prev.find((m) => m.id === message.id)) return prev;
+        return [
+          ...prev,
+          {
+            ...message,
+            seen_by: normalizeSeenBy((message as { seen_by?: unknown }).seen_by),
+          },
+        ];
       });
     });
 
+    const onGroupNewNotification = (payload: {
+      groupId?: string;
+      messageId?: string;
+      senderId?: string;
+    }) => {
+      if (!payload?.groupId || !groupId || String(payload.groupId) !== String(groupId)) return;
+      if (payload.senderId && user?.id && payload.senderId === user.id) return;
+      void groupNotifRef.current?.markGroupNotificationsRead(groupId);
+      void groupNotifRef.current?.refresh();
+    };
+    socket.on('new_notification', onGroupNewNotification);
+
     socket.on('group_history', (history: GroupMessage[]) => {
       console.log('DEBUG: Received group history:', history?.length, 'messages');
-      setMessages(history || []);
+      const withSeen = (history || []).map((h) => ({
+        ...h,
+        seen_by: normalizeSeenBy((h as { seen_by?: unknown }).seen_by),
+      }));
+      setMessages(withSeen);
     });
 
     if (groupId) {
       // Join the group room and request history (after listeners are attached).
       socket.emit('join_group', groupId);
     }
+    if (user?.id) {
+      socket.emit('register_user', user.id);
+    }
+
+    socket.on('call_ringing', () => {
+      setCallStatus('ringing');
+    });
+
+    socket.on('call_accepted', () => {
+      setCallStatus('connected');
+    });
+
+    socket.on('call_ended', () => {
+      setCallStatus('ended');
+    });
 
     socket.on('call:started', (data: any) => {
       // If I'm not in a call, show the incoming call notification or just join
@@ -394,6 +556,7 @@ export default function GroupChatPage() {
     });
 
     socket.on('call:ended', (data: any) => {
+      setCallStatus('ended');
       setActiveCall(prev => {
         if (prev?.id === data.callId) return null;
         return prev;
@@ -429,14 +592,72 @@ export default function GroupChatPage() {
       setViewerCount(count);
     });
 
+    socket.on('user_typing', onUserTyping);
+    socket.on('user_stop_typing', onUserStopTyping);
+    socket.on('user_online', onUserOnline);
+    socket.on('user_offline', onUserOffline);
+    socket.on('message_seen_update', onMessageSeenUpdate);
+
     return () => {
+      socket.off('user_typing', onUserTyping);
+      socket.off('user_stop_typing', onUserStopTyping);
+      socket.off('user_online', onUserOnline);
+      socket.off('user_offline', onUserOffline);
+      socket.off('message_seen_update', onMessageSeenUpdate);
+      socket.off('new_notification', onGroupNewNotification);
       socket.disconnect();
     };
-  }, [groupId]);
+  }, [groupId, user?.id]);
+
+  useEffect(() => {
+    if (!activeCall) {
+      setCallDuration(0);
+      setCallStatus('calling');
+      return;
+    }
+    setCallDuration(0);
+    if (activeCall.status === 'active') {
+      setCallStatus('connected');
+    } else {
+      setCallStatus('calling');
+    }
+  }, [activeCall?.id]);
+
+  useEffect(() => {
+    if (activeCall?.status === 'active') {
+      setCallStatus('connected');
+    }
+  }, [activeCall?.status]);
+
+  useEffect(() => {
+    let interval: ReturnType<typeof setInterval> | undefined;
+    if (callStatus === 'connected') {
+      interval = setInterval(() => {
+        setCallDuration((prev) => prev + 1);
+      }, 1000);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [callStatus]);
+
+  useEffect(() => {
+    if (activeCall?.status !== 'calling' || activeCall.hostId !== user?.id) return;
+    const t = setTimeout(() => {
+      setCallStatus((prev) => (prev === 'calling' ? 'ringing' : prev));
+    }, 700);
+    return () => clearTimeout(t);
+  }, [activeCall?.id, activeCall?.status, activeCall?.hostId, user?.id]);
 
   useEffect(() => {
     fetchGroupInfo();
   }, [groupId]);
+
+  /** Clear Supabase group-message notifications when opening this chat. */
+  useEffect(() => {
+    if (!groupId || !user?.id) return;
+    void groupNotif?.markGroupNotificationsRead(groupId);
+  }, [groupId, user?.id, groupNotif?.markGroupNotificationsRead]);
 
   useEffect(() => {
     scrollToBottom();
@@ -448,6 +669,39 @@ export default function GroupChatPage() {
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  const clearTypingIndicatorEmit = () => {
+    if (typingStopTimeoutRef.current) {
+      clearTimeout(typingStopTimeoutRef.current);
+      typingStopTimeoutRef.current = null;
+    }
+    const sock = socketRef.current;
+    if (sock && groupId && user?.id) {
+      sock.emit('stop_typing', { groupId, userId: user.id });
+    }
+  };
+
+  const handleTypingInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const v = e.target.value;
+    setInputText(v);
+    const sock = socketRef.current;
+    if (!sock || !groupId || !user?.id) return;
+    const username = profile?.username || user.email?.split('@')[0] || 'User';
+    if (v.trim()) {
+      sock.emit('typing', { groupId, userId: user.id, username });
+      if (typingStopTimeoutRef.current) clearTimeout(typingStopTimeoutRef.current);
+      typingStopTimeoutRef.current = setTimeout(() => {
+        typingStopTimeoutRef.current = null;
+        sock.emit('stop_typing', { groupId, userId: user.id });
+      }, 1000);
+    } else {
+      if (typingStopTimeoutRef.current) {
+        clearTimeout(typingStopTimeoutRef.current);
+        typingStopTimeoutRef.current = null;
+      }
+      sock.emit('stop_typing', { groupId, userId: user.id });
+    }
   };
 
   const handleSendMessage = async (e: React.FormEvent) => {
@@ -534,6 +788,7 @@ export default function GroupChatPage() {
         (messageData as Record<string, unknown>).id = insertedId;
       }
 
+      clearTypingIndicatorEmit();
       socketRef.current.emit('send_group_message', messageData);
       // Immediate non-blocking refresh for deploys where realtime delivery can lag.
       void fetchMessages();
@@ -935,7 +1190,10 @@ export default function GroupChatPage() {
               <h1 className="font-bold text-sm">{groupInfo.name}</h1>
               <div className="flex items-center gap-1 text-[10px] text-gray-500">
                 <Users size={10} />
-                <span>{groupInfo.members?.length || 0} members</span>
+                <span>
+                  {groupInfo.members?.filter((m) => onlineUsers.includes(m.id)).length ?? 0} online ·{' '}
+                  {groupInfo.members?.length || 0} members
+                </span>
               </div>
             </div>
           </div>
@@ -1077,8 +1335,18 @@ export default function GroupChatPage() {
                       displayText
                     )}
                   </div>
-                  <span className="text-[8px] text-gray-400 mt-1 px-1">
+                  <span
+                    className={cn(
+                      'text-[8px] text-gray-400 mt-1 px-1 flex items-center gap-1.5 flex-wrap',
+                      isMe && 'justify-end'
+                    )}
+                  >
                     {new Date(msg.created_at || msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    {isMe && (
+                      <span className="opacity-90" title="Status">
+                        {(msg.seen_by || []).length >= 1 ? '✔✔ Seen' : '✔ Delivered'}
+                      </span>
+                    )}
                   </span>
                 </div>
               </motion.div>
@@ -1090,6 +1358,11 @@ export default function GroupChatPage() {
 
       {/* Input Area */}
       <div className="p-4 bg-white dark:bg-gray-900 border-t border-gray-100 dark:border-gray-800 pb-12 lg:pb-4">
+        {typingUsers.length > 0 && (
+          <div className="typing-indicator mb-2 px-1 text-xs text-gray-500 dark:text-gray-400 italic">
+            {typingUsers.map((t) => t.username).join(', ')} {typingUsers.length === 1 ? 'is' : 'are'} typing…
+          </div>
+        )}
         {selectedImage && (
           <div className="relative inline-block mb-4">
             <img 
@@ -1163,7 +1436,7 @@ export default function GroupChatPage() {
               <input
                 type="text"
                 value={inputText}
-                onChange={(e) => setInputText(e.target.value)}
+                onChange={handleTypingInputChange}
                 placeholder="Type a message..."
                 className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl py-3 px-4 text-sm text-gray-900 dark:text-white placeholder:text-gray-400 caret-gray-900 dark:caret-white focus:ring-2 focus:ring-indigo-500 transition-all"
               />
@@ -1196,6 +1469,7 @@ export default function GroupChatPage() {
         {isMembersModalOpen && (
           <MembersModal 
             members={groupInfo.members}
+            onlineUsers={onlineUsers}
             onClose={() => setIsMembersModalOpen(false)}
           />
         )}
@@ -1272,8 +1546,17 @@ export default function GroupChatPage() {
                     )}
                   </div>
                   <p className="text-xs opacity-80">
-                    {activeCall.status === 'calling' ? 'Calling...' : `${callParticipants.length + 1} participants • ${activeCall.type === 'audio' ? 'Audio' : 'Video'} Call`}
-                    {activeCall.isLive && ` • ${viewerCount} Viewers`}
+                    {callStatus === 'connected' && (
+                      <>
+                        {callParticipants.length + 1} participants • {activeCall.type === 'audio' ? 'Audio' : 'Video'} Call
+                        {activeCall.isLive && ` • ${viewerCount} Viewers`}
+                      </>
+                    )}
+                  </p>
+                  <p className="text-gray-400 mt-2">
+                    {callStatus === 'calling' && 'Calling...'}
+                    {callStatus === 'ringing' && 'Ringing...'}
+                    {callStatus === 'connected' && formatTime(callDuration)}
                   </p>
                 </div>
               </div>
@@ -1308,8 +1591,8 @@ export default function GroupChatPage() {
             {/* Call Content */}
             <div className="flex-1 relative overflow-y-auto flex flex-col md:flex-row">
               <AgoraCall 
-                appId={import.meta.env.VITE_AGORA_APP_ID || ""}
-                channelName={activeCall.isLive ? `live_${activeCall.id}` : `call_${activeCall.id}`}
+                appId={import.meta.env.VITE_AGORA_APP_ID}
+                channelName={`${groupId}_${activeCall.isLive ? 'live' : 'call'}_${activeCall.id}`}
                 uid={user?.id || ""}
                 role={(activeCall.hostId === user?.id || activeCall.isSpeaker) ? "host" : "audience"}
                 type={activeCall.type as 'audio' | 'video'}
@@ -1595,7 +1878,15 @@ function InviteModal({ onClose, onConfirm }: { onClose: () => void; onConfirm: (
   );
 }
 
-function MembersModal({ members, onClose }: { members: GroupMember[]; onClose: () => void }) {
+function MembersModal({
+  members,
+  onlineUsers,
+  onClose,
+}: {
+  members: GroupMember[];
+  onlineUsers: string[];
+  onClose: () => void;
+}) {
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
       <motion.div 
@@ -1627,7 +1918,11 @@ function MembersModal({ members, onClose }: { members: GroupMember[]; onClose: (
                 </div>
                 <div>
                   <p className="font-semibold text-sm text-gray-900 dark:text-white opacity-100">@{member.username}</p>
-                  <p className="text-[10px] text-gray-500 capitalize">{member.role}</p>
+                  <p className="text-[10px] text-gray-500 capitalize">
+                    {member.role}
+                    {' · '}
+                    {onlineUsers.includes(member.id) ? '🟢 Online' : '⚪ Offline'}
+                  </p>
                 </div>
               </div>
               {member.role === 'creator' && (

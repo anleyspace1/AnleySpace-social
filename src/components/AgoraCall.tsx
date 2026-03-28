@@ -8,8 +8,12 @@ import AgoraRTC, {
 import { Video, VideoOff, Mic, MicOff, PhoneOff, User } from 'lucide-react';
 import { cn } from '../lib/utils';
 
+/** Production (e.g. Vercel): set `VITE_AGORA_APP_ID` in the project env; never commit the real value. */
+const APP_ID = import.meta.env.VITE_AGORA_APP_ID;
+
 interface AgoraCallProps {
-  appId: string;
+  /** Optional fallback if `VITE_AGORA_APP_ID` is unset (e.g. tests); join prefers env `APP_ID`. */
+  appId?: string;
   channelName: string;
   token?: string | null;
   uid: string | number;
@@ -18,7 +22,7 @@ interface AgoraCallProps {
   onLeave: () => void;
 }
 
-export default function AgoraCall({ appId, channelName, token, uid, role, type, onLeave }: AgoraCallProps) {
+export default function AgoraCall({ appId, channelName, uid, role, type, onLeave }: AgoraCallProps) {
   const [localAudioTrack, setLocalAudioTrack] = useState<IMicrophoneAudioTrack | null>(null);
   const [localVideoTrack, setLocalVideoTrack] = useState<ICameraVideoTrack | null>(null);
   const [remoteUsers, setRemoteUsers] = useState<IAgoraRTCRemoteUser[]>([]);
@@ -59,7 +63,11 @@ export default function AgoraCall({ appId, channelName, token, uid, role, type, 
       });
 
       try {
-        await clientRef.current.join(appId, channelName, token || null, uid);
+        const resolvedAppId = APP_ID ?? appId ?? '';
+        console.log('AGORA APP_ID:', APP_ID);
+        console.log('JOIN UID:', uid);
+
+        await clientRef.current.join(resolvedAppId, channelName, null, uid);
         
         if (role === 'host') {
           const audioTrack = await AgoraRTC.createMicrophoneAudioTrack();
@@ -96,7 +104,7 @@ export default function AgoraCall({ appId, channelName, token, uid, role, type, 
       }
       clientRef.current?.leave();
     };
-  }, [appId, channelName, token, uid, role, type]);
+  }, [appId, channelName, uid, role, type]);
 
   const toggleMute = () => {
     if (localAudioTrack) {
@@ -127,7 +135,7 @@ export default function AgoraCall({ appId, channelName, token, uid, role, type, 
         {/* Local User */}
         {role === 'host' && (
           <div className="relative bg-gray-800 rounded-3xl overflow-hidden border border-white/10 aspect-video">
-            <div ref={localVideoRef} className="w-full h-full" />
+            <div ref={localVideoRef} id="local-player" className="w-full h-full" />
             {isCameraOff && (
               <div className="absolute inset-0 bg-gray-900 flex items-center justify-center">
                 <User size={64} className="text-gray-700" />
@@ -140,8 +148,12 @@ export default function AgoraCall({ appId, channelName, token, uid, role, type, 
         )}
 
         {/* Remote Users */}
-        {remoteUsers.map(user => (
-          <div key={user.uid} className="relative bg-gray-800 rounded-3xl overflow-hidden border border-white/10 aspect-video">
+        {remoteUsers.map((user, i) => (
+          <div
+            key={user.uid}
+            id={i === 0 ? 'remote-player' : undefined}
+            className="relative bg-gray-800 rounded-3xl overflow-hidden border border-white/10 aspect-video"
+          >
             <RemoteVideoPlayer user={user} />
             <div className="absolute bottom-4 left-4 bg-black/50 backdrop-blur-md px-3 py-1 rounded-full text-white text-xs font-bold">
               User {user.uid}
