@@ -22,7 +22,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { cn } from '../lib/utils';
 import { apiUrl } from '../lib/apiOrigin';
 import { productImagePublicUrl } from '../lib/marketplaceImage';
-import { fetchMarketplaceTableRowsAsApiProducts } from '../lib/marketplaceRemote';
+import { fetchMarketplaceTableRowsAsApiProducts, mapMarketplaceRowsToProducts } from '../lib/marketplaceRemote';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import { ResponsiveImage } from '../components/ResponsiveImage';
@@ -147,22 +147,14 @@ export default function ExplorePage() {
           console.log("EXPLORE PRODUCTS:", products);
           setExploreProducts(products);
         } else {
-          const products: ExploreProductRow[] = data
-            .map((p: Record<string, unknown>) => {
-              const sellerId = String(p.seller_id ?? '').trim();
-              const id = String(p.id ?? '').trim();
-              if (!id || !sellerId) return null;
-              const img = productImagePublicUrl(String(p.image ?? '').trim());
-              if (!isValidExploreProductUrl(img)) return null;
-              return {
-                id,
-                name: String((p.title as string) || 'Product'),
-                price: Number(p.price) || 0,
-                image: img,
-                seller_id: sellerId,
-              };
-            })
-            .filter((row): row is ExploreProductRow => row !== null);
+          const mapped = mapMarketplaceRowsToProducts(data);
+          const products: ExploreProductRow[] = mapped.map((p) => ({
+            id: p.id,
+            name: p.title || 'Product',
+            price: p.price || 0,
+            image: p.image || '',
+            seller_id: String((p as { seller_id?: string }).seller_id ?? '').trim(),
+          }));
           console.log("EXPLORE PRODUCTS:", products);
           setExploreProducts(products);
         }
@@ -170,22 +162,14 @@ export default function ExplorePage() {
         if (!cancelled) {
           try {
             const data = await fetchMarketplaceTableRowsAsApiProducts();
-            const products: ExploreProductRow[] = data
-              .map((p: Record<string, unknown>) => {
-                const sellerId = String(p.seller_id ?? '').trim();
-                const id = String(p.id ?? '').trim();
-                if (!id || !sellerId) return null;
-                const img = productImagePublicUrl(String(p.image ?? '').trim());
-                if (!isValidExploreProductUrl(img)) return null;
-                return {
-                  id,
-                  name: String((p.title as string) || 'Product'),
-                  price: Number(p.price) || 0,
-                  image: img,
-                  seller_id: sellerId,
-                };
-              })
-              .filter((row): row is ExploreProductRow => row !== null);
+            const mapped = mapMarketplaceRowsToProducts(data);
+            const products: ExploreProductRow[] = mapped.map((p) => ({
+              id: p.id,
+              name: p.title || 'Product',
+              price: p.price || 0,
+              image: p.image || '',
+              seller_id: String((p as { seller_id?: string }).seller_id ?? '').trim(),
+            }));
             console.log("EXPLORE PRODUCTS:", products);
             setExploreProducts(products);
           } catch {

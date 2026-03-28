@@ -35,3 +35,15 @@ export function productImagePublicUrl(stored: string | null | undefined): string
   console.log('PRODUCT IMAGE URL:', data.publicUrl);
   return data.publicUrl;
 }
+
+/**
+ * Best-effort HTTPS URL for a listing (`image_url` or legacy `image`).
+ * Does not drop rows — empty string if nothing usable (UI can show a placeholder).
+ */
+export function resolveMarketplaceListingImageUrl(stored: string | null | undefined): string {
+  const fromBucket = productImagePublicUrl(stored);
+  if (fromBucket) return fromBucket;
+  const s = String(stored ?? '').trim();
+  if (s.startsWith('https://')) return s;
+  return '';
+}

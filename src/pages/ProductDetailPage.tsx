@@ -17,7 +17,11 @@ import { Product } from '../types';
 import { cn } from '../lib/utils';
 import { apiUrl } from '../lib/apiOrigin';
 import { productImagePublicUrl } from '../lib/marketplaceImage';
-import { fetchSingleProductAsApiShape } from '../lib/marketplaceRemote';
+import {
+  fetchMarketplaceTableRowsAsApiProducts,
+  fetchSingleProductAsApiShape,
+  mapMarketplaceRowsToProducts,
+} from '../lib/marketplaceRemote';
 import { isProductSavedInMarketplace, setSavedMarketplaceProduct } from '../lib/savedMarketplace';
 import { MOCK_USER } from '../constants';
 import { useAuth } from '../contexts/AuthContext';
@@ -111,32 +115,41 @@ export default function ProductDetailPage() {
   const fetchRelatedProducts = async () => {
     try {
       const res = await fetch(apiUrl('/api/marketplace/products'));
+      const ct = res.headers.get('content-type') || '';
       let payload: unknown;
       try {
-        payload = await res.json();
+        if (!ct.includes('application/json')) payload = null;
+        else payload = await res.json();
       } catch (parseErr) {
         console.log('marketplace error:', parseErr);
-        setRelatedProducts([]);
-        return;
+        payload = null;
       }
       console.log('marketplace data:', payload);
-      if (!res.ok) {
-        console.log('marketplace error:', (payload as { error?: string })?.error ?? res.statusText);
-        setRelatedProducts([]);
-        return;
+      let list: Record<string, unknown>[] = [];
+      if (res.ok && Array.isArray(payload)) {
+        list = payload as Record<string, unknown>[];
       }
-      if (!Array.isArray(payload)) {
-        console.log('marketplace error:', 'Expected array of products');
-        setRelatedProducts([]);
-        return;
+      if (!list.length) {
+        list = await fetchMarketplaceTableRowsAsApiProducts();
       }
-      const filtered = payload
-        .filter((p: any) => p.location === product?.location && p.id !== product?.id)
+      console.log('Marketplace rows (related list length):', list.length);
+      const products = mapMarketplaceRowsToProducts(list);
+      const filtered = products
+        .filter((p) => p.location === product?.location && p.id !== product?.id)
         .slice(0, 4);
       setRelatedProducts(filtered);
     } catch (err) {
       console.log('marketplace error:', err);
-      setRelatedProducts([]);
+      try {
+        const direct = await fetchMarketplaceTableRowsAsApiProducts();
+        const products = mapMarketplaceRowsToProducts(direct);
+        const filtered = products
+          .filter((p) => p.location === product?.location && p.id !== product?.id)
+          .slice(0, 4);
+        setRelatedProducts(filtered);
+      } catch {
+        setRelatedProducts([]);
+      }
     }
   };
 
@@ -275,7 +288,10 @@ export default function ProductDetailPage() {
                 <span>{product.price.toLocaleString()}</span>
               </div>
               <div 
-                onClick={() => navigate(`/marketplace?location=${product.location}`)}
+                onClick={() => {
+                  const loc = (product.location || '').trim();
+                  navigate(loc ? `/marketplace?location=${encodeURIComponent(loc)}` : '/marketplace');
+                }}
                 className="flex items-center gap-1 text-gray-400 font-medium text-sm cursor-pointer hover:text-indigo-600 transition-colors group"
               >
                 <MapPin size={16} className="group-hover:scale-110 transition-transform" />
@@ -387,7 +403,10 @@ export default function ProductDetailPage() {
           <div className="flex items-center justify-between mb-6">
             <h2 className="text-xl font-black">More from this area</h2>
             <button 
-              onClick={() => navigate(`/marketplace?location=${product.location}`)}
+              onClick={() => {
+                  const loc = (product.location || '').trim();
+                  navigate(loc ? `/marketplace?location=${encodeURIComponent(loc)}` : '/marketplace');
+                }}
               className="text-sm text-indigo-600 font-bold hover:underline flex items-center gap-1"
             >
               See all

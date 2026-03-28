@@ -20,23 +20,15 @@ import {
 } from 'lucide-react';
 import { Product, Video, Post } from '../types';
 
-/** Marketplace-only: real listing media from Supabase Storage (public HTTPS), not placeholders. */
-function isValidMarketplaceProductMediaUrl(url: string | undefined | null): boolean {
-  const u = (url || '').trim();
-  if (!u) return false;
-  const lower = u.toLowerCase();
-  if (lower.includes('picsum.photos') || lower.includes('placeholder')) return false;
-  if (lower.includes('localhost') || lower.includes('127.0.0.1')) return false;
-  if (!u.startsWith('https://')) return false;
-  if (!lower.includes('.supabase.co')) return false;
-  return true;
-}
 import { cn } from '../lib/utils';
 import { useAuth } from '../contexts/AuthContext';
-import { supabase } from '../lib/supabase';
+import { isSupabaseConfigured, supabase } from '../lib/supabase';
 import { apiUrl } from '../lib/apiOrigin';
-import { productImagePublicUrl } from '../lib/marketplaceImage';
-import { fetchMarketplaceTableRowsAsApiProducts } from '../lib/marketplaceRemote';
+import {
+  fetchMarketplaceTableRowsAsApiProducts,
+  mapMarketplaceRowsToProducts,
+} from '../lib/marketplaceRemote';
+import { resolveMarketplaceListingImageUrl } from '../lib/marketplaceImage';
 import { fetchSavedMarketplaceProductIds, setSavedMarketplaceProduct } from '../lib/savedMarketplace';
 import { ResponsiveImage } from '../components/ResponsiveImage';
 
@@ -44,7 +36,14 @@ export default function MarketplacePage() {
   const navigate = useNavigate();
   const { user } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
-  const locationFilter = searchParams.get('location');
+  /** Ignore bogus params from `?location=${undefined}` and empty strings so the grid is not cleared on Vercel. */
+  const locationFilter = React.useMemo(() => {
+    const raw = searchParams.get('location');
+    if (raw == null) return null;
+    const t = raw.trim();
+    if (!t || t === 'undefined' || t === 'null') return null;
+    return t;
+  }, [searchParams]);
 
   const [products, setProducts] = useState<Product[]>([]);
   const [reels, setReels] = useState<Video[]>([]);
@@ -109,12 +108,7 @@ export default function MarketplacePage() {
 
   const marketplacePostsGrid = React.useMemo((): Post[] => {
     return products
-      .filter(
-        (p) =>
-          !!p.id &&
-          !!(p as { seller_id?: string }).seller_id &&
-          isValidMarketplaceProductMediaUrl(p.image)
-      )
+      .filter((p) => !!p.id && !!(p as { seller_id?: string }).seller_id)
       .map((p) => {
         const sellerUsername =
           p.seller?.username ||
@@ -122,7 +116,7 @@ export default function MarketplacePage() {
           'seller';
         return {
           id: p.id,
-          image: p.image,
+          image: p.image || `https://picsum.photos/seed/${p.id}/400/400`,
           caption: p.title || '',
           likes: 0,
           comments: 0,
@@ -156,8 +150,7 @@ export default function MarketplacePage() {
         .map((p) => {
           const id = String(p.id ?? '');
           if (!id || !String((p as { seller_id?: string }).seller_id ?? '').trim()) return null;
-          const thumb = productImagePublicUrl(String(p.image ?? '').trim());
-          if (!thumb || !isValidMarketplaceProductMediaUrl(thumb)) return null;
+          const thumb = resolveMarketplaceListingImageUrl(String(p.image ?? '').trim());
           const sellerUsername = String(
             (p as { seller_username?: string }).seller_username ||
               (p as { seller?: { username?: string } }).seller?.username ||
@@ -166,7 +159,7 @@ export default function MarketplacePage() {
           return {
             id,
             url: '',
-            thumbnail: thumb,
+            thumbnail: thumb || '',
             user: {
               username: sellerUsername,
               avatar: '',
@@ -194,8 +187,7 @@ export default function MarketplacePage() {
         .map((p) => {
           const id = String(p.id ?? '');
           if (!id || !String((p as { seller_id?: string }).seller_id ?? '').trim()) return null;
-          const thumb = productImagePublicUrl(String(p.image ?? '').trim());
-          if (!thumb || !isValidMarketplaceProductMediaUrl(thumb)) return null;
+          const thumb = resolveMarketplaceListingImageUrl(String(p.image ?? '').trim());
           const sellerUsername = String(
             (p as { seller_username?: string }).seller_username ||
               (p as { seller?: { username?: string } }).seller?.username ||
@@ -204,7 +196,7 @@ export default function MarketplacePage() {
           return {
             id,
             url: '',
-            thumbnail: thumb,
+            thumbnail: thumb || '',
             user: {
               username: sellerUsername,
               avatar: '',
@@ -222,28 +214,6 @@ export default function MarketplacePage() {
       setReels(formattedReels);
     }
   };
-
-  const mapPayloadToProducts = (payload: Record<string, unknown>[]): Product[] =>
-    payload
-      .map((p: any) => {
-        const id = String(p.id ?? '');
-        const sellerId = String(p.seller_id ?? '').trim();
-        if (!id || !sellerId) return null;
-        const image = productImagePublicUrl(String(p.image ?? '').trim());
-        if (!isValidMarketplaceProductMediaUrl(image)) return null;
-        return {
-          ...p,
-          id,
-          title: String(p.title ?? ''),
-          price: Number(p.price) || 0,
-          location: String(p.location ?? ''),
-          image,
-          category: String(p.category ?? ''),
-          stock: p.stock != null ? Number(p.stock) : undefined,
-          seller: { username: String(p.seller_username ?? 'seller').trim() || 'seller' },
-        } as Product;
-      })
-      .filter((row): row is Product => row !== null);
 
   const fetchProducts = async () => {
     try {
@@ -265,17 +235,33 @@ export default function MarketplacePage() {
       if (!list.length) {
         list = await fetchMarketplaceTableRowsAsApiProducts();
       }
+      console.log('Marketplace rows (merged list length):', list.length);
       if (!list.length) {
         if (!res.ok) console.log('marketplace error:', (payload as { error?: string })?.error ?? res.statusText);
         else if (!Array.isArray(payload)) console.log('marketplace error:', 'Expected array of products');
+        console.log('[Marketplace] No rows after API + Supabase fallback', { supabaseConfigured: isSupabaseConfigured });
         setProducts([]);
         return;
       }
-      setProducts(mapPayloadToProducts(list));
+      const mapped = mapMarketplaceRowsToProducts(list);
+      console.log('[Marketplace] Fetched rows → products', {
+        supabaseConfigured: isSupabaseConfigured,
+        rawRowCount: list.length,
+        afterMapCount: mapped.length,
+        idsSample: mapped.slice(0, 5).map((p) => p.id),
+      });
+      setProducts(mapped);
     } catch (err) {
       console.log('marketplace error:', err);
       const direct = await fetchMarketplaceTableRowsAsApiProducts();
-      setProducts(direct.length ? mapPayloadToProducts(direct) : []);
+      const mappedCatch = direct.length ? mapMarketplaceRowsToProducts(direct) : [];
+      console.log('[Marketplace] Catch fallback', {
+        supabaseConfigured: isSupabaseConfigured,
+        rawRowCount: direct.length,
+        afterMapCount: mappedCatch.length,
+        idsSample: mappedCatch.slice(0, 5).map((p) => p.id),
+      });
+      setProducts(mappedCatch);
     }
   };
 
@@ -301,10 +287,15 @@ export default function MarketplacePage() {
     { name: 'Home', icon: '🛋️' },
   ];
 
-  const filteredProducts = products.filter(p => {
+  const filteredProducts = products.filter((p) => {
     const matchesSearch = (p.title || '').toLowerCase().includes((searchQuery || '').toLowerCase());
-    const matchesCategory = activeCategory === 'All' || p.category === activeCategory;
-    const matchesLocation = !locationFilter || (p.location || '').toLowerCase().includes((locationFilter || '').toLowerCase());
+    // Remote rows often have no category; still show them unless a specific category is set on the product and it differs.
+    const cat = String(p.category || '').trim();
+    const matchesCategory =
+      activeCategory === 'All' || !cat || cat === activeCategory;
+    const ploc = (p.location || '').trim().toLowerCase();
+    const lf = (locationFilter || '').trim().toLowerCase();
+    const matchesLocation = !lf || !ploc || ploc.includes(lf);
     return matchesSearch && matchesCategory && matchesLocation;
   });
 
