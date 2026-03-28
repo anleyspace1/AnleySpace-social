@@ -22,6 +22,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { cn } from '../lib/utils';
 import { apiUrl } from '../lib/apiOrigin';
 import { productImagePublicUrl } from '../lib/marketplaceImage';
+import { fetchMarketplaceTableRowsAsApiProducts } from '../lib/marketplaceRemote';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import { ResponsiveImage } from '../components/ResponsiveImage';
@@ -129,9 +130,19 @@ export default function ExplorePage() {
     (async () => {
       try {
         const res = await fetch(apiUrl('/api/marketplace/products'));
-        const data = await res.json();
+        const ct = res.headers.get('content-type') || '';
+        let raw: unknown;
+        try {
+          if (!ct.includes('application/json')) raw = null;
+          else raw = await res.json();
+        } catch {
+          raw = null;
+        }
         if (cancelled) return;
-        if (!Array.isArray(data)) {
+        let data: Record<string, unknown>[] = [];
+        if (res.ok && Array.isArray(raw)) data = raw as Record<string, unknown>[];
+        if (!data.length) data = await fetchMarketplaceTableRowsAsApiProducts();
+        if (!data.length) {
           const products: ExploreProductRow[] = [];
           console.log("EXPLORE PRODUCTS:", products);
           setExploreProducts(products);
@@ -157,9 +168,31 @@ export default function ExplorePage() {
         }
       } catch {
         if (!cancelled) {
-          const products: ExploreProductRow[] = [];
-          console.log("EXPLORE PRODUCTS:", products);
-          setExploreProducts(products);
+          try {
+            const data = await fetchMarketplaceTableRowsAsApiProducts();
+            const products: ExploreProductRow[] = data
+              .map((p: Record<string, unknown>) => {
+                const sellerId = String(p.seller_id ?? '').trim();
+                const id = String(p.id ?? '').trim();
+                if (!id || !sellerId) return null;
+                const img = productImagePublicUrl(String(p.image ?? '').trim());
+                if (!isValidExploreProductUrl(img)) return null;
+                return {
+                  id,
+                  name: String((p.title as string) || 'Product'),
+                  price: Number(p.price) || 0,
+                  image: img,
+                  seller_id: sellerId,
+                };
+              })
+              .filter((row): row is ExploreProductRow => row !== null);
+            console.log("EXPLORE PRODUCTS:", products);
+            setExploreProducts(products);
+          } catch {
+            const products: ExploreProductRow[] = [];
+            console.log("EXPLORE PRODUCTS:", products);
+            setExploreProducts(products);
+          }
         }
       }
 

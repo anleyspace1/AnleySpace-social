@@ -30,6 +30,7 @@ import {
   CheckCircle2,
   Gift,
   Heart,
+  Coins,
   Play,
   Square,
   Trash2,
@@ -39,6 +40,7 @@ import { MOCK_CHATS, MOCK_USER } from '../constants';
 import { Message } from '../types';
 import { cn } from '../lib/utils';
 import { apiUrl } from '../lib/apiOrigin';
+import { productImagePublicUrl } from '../lib/marketplaceImage';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import io from 'socket.io-client';
@@ -66,6 +68,17 @@ async function notifyInboxMessageRealtime(messageId: string, senderId: string, r
   }
 }
 
+function parseOfferFields(m: any): Pick<Message, 'offer_price' | 'offer_status'> {
+  const raw = m.offer_price;
+  if (raw == null || raw === '') return {};
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return {};
+  return {
+    offer_price: n,
+    offer_status: m.offer_status != null ? String(m.offer_status) : 'pending',
+  };
+}
+
 /** Map Supabase `messages` row → UI Message (keeps normal messages unchanged). */
 function formatMessageFromDb(m: any): Message {
   const content = m.content || m.text || '';
@@ -88,6 +101,7 @@ function formatMessageFromDb(m: any): Message {
       storyMedia: m.story_media ?? undefined,
       storyMediaType: m.story_media_type ?? null,
       isSeen: m.is_seen === true,
+      ...parseOfferFields(m),
     };
   }
   // Voice files use the same `posts` bucket as images (`/posts/...`), so URL heuristics must detect voice BEFORE image.
@@ -122,7 +136,20 @@ function formatMessageFromDb(m: any): Message {
     audioUrl: m.audio_url || (isAudioLike ? content : undefined),
     imageUrl: m.image_url || (!isAudioLike && resolvedType === 'image' && isImageUrl ? content : undefined),
     isSeen: m.is_seen === true,
+    ...parseOfferFields(m),
   };
+}
+
+/** Nullable `messages.product_id` → normalized string or null (normal DM thread). Lowercase for stable keys. */
+function normalizeDmProductId(raw: unknown): string | null {
+  if (raw == null) return null;
+  const s = String(raw).trim().toLowerCase();
+  return s === '' ? null : s;
+}
+
+/** Stable list row id: one normal DM per peer, one marketplace row per (peer, product). */
+function dmThreadListId(contactId: string, product_id: string | null): string {
+  return product_id ? `${contactId}_${product_id}` : contactId;
 }
 
 export default function MessagesPage() {
@@ -131,11 +158,21 @@ export default function MessagesPage() {
   const [searchParams] = useSearchParams();
   const location = useLocation();
   const targetUser = searchParams.get('user');
-  const targetUserId = searchParams.get('userId');
+  /** `seller` (marketplace) takes priority over `userId` (profile / notifications). */
+  const targetUserIdRaw = searchParams.get('seller') || searchParams.get('userId');
+  const targetUserId = targetUserIdRaw != null && String(targetUserIdRaw).trim() !== '' ? String(targetUserIdRaw).trim() : null;
+  const marketplaceProductId = searchParams.get('product');
   
   const [chats, setChats] = useState<any[]>([]);
   const [selectedChat, setSelectedChat] = useState<any>(null);
+  const [headerMarketplaceProduct, setHeaderMarketplaceProduct] = useState<{
+    id: string;
+    title: string;
+    price: number;
+    image_url: string | null;
+  } | null>(null);
   const [message, setMessage] = useState('');
+  const [offerDraft, setOfferDraft] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
   const [loading, setLoading] = useState(true);
   const [isRecording, setIsRecording] = useState(false);
@@ -146,6 +183,45 @@ export default function MessagesPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
+  const productPrefillDoneRef = useRef(false);
+
+  useEffect(() => {
+    productPrefillDoneRef.current = false;
+  }, [marketplaceProductId]);
+
+  useEffect(() => {
+    setOfferDraft('');
+  }, [selectedChat?.id]);
+
+  useEffect(() => {
+    const pid = selectedChat?.product_id;
+    if (!pid) {
+      setHeaderMarketplaceProduct(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from('marketplace')
+        .select('id, title, price, image_url')
+        .eq('id', pid)
+        .maybeSingle();
+      if (cancelled) return;
+      if (!error && data) {
+        setHeaderMarketplaceProduct({
+          id: String(data.id),
+          title: String(data.title ?? ''),
+          price: Number(data.price),
+          image_url: data.image_url != null ? String(data.image_url) : null,
+        });
+      } else {
+        setHeaderMarketplaceProduct(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedChat?.product_id]);
 
   useEffect(() => {
     fetchChats();
@@ -169,8 +245,10 @@ export default function MessagesPage() {
     if (location.state?.openCall && user) {
       const { openCall, callType, callerId } = location.state;
       
-      // Find the chat with the caller
-      const chat = chats.find(c => c.user.id === callerId);
+      // Prefer normal DM; if only a marketplace thread exists with that user, use it so calls still open.
+      const chat =
+        chats.find((c) => c.user.id === callerId && !c.product_id) ||
+        chats.find((c) => c.user.id === callerId);
       if (chat) {
         setSelectedChat(chat);
         setActiveCall({ 
@@ -209,19 +287,34 @@ export default function MessagesPage() {
       
       if (msgError) throw msgError;
 
-      const contactIds = new Set<string>();
-      const lastMessagesMap = new Map<string, { content: string, created_at: string }>();
       const injectedProfiles = new Map<string, { id: string; username: string; full_name: string | null; avatar_url: string | null; bio?: string | null }>();
 
-      allMessages?.forEach(m => {
+      type ThreadAgg = {
+        contactId: string;
+        product_id: string | null;
+        last: { content: string; created_at: string; type?: string | null };
+      };
+      const threads = new Map<string, ThreadAgg>();
+
+      allMessages?.forEach((m: any) => {
+        if (m.group_id) return;
         const contactId = m.sender_id === authUser.id ? m.receiver_id : m.sender_id;
-        if (contactId) {
-          contactIds.add(contactId);
-          if (!lastMessagesMap.has(contactId)) {
-            lastMessagesMap.set(contactId, { content: m.content || m.text || '', created_at: m.created_at });
-          }
+        if (!contactId) return;
+        const productId = normalizeDmProductId(m.product_id);
+        const tkey = dmThreadListId(String(contactId), productId);
+        const cand = {
+          content: m.content || m.text || '',
+          created_at: m.created_at,
+          type: m.type ?? null,
+        };
+        const cur = threads.get(tkey);
+        if (!cur || new Date(cand.created_at).getTime() > new Date(cur.last.created_at).getTime()) {
+          threads.set(tkey, { contactId: String(contactId), product_id: productId, last: cand });
         }
       });
+
+      const contactIds = new Set<string>();
+      threads.forEach((t) => contactIds.add(t.contactId));
 
       // If there's a targetUser (username) or targetUserId in URL, ensure they are in the list
       const ensureContact = async (targetProfile: { id: string; username: string; full_name: string | null; avatar_url: string | null } | null) => {
@@ -259,19 +352,19 @@ export default function MessagesPage() {
         const { data: targetProfileById, error: targetErr2 } = await supabase
           .from('profiles')
           .select('id, username, full_name, avatar_url')
-          .eq('id', targetUserId.trim())
+          .eq('id', targetUserId)
           .maybeSingle();
         if (!targetErr2 && targetProfileById) {
           await ensureContact(targetProfileById);
         } else {
           // Safe fallback for newly created users not fully synced in profiles yet.
           try {
-            const res = await fetch(apiUrl(`/api/user/${encodeURIComponent(targetUserId.trim())}`));
+            const res = await fetch(apiUrl(`/api/user/${encodeURIComponent(targetUserId)}`));
             if (res.ok) {
               const localUser = await res.json();
               const fallbackProfile = {
-                id: targetUserId.trim(),
-                username: localUser?.username || targetUserId.trim(),
+                id: targetUserId,
+                username: localUser?.username || targetUserId,
                 full_name: localUser?.full_name || null,
                 avatar_url: localUser?.avatar || null,
                 bio: localUser?.bio || null,
@@ -279,8 +372,8 @@ export default function MessagesPage() {
               await ensureContact(fallbackProfile);
             } else {
               await ensureContact({
-                id: targetUserId.trim(),
-                username: targetUserId.trim(),
+                id: targetUserId,
+                username: targetUserId,
                 full_name: null,
                 avatar_url: null,
               });
@@ -288,14 +381,25 @@ export default function MessagesPage() {
           } catch (fallbackErr) {
             console.error('Error resolving target user fallback:', fallbackErr);
             await ensureContact({
-              id: targetUserId.trim(),
-              username: targetUserId.trim(),
+              id: targetUserId,
+              username: targetUserId,
               full_name: null,
               avatar_url: null,
             });
           }
         }
       }
+
+      Array.from(contactIds).forEach((cid) => {
+        const tk = dmThreadListId(cid, null);
+        if (!threads.has(tk)) {
+          threads.set(tk, {
+            contactId: cid,
+            product_id: null,
+            last: { content: '', created_at: new Date(0).toISOString(), type: null },
+          });
+        }
+      });
 
       if (contactIds.size === 0) {
         setChats([]);
@@ -323,51 +427,67 @@ export default function MessagesPage() {
         }
       });
 
-      const formattedChats = profileList.map((p: any) => {
-        const lastMsg = lastMessagesMap.get(p.id);
-        return {
-          id: p.id,
-          user: {
-            id: p.id,
-            username: p.username || `user_${String(p.id).slice(0, 6)}`,
-            displayName: p.full_name || p.username || 'User',
-            avatar: p.avatar_url || `https://picsum.photos/seed/${p.id}/100/100`,
-            bio: p.bio,
-            online: true 
-          },
-          lastMessage: lastMsg ? (
-            (() => {
-              const lm = lastMsg as { content?: string; type?: string | null };
-              const lmType = lm.type != null ? String(lm.type).trim().toLowerCase() : '';
-              if (lmType === 'audio' || lmType === 'voice') return '🎤 Voice message';
-              if (
-                lm.content &&
-                lm.content.startsWith('http') &&
-                lm.content.includes('/voice-messages/')
-              ) {
-                return '🎤 Voice message';
-              }
-              if (
-                lm.content &&
-                lm.content.startsWith('http') &&
-                (lm.content.includes('/chat/') || lm.content.includes('/posts/'))
-              ) {
-                return '📷 Photo';
-              }
-              return lm.content || '';
-            })()
-          ) : 'Start a conversation',
-          timestamp: lastMsg ? new Date(lastMsg.created_at).toLocaleDateString() === new Date().toLocaleDateString()
-            ? new Date(lastMsg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-            : new Date(lastMsg.created_at).toLocaleDateString()
-            : '',
-          rawDate: lastMsg ? new Date(lastMsg.created_at) : new Date(0),
-          unreadCount: 0
-        };
+      const threadEntries = Array.from(threads.values());
+      threadEntries.sort(
+        (a, b) => new Date(b.last.created_at).getTime() - new Date(a.last.created_at).getTime()
+      );
+
+      /** Sidebar only: hide empty Marketplace rows (no real message body). Normal DMs unchanged. */
+      const threadsForSidebar = threadEntries.filter((t) => {
+        if (!t.product_id) return true;
+        const c = t.last?.content;
+        return c != null && String(c).trim() !== '';
       });
 
-      // Sort by latest message
-      formattedChats.sort((a, b) => b.rawDate.getTime() - a.rawDate.getTime());
+      const formattedChats = threadsForSidebar
+        .map((t) => {
+          const p = profileList.find((row: any) => row.id === t.contactId);
+          if (!p) return null;
+          const lastMsg = t.last;
+          const hasText = Boolean(lastMsg?.content && String(lastMsg.content).trim() !== '');
+          return {
+            id: dmThreadListId(t.contactId, t.product_id),
+            product_id: t.product_id,
+            user: {
+              id: p.id,
+              username: p.username || `user_${String(p.id).slice(0, 6)}`,
+              displayName: p.full_name || p.username || 'User',
+              avatar: p.avatar_url || `https://picsum.photos/seed/${p.id}/100/100`,
+              bio: p.bio,
+              online: true,
+            },
+            lastMessage: hasText
+              ? (() => {
+                  const lm = lastMsg as { content?: string; type?: string | null };
+                  const lmType = lm.type != null ? String(lm.type).trim().toLowerCase() : '';
+                  if (lmType === 'audio' || lmType === 'voice') return '🎤 Voice message';
+                  if (
+                    lm.content &&
+                    lm.content.startsWith('http') &&
+                    lm.content.includes('/voice-messages/')
+                  ) {
+                    return '🎤 Voice message';
+                  }
+                  if (
+                    lm.content &&
+                    lm.content.startsWith('http') &&
+                    (lm.content.includes('/chat/') || lm.content.includes('/posts/'))
+                  ) {
+                    return '📷 Photo';
+                  }
+                  return lm.content || '';
+                })()
+              : 'Start a conversation',
+            timestamp: hasText
+              ? new Date(lastMsg.created_at).toLocaleDateString() === new Date().toLocaleDateString()
+                ? new Date(lastMsg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                : new Date(lastMsg.created_at).toLocaleDateString()
+              : '',
+            rawDate: new Date(lastMsg.created_at),
+            unreadCount: 0,
+          };
+        })
+        .filter(Boolean) as any[];
 
       setChats(formattedChats);
     } catch (err) {
@@ -377,33 +497,117 @@ export default function MessagesPage() {
     }
   };
 
+  const fetchChatsRef = useRef(fetchChats);
+  fetchChatsRef.current = fetchChats;
+
+  /** One extra fetchChats if peer row is missing right after load (ensureContact vs list timing). */
+  const peerListRefetchCountRef = useRef(0);
   useEffect(() => {
-    if (targetUserId && chats.length > 0) {
-      const byId = chats.find(c => c.user.id === targetUserId.trim());
-      if (byId) {
-        setSelectedChat(byId);
-        return;
-      }
+    peerListRefetchCountRef.current = 0;
+  }, [targetUserId, targetUser, marketplaceProductId]);
+
+  /** After chats finish loading: select thread for `seller` / `userId` (never fall back to chats[0]). */
+  useEffect(() => {
+    const urlPeerId = (searchParams.get('seller') || searchParams.get('userId') || '').trim();
+    if (!urlPeerId) return;
+
+    if (loading) {
+      setSelectedChat(null);
+      return;
     }
-    if (targetUser && chats.length > 0) {
-      const existingChat = chats.find(c => c.user.username === targetUser);
-      if (existingChat) {
-        setSelectedChat(existingChat);
-      }
-    } else if (!selectedChat && chats.length > 0) {
-      setSelectedChat(chats[0]);
+
+    const urlProduct = (searchParams.get('product') || '').trim();
+    const urlProductNorm = urlProduct.toLowerCase();
+    const match = chats.find((c) => {
+      if (String(c.user?.id ?? '').trim() !== urlPeerId) return false;
+      if (urlProduct) return String(c.product_id ?? '').toLowerCase() === urlProductNorm;
+      return !c.product_id;
+    });
+    if (match) {
+      setSelectedChat(match);
+      return;
     }
-  }, [targetUser, targetUserId, chats]);
+
+    if (chats.length === 0) {
+      setSelectedChat(null);
+      return;
+    }
+
+    if (peerListRefetchCountRef.current < 1) {
+      peerListRefetchCountRef.current += 1;
+      void fetchChatsRef.current();
+      return;
+    }
+
+    setSelectedChat(null);
+  }, [chats, loading, searchParams]);
+
+  /** Username deep link when no peer id in URL. */
+  useEffect(() => {
+    const u = (searchParams.get('user') || '').trim();
+    if (!u) return;
+    const urlPeerId = (searchParams.get('seller') || searchParams.get('userId') || '').trim();
+    if (urlPeerId) return;
+
+    if (loading) {
+      setSelectedChat(null);
+      return;
+    }
+
+    if (chats.length === 0) {
+      setSelectedChat(null);
+      return;
+    }
+
+    const match = chats.find((c) => c.user.username === u && !c.product_id);
+    if (match) {
+      setSelectedChat(match);
+      return;
+    }
+
+    setSelectedChat(null);
+  }, [chats, loading, searchParams]);
+
+  /** No URL target: preserve prior selection or default to first chat. */
+  useEffect(() => {
+    const urlPeerId = (searchParams.get('seller') || searchParams.get('userId') || '').trim();
+    const u = (searchParams.get('user') || '').trim();
+    if (urlPeerId || u) return;
+    if (loading) return;
+
+    setSelectedChat((prev) => {
+      if (prev && chats.some((c) => c.id === prev.id)) return prev;
+      return chats[0] ?? null;
+    });
+  }, [chats, loading, searchParams]);
+
+  useEffect(() => {
+    const urlSellerId = (searchParams.get('seller') || searchParams.get('userId') || '').trim();
+    const urlProduct = (searchParams.get('product') || '').trim();
+    const urlProductNorm = urlProduct.toLowerCase();
+    if (!urlProduct || !selectedChat || !urlSellerId) return;
+    if (String(selectedChat.user?.id ?? '').trim() !== urlSellerId) return;
+    if (String(selectedChat.product_id ?? '').toLowerCase() !== urlProductNorm) return;
+    if (productPrefillDoneRef.current) return;
+    productPrefillDoneRef.current = true;
+    setMessage((m) => (m.trim() === '' ? "Hi, I'm interested in this product" : m));
+  }, [marketplaceProductId, selectedChat, searchParams]);
 
   const fetchMessages = async () => {
     if (!selectedChat || !user) return;
     try {
-      const { data, error } = await supabase
+      let q = supabase
         .from('messages')
         .select('*')
         .or(`and(sender_id.eq.${user.id},receiver_id.eq.${selectedChat.user.id}),and(sender_id.eq.${selectedChat.user.id},receiver_id.eq.${user.id})`)
         .order('created_at', { ascending: true });
-      
+      if (selectedChat.product_id) {
+        q = q.eq('product_id', selectedChat.product_id);
+      } else {
+        q = q.is('product_id', null);
+      }
+      const { data, error } = await q;
+
       if (error) throw error;
 
       const formattedMessages: Message[] = (data || []).map(formatMessageFromDb);
@@ -416,6 +620,7 @@ export default function MessagesPage() {
   /** Mark messages from the other user to me as read; server emits `messages_seen` so sender UI updates instantly. */
   const markConversationAsSeen = async () => {
     if (!selectedChat || !user) return;
+    const productId = selectedChat.product_id ? String(selectedChat.product_id) : null;
     try {
       const res = await fetch(apiUrl('/api/messages/mark-seen'), {
         method: "POST",
@@ -423,24 +628,29 @@ export default function MessagesPage() {
         body: JSON.stringify({
           receiverId: user.id,
           senderId: selectedChat.user.id,
+          ...(productId ? { productId } : {}),
         }),
       });
       if (!res.ok) {
-        const { error } = await supabase
+        let q = supabase
           .from("messages")
           .update({ is_seen: true })
           .eq("receiver_id", user.id)
           .eq("sender_id", selectedChat.user.id);
+        q = productId ? q.eq("product_id", productId) : q.is("product_id", null);
+        const { error } = await q;
         if (error) console.error("markConversationAsSeen fallback:", error);
       }
     } catch (e) {
       console.error("markConversationAsSeen:", e);
       try {
-        const { error } = await supabase
+        let q = supabase
           .from("messages")
           .update({ is_seen: true })
           .eq("receiver_id", user.id)
           .eq("sender_id", selectedChat.user.id);
+        q = productId ? q.eq("product_id", productId) : q.is("product_id", null);
+        const { error } = await q;
         if (error) console.error("markConversationAsSeen fallback:", error);
       } catch (e2) {
         console.error("markConversationAsSeen fallback:", e2);
@@ -458,13 +668,16 @@ export default function MessagesPage() {
 
     // Subscribe to real-time messages for this conversation
     const channel = supabase
-      .channel(`chat:${selectedChat.user.id}`)
+      .channel(`chat:${selectedChat.id}`)
       .on('postgres_changes', { 
         event: 'INSERT', 
         schema: 'public', 
         table: 'messages'
       }, (payload) => {
         const newMessage = payload.new;
+        const selPid = normalizeDmProductId(selectedChat.product_id);
+        const msgPid = normalizeDmProductId((newMessage as { product_id?: string | null }).product_id);
+        if (selPid !== msgPid) return;
         const isRelevant = (newMessage.sender_id === user.id && newMessage.receiver_id === selectedChat.user.id) ||
                            (newMessage.sender_id === selectedChat.user.id && newMessage.receiver_id === user.id);
         
@@ -482,6 +695,9 @@ export default function MessagesPage() {
         table: 'messages',
       }, (payload) => {
         const row = payload.new as Record<string, unknown>;
+        const selPid = normalizeDmProductId(selectedChat.product_id);
+        const msgPid = normalizeDmProductId(row.product_id);
+        if (selPid !== msgPid) return;
         const isRelevant =
           (row.sender_id === user.id && row.receiver_id === selectedChat.user.id) ||
           (row.sender_id === selectedChat.user.id && row.receiver_id === user.id);
@@ -858,6 +1074,59 @@ export default function MessagesPage() {
     }
   };
 
+  const sendOffer = async (price: number) => {
+    if (!selectedChat?.product_id || !user) return;
+    const p = Number(price);
+    if (!Number.isFinite(p) || p <= 0) {
+      alert('Enter a valid offer in coins.');
+      return;
+    }
+    try {
+      const row: Record<string, string | number | boolean> = {
+        sender_id: user.id,
+        receiver_id: selectedChat.user.id,
+        content: `Offer: ${p} coins`,
+        product_id: String(selectedChat.product_id),
+        offer_price: p,
+        offer_status: 'pending',
+        is_seen: false,
+      };
+      const { data, error } = await supabase.from('messages').insert([row]).select();
+      if (error) {
+        console.error('sendOffer:', error);
+        alert(`Failed to send offer: ${error.message}`);
+        return;
+      }
+      if (data?.[0]) {
+        const savedMsg = data[0];
+        setMessages((prev) => [...prev, formatMessageFromDb(savedMsg)]);
+        setOfferDraft('');
+        void notifyInboxMessageRealtime(savedMsg.id, user.id, selectedChat.user.id);
+      }
+    } catch (e: any) {
+      console.error('sendOffer:', e);
+      alert(e?.message || 'Failed to send offer');
+    }
+  };
+
+  const acceptOffer = async (messageId: string) => {
+    const { error } = await supabase.from('messages').update({ offer_status: 'accepted' }).eq('id', messageId);
+    if (error) {
+      alert(error.message);
+      return;
+    }
+    setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, offer_status: 'accepted' } : m)));
+  };
+
+  const declineOffer = async (messageId: string) => {
+    const { error } = await supabase.from('messages').update({ offer_status: 'declined' }).eq('id', messageId);
+    if (error) {
+      alert(error.message);
+      return;
+    }
+    setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, offer_status: 'declined' } : m)));
+  };
+
   const handleSendMessage = async () => {
     if ((!message.trim() && !selectedImage) || !selectedChat || !user) return;
     
@@ -894,6 +1163,9 @@ export default function MessagesPage() {
         content: imageUrl || message.trim(),
         is_seen: false,
       };
+      if (selectedChat.product_id) {
+        messageData.product_id = String(selectedChat.product_id);
+      }
 
       const { data, error } = await supabase
         .from('messages')
@@ -1033,15 +1305,19 @@ export default function MessagesPage() {
         .getPublicUrl(filePath);
 
       // 3. Insert message using confirmed columns
+      const voiceRow: Record<string, string | boolean> = {
+        sender_id: user.id,
+        receiver_id: selectedChat.user.id,
+        content: publicUrl,
+        is_seen: false,
+        type: 'audio',
+      };
+      if (selectedChat.product_id) {
+        voiceRow.product_id = String(selectedChat.product_id);
+      }
       const { data, error } = await supabase
         .from('messages')
-        .insert([{
-          sender_id: user.id,
-          receiver_id: selectedChat.user.id,
-          content: publicUrl,
-          is_seen: false,
-          type: 'audio',
-        }])
+        .insert([voiceRow])
         .select();
       
       if (error) {
@@ -1098,8 +1374,8 @@ export default function MessagesPage() {
         throw error;
       }
 
-      // Remove this conversation locally and close info/chat view.
-      setChats(prev => prev.filter((chat) => chat.user?.id !== blockedId));
+      // Remove this thread only (normal vs marketplace stay separate).
+      setChats(prev => prev.filter((chat) => chat.id !== selectedChat.id));
       setSelectedChat(null);
       setMessages([]);
       setIsInfoOpen(false);
@@ -1169,9 +1445,16 @@ export default function MessagesPage() {
                 )}
               </div>
               <div className="flex-1 text-left">
-                <div className="flex items-center justify-between mb-0.5 sm:mb-1">
-                  <span className="font-bold text-sm sm:text-base">{chat.user.displayName}</span>
-                  <span className="text-[10px] sm:text-xs text-gray-500">{chat.timestamp}</span>
+                <div className="flex items-center justify-between mb-0.5 sm:mb-1 gap-1">
+                  <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                    <span className="font-bold text-sm sm:text-base truncate">{chat.user.displayName}</span>
+                    {chat.product_id ? (
+                      <span className="shrink-0 text-[9px] sm:text-[10px] font-semibold text-indigo-500 bg-indigo-500/15 dark:bg-indigo-500/20 px-1.5 py-0.5 rounded">
+                        Marketplace
+                      </span>
+                    ) : null}
+                  </div>
+                  <span className="text-[10px] sm:text-xs text-gray-500 shrink-0">{chat.timestamp}</span>
                 </div>
                 <p className="text-xs sm:text-sm text-gray-500 truncate">{chat.lastMessage}</p>
               </div>
@@ -1206,7 +1489,14 @@ export default function MessagesPage() {
                   {selectedChat.online && <div className="absolute bottom-0 right-0 w-2 h-2 sm:w-2.5 sm:h-2.5 bg-green-500 border-2 border-white dark:border-black rounded-full"></div>}
                 </div>
                 <div>
-                  <h3 className="font-bold leading-none text-sm sm:text-base">{selectedChat.user.displayName}</h3>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h3 className="font-bold leading-none text-sm sm:text-base">{selectedChat.user.displayName}</h3>
+                    {selectedChat.product_id ? (
+                      <span className="text-[9px] sm:text-[10px] font-semibold text-indigo-500 bg-indigo-500/15 dark:bg-indigo-500/20 px-1.5 py-0.5 rounded">
+                        Marketplace
+                      </span>
+                    ) : null}
+                  </div>
                   <span className="text-[10px] sm:text-xs text-gray-500">{selectedChat.online ? 'Online' : 'Offline'}</span>
                 </div>
               </div>
@@ -1245,6 +1535,37 @@ export default function MessagesPage() {
               </div>
             </div>
 
+            {headerMarketplaceProduct && (
+              <div className="shrink-0 flex items-center gap-3 p-3 border-b border-gray-200 dark:border-gray-800 bg-white dark:bg-black">
+                <img
+                  src={
+                    productImagePublicUrl(headerMarketplaceProduct.image_url) ||
+                    headerMarketplaceProduct.image_url ||
+                    `https://picsum.photos/seed/${headerMarketplaceProduct.id}/112/112`
+                  }
+                  alt=""
+                  className="w-14 h-14 rounded-lg object-cover border border-gray-100 dark:border-gray-800 bg-gray-100 dark:bg-gray-900"
+                />
+                <div className="flex flex-col min-w-0 flex-1">
+                  <span className="font-semibold text-sm text-gray-900 dark:text-white truncate">
+                    {headerMarketplaceProduct.title || 'Listing'}
+                  </span>
+                  <span className="text-xs text-gray-500 dark:text-gray-400">
+                    {Number.isFinite(headerMarketplaceProduct.price)
+                      ? `${headerMarketplaceProduct.price.toLocaleString()} coins`
+                      : '—'}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => navigate(`/marketplace/product/${headerMarketplaceProduct.id}`)}
+                    className="text-left text-xs text-indigo-600 dark:text-indigo-400 hover:underline mt-0.5"
+                  >
+                    View listing
+                  </button>
+                </div>
+              </div>
+            )}
+
             <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-3 sm:p-4 space-y-3 sm:space-y-4 bg-[#f5f7fb] dark:bg-[#111827]/80">
               <div className="flex justify-center">
                 <span className="text-xs bg-white dark:bg-gray-800 text-gray-600 dark:text-gray-400 px-3 py-1 rounded-full border border-gray-200/80 dark:border-gray-700 shadow-sm">Today</span>
@@ -1273,7 +1594,45 @@ export default function MessagesPage() {
                       ? "bg-gradient-to-br from-indigo-600 to-violet-600 text-white shadow-[0_2px_10px_rgba(79,70,229,0.35)]" 
                       : "bg-white text-[#0f172a] border border-gray-200/90 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 shadow-[0_1px_4px_rgba(15,23,42,0.06)]"
                   )}>
-                    {msg.type === 'voice' || msg.type === 'audio' ? (
+                    {msg.offer_price != null && Number.isFinite(msg.offer_price) ? (
+                      <div className="space-y-2 min-w-[200px]">
+                        <p
+                          className={cn(
+                            'text-sm font-semibold flex items-center gap-1.5',
+                            msg.senderId === user?.id ? 'text-white' : 'text-[#0f172a] dark:text-gray-100'
+                          )}
+                        >
+                          <span aria-hidden>💰</span>
+                          Offer: {msg.offer_price.toLocaleString()} coins
+                        </p>
+                        {(msg.offer_status || 'pending').toLowerCase() === 'accepted' && (
+                          <p className="text-xs font-medium text-emerald-600 dark:text-emerald-400">✅ Accepted</p>
+                        )}
+                        {(msg.offer_status || 'pending').toLowerCase() === 'declined' && (
+                          <p className="text-xs font-medium text-red-600 dark:text-red-400">❌ Declined</p>
+                        )}
+                        {selectedChat?.product_id &&
+                          user?.id === msg.receiverId &&
+                          (msg.offer_status || 'pending').toLowerCase() === 'pending' && (
+                            <div className="flex flex-wrap gap-2 pt-1">
+                              <button
+                                type="button"
+                                onClick={() => void acceptOffer(msg.id)}
+                                className="rounded-lg bg-emerald-600 px-3 py-1 text-xs font-bold text-white hover:bg-emerald-700"
+                              >
+                                Accept
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => void declineOffer(msg.id)}
+                                className="rounded-lg bg-gray-200 px-3 py-1 text-xs font-bold text-gray-800 hover:bg-gray-300 dark:bg-gray-700 dark:text-gray-100 dark:hover:bg-gray-600"
+                              >
+                                Decline
+                              </button>
+                            </div>
+                          )}
+                      </div>
+                    ) : msg.type === 'voice' || msg.type === 'audio' ? (
                       <div className="flex items-center gap-3 min-w-[160px] py-1">
                         <button 
                           onClick={() => {
@@ -1383,6 +1742,28 @@ export default function MessagesPage() {
             </div>
 
             <div className="shrink-0 p-2 sm:p-4 border-t border-[#e5e7eb] bg-white dark:bg-gray-950 dark:border-gray-800">
+              {selectedChat?.product_id && !isRecording && (
+                <div className="mb-2 flex flex-wrap items-center gap-2 px-0.5">
+                  <Coins className="text-amber-500 shrink-0" size={18} aria-hidden />
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    inputMode="numeric"
+                    value={offerDraft}
+                    onChange={(e) => setOfferDraft(e.target.value)}
+                    placeholder="Offer (coins)"
+                    className="w-28 sm:w-36 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 px-2 py-1.5 text-sm text-gray-900 dark:text-gray-100"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void sendOffer(Number(offerDraft))}
+                    className="rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-bold text-white hover:bg-amber-600 transition-colors"
+                  >
+                    Make offer
+                  </button>
+                </div>
+              )}
               {selectedImage && (
                 <div className="mb-3 relative inline-block">
                   <img src={selectedImage} alt="Preview" className="w-32 h-32 object-cover rounded-xl border-2 border-indigo-500" />

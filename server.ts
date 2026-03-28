@@ -1844,17 +1844,26 @@ async function startServer() {
     try {
       const receiverId = typeof req.body?.receiverId === "string" ? req.body.receiverId.trim() : "";
       const senderId = typeof req.body?.senderId === "string" ? req.body.senderId.trim() : "";
+      const productIdRaw = req.body?.productId;
+      const productId =
+        typeof productIdRaw === "string" && productIdRaw.trim() ? productIdRaw.trim() : null;
       if (!receiverId || !senderId || receiverId === senderId) {
         return res.status(400).json({ error: "Invalid payload" });
       }
       if (!supabaseAdmin) {
         return res.status(503).json({ error: "Supabase service role not configured" });
       }
-      const { error } = await supabaseAdmin
+      let q = supabaseAdmin
         .from("messages")
         .update({ is_seen: true })
         .eq("receiver_id", receiverId)
         .eq("sender_id", senderId);
+      if (productId) {
+        q = q.eq("product_id", productId);
+      } else {
+        q = q.is("product_id", null);
+      }
+      const { error } = await q;
       if (error) {
         console.error("POST /api/messages/mark-seen update error:", error);
         return res.status(500).json({ error: error.message });
@@ -3185,7 +3194,7 @@ async function startServer() {
       }
 
       const { data, error } = await client
-        .from('products')
+        .from('marketplace')
         .select('*')
         .order('created_at', { ascending: false });
 
@@ -3194,7 +3203,29 @@ async function startServer() {
 
       if (error) throw error;
 
-      const rows = data || [];
+      const fromProducts = (data || []).map((m: Record<string, unknown>) => ({
+        id: m.id,
+        title: m.title,
+        price: m.price,
+        image: m.image_url,
+        seller_id: m.user_id,
+        category: '',
+        location: '',
+        description: '',
+        stock: 10,
+        created_at: m.created_at,
+      }));
+
+      const mergedById = new Map<string, Record<string, unknown>>();
+      for (const p of fromProducts) {
+        if (p && (p as { id?: string }).id) mergedById.set(String((p as { id: string }).id), p as Record<string, unknown>);
+      }
+      const rows = [...mergedById.values()].sort((a, b) => {
+        const ta = new Date((a as { created_at?: string }).created_at || 0).getTime();
+        const tb = new Date((b as { created_at?: string }).created_at || 0).getTime();
+        return tb - ta;
+      });
+
       const sellerIds = [...new Set(rows.map((p: { seller_id?: string }) => p.seller_id).filter(Boolean))] as string[];
       const profileMap = new Map<string, string>();
       if (sellerIds.length > 0) {
@@ -3247,30 +3278,48 @@ async function startServer() {
       }
 
       const { data, error } = await client
-        .from('products')
+        .from('marketplace')
         .select('*')
         .eq('id', req.params.id)
-        .single();
+        .maybeSingle();
 
       console.log("marketplace data:", data);
       console.log("marketplace error:", error);
 
-      if (error) throw error;
-      if (!data) return res.status(404).json({ error: 'Product not found' });
+      let row: Record<string, unknown> | null = null;
+      if (data && !error) {
+        const m = data as Record<string, unknown>;
+        row = {
+          id: m.id,
+          title: m.title,
+          price: m.price,
+          image: m.image_url,
+          seller_id: m.user_id,
+          category: '',
+          location: '',
+          description: '',
+          stock: 10,
+          created_at: m.created_at,
+        };
+      }
+
+      if (error && !row) throw error;
+      if (!row) return res.status(404).json({ error: 'Product not found' });
 
       let seller_username = 'Unknown';
-      if (data.seller_id) {
+      const sid = row.seller_id as string | undefined;
+      if (sid) {
         const { data: prof, error: pErr } = await client
           .from('profiles')
           .select('username')
-          .eq('id', data.seller_id)
+          .eq('id', sid)
           .single();
         console.log("marketplace profiles error:", pErr);
         if (!pErr && prof?.username) seller_username = prof.username;
       }
 
       const product = {
-        ...data,
+        ...row,
         seller_username,
       };
 
@@ -3303,16 +3352,12 @@ async function startServer() {
       try {
         const syncClient = supabaseAdmin || supabase;
         if (syncClient) {
-          const { error: syncError } = await syncClient.from('products').upsert({
+          const { error: syncError } = await syncClient.from('marketplace').upsert({
             id,
             title,
             price,
-            category,
-            location,
-            image,
-            seller_id: sellerId,
-            description: description || '',
-            stock: stock || 10
+            image_url: image,
+            user_id: sellerId,
           });
           if (syncError) logToFile(`SERVER: Supabase product sync error: ${syncError.message}`);
         }
@@ -3334,8 +3379,15 @@ async function startServer() {
       // Get product from Supabase if possible, otherwise SQLite
       let product;
       try {
-        const { data } = await supabase.from('products').select('*').eq('id', productId).single();
-        product = data;
+        const { data: m } = await supabase.from('marketplace').select('*').eq('id', productId).maybeSingle();
+        if (m) {
+          product = {
+            ...m,
+            seller_id: m.user_id,
+            stock: 10,
+            image: m.image_url,
+          };
+        }
       } catch (e) {}
       
       if (!product) {
@@ -3383,7 +3435,6 @@ async function startServer() {
       try {
         await supabase.rpc('decrement_coins', { user_id: buyerId, amount: product.price });
         await supabase.rpc('increment_coins', { user_id: product.seller_id, amount: payout });
-        await supabase.from('products').update({ stock: product.stock - 1 }).eq('id', productId);
         await supabase.from('orders').insert({
           id: orderId,
           buyer_id: buyerId,

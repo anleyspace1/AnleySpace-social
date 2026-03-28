@@ -36,6 +36,8 @@ import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../lib/supabase';
 import { apiUrl } from '../lib/apiOrigin';
 import { productImagePublicUrl } from '../lib/marketplaceImage';
+import { fetchMarketplaceTableRowsAsApiProducts } from '../lib/marketplaceRemote';
+import { fetchSavedMarketplaceProductIds, setSavedMarketplaceProduct } from '../lib/savedMarketplace';
 import { ResponsiveImage } from '../components/ResponsiveImage';
 
 export default function MarketplacePage() {
@@ -56,6 +58,7 @@ export default function MarketplacePage() {
   const [buyStatus, setBuyStatus] = useState<'idle' | 'processing' | 'success' | 'error'>('idle');
   const [selectedImages, setSelectedImages] = useState<File[]>([]);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+  const [savedProductIds, setSavedProductIds] = useState<Set<string>>(new Set());
 
   const closePostModal = () => {
     setIsPostModalOpen(false);
@@ -69,6 +72,40 @@ export default function MarketplacePage() {
       fetchUser();
     }
   }, [user]);
+
+  useEffect(() => {
+    if (!user?.id) {
+      setSavedProductIds(new Set());
+      return;
+    }
+    let cancelled = false;
+    fetchSavedMarketplaceProductIds(user.id).then((ids) => {
+      if (!cancelled) setSavedProductIds(ids);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id]);
+
+  const toggleSaveProduct = async (e: React.MouseEvent, productId: string) => {
+    e.stopPropagation();
+    if (!user?.id) {
+      alert('Please log in to save items');
+      return;
+    }
+    const willSave = !savedProductIds.has(productId);
+    try {
+      await setSavedMarketplaceProduct(user.id, productId, willSave);
+      setSavedProductIds((prev) => {
+        const next = new Set(prev);
+        if (willSave) next.add(productId);
+        else next.delete(productId);
+        return next;
+      });
+    } catch (err) {
+      console.error('[Marketplace] save toggle', err);
+    }
+  };
 
   const marketplacePostsGrid = React.useMemo((): Post[] => {
     return products
@@ -99,18 +136,23 @@ export default function MarketplacePage() {
   const fetchReels = async () => {
     try {
       const res = await fetch(apiUrl('/api/marketplace/products'));
-      let data: unknown;
+      const ct = res.headers.get('content-type') || '';
+      let raw: unknown;
       try {
-        data = await res.json();
+        if (!ct.includes('application/json')) raw = null;
+        else raw = await res.json();
       } catch {
-        data = null;
+        raw = null;
       }
-      console.log('REELS DATA:', data);
-      if (!res.ok || !Array.isArray(data)) {
+      console.log('REELS DATA:', raw);
+      let data: Record<string, unknown>[] = [];
+      if (res.ok && Array.isArray(raw)) data = raw as Record<string, unknown>[];
+      if (!data.length) data = await fetchMarketplaceTableRowsAsApiProducts();
+      if (!data.length) {
         setReels([]);
         return;
       }
-      const formattedReels: Video[] = (data as Record<string, unknown>[])
+      const formattedReels: Video[] = data
         .map((p) => {
           const id = String(p.id ?? '');
           if (!id || !String((p as { seller_id?: string }).seller_id ?? '').trim()) return null;
@@ -143,56 +185,97 @@ export default function MarketplacePage() {
     } catch (err) {
       console.log('REELS DATA:', null);
       console.log('marketplace error:', err);
-      setReels([]);
+      const direct = await fetchMarketplaceTableRowsAsApiProducts();
+      if (!direct.length) {
+        setReels([]);
+        return;
+      }
+      const formattedReels: Video[] = direct
+        .map((p) => {
+          const id = String(p.id ?? '');
+          if (!id || !String((p as { seller_id?: string }).seller_id ?? '').trim()) return null;
+          const thumb = productImagePublicUrl(String(p.image ?? '').trim());
+          if (!thumb || !isValidMarketplaceProductMediaUrl(thumb)) return null;
+          const sellerUsername = String(
+            (p as { seller_username?: string }).seller_username ||
+              (p as { seller?: { username?: string } }).seller?.username ||
+              'seller'
+          );
+          return {
+            id,
+            url: '',
+            thumbnail: thumb,
+            user: {
+              username: sellerUsername,
+              avatar: '',
+            },
+            caption: String((p as { title?: string }).title ?? ''),
+            likes: 0,
+            comments: 0,
+            shares: 0,
+            saves: 0,
+            coins: Number((p as { price?: number }).price) || 0,
+            sound: null,
+          } satisfies Video;
+        })
+        .filter((v): v is Video => v !== null);
+      setReels(formattedReels);
     }
   };
+
+  const mapPayloadToProducts = (payload: Record<string, unknown>[]): Product[] =>
+    payload
+      .map((p: any) => {
+        const id = String(p.id ?? '');
+        const sellerId = String(p.seller_id ?? '').trim();
+        if (!id || !sellerId) return null;
+        const image = productImagePublicUrl(String(p.image ?? '').trim());
+        if (!isValidMarketplaceProductMediaUrl(image)) return null;
+        return {
+          ...p,
+          id,
+          title: String(p.title ?? ''),
+          price: Number(p.price) || 0,
+          location: String(p.location ?? ''),
+          image,
+          category: String(p.category ?? ''),
+          stock: p.stock != null ? Number(p.stock) : undefined,
+          seller: { username: String(p.seller_username ?? 'seller').trim() || 'seller' },
+        } as Product;
+      })
+      .filter((row): row is Product => row !== null);
 
   const fetchProducts = async () => {
     try {
       const res = await fetch(apiUrl('/api/marketplace/products'));
+      const ct = res.headers.get('content-type') || '';
       let payload: unknown;
       try {
-        payload = await res.json();
+        if (!ct.includes('application/json')) payload = null;
+        else payload = await res.json();
       } catch (parseErr) {
         console.log('marketplace error:', parseErr);
-        setProducts([]);
-        return;
+        payload = null;
       }
       console.log('MARKETPLACE PRODUCTS:', payload);
-      if (!res.ok) {
-        console.log('marketplace error:', (payload as { error?: string })?.error ?? res.statusText);
+      let list: Record<string, unknown>[] = [];
+      if (res.ok && Array.isArray(payload)) {
+        list = payload as Record<string, unknown>[];
+      }
+      if (!list.length) {
+        list = await fetchMarketplaceTableRowsAsApiProducts();
+      }
+      if (!list.length) {
+        if (!res.ok) console.log('marketplace error:', (payload as { error?: string })?.error ?? res.statusText);
+        else if (!Array.isArray(payload)) console.log('marketplace error:', 'Expected array of products');
         setProducts([]);
         return;
       }
-      if (!Array.isArray(payload)) {
-        console.log('marketplace error:', 'Expected array of products');
-        setProducts([]);
-        return;
-      }
-      const mapped: Product[] = (payload as Record<string, unknown>[])
-        .map((p: any) => {
-          const id = String(p.id ?? '');
-          const sellerId = String(p.seller_id ?? '').trim();
-          if (!id || !sellerId) return null;
-          const image = productImagePublicUrl(String(p.image ?? '').trim());
-          if (!isValidMarketplaceProductMediaUrl(image)) return null;
-          return {
-            ...p,
-            id,
-            title: String(p.title ?? ''),
-            price: Number(p.price) || 0,
-            location: String(p.location ?? ''),
-            image,
-            category: String(p.category ?? ''),
-            stock: p.stock != null ? Number(p.stock) : undefined,
-            seller: { username: String(p.seller_username ?? 'seller').trim() || 'seller' },
-          } as Product;
-        })
-        .filter((row): row is Product => row !== null);
-      setProducts(mapped);
+      setProducts(mapPayloadToProducts(list));
     } catch (err) {
       console.log('marketplace error:', err);
-      setProducts([]);
+      const direct = await fetchMarketplaceTableRowsAsApiProducts();
+      setProducts(direct.length ? mapPayloadToProducts(direct) : []);
     }
   };
 
@@ -466,12 +549,17 @@ export default function MarketplacePage() {
                     />
                     <div className="absolute top-2 right-2 flex flex-col gap-2">
                       <button 
-                        onClick={(e) => {
-                          e.stopPropagation();
-                        }}
-                        className="w-9 h-9 bg-white/90 dark:bg-black/90 backdrop-blur-md rounded-full flex items-center justify-center text-gray-600 dark:text-white hover:text-red-500 transition-colors shadow-md"
+                        type="button"
+                        aria-label={savedProductIds.has(product.id) ? 'Unsave' : 'Save'}
+                        onClick={(e) => void toggleSaveProduct(e, product.id)}
+                        className={cn(
+                          'w-9 h-9 bg-white/90 dark:bg-black/90 backdrop-blur-md rounded-full flex items-center justify-center transition-colors shadow-md',
+                          savedProductIds.has(product.id)
+                            ? 'text-red-500'
+                            : 'text-gray-600 dark:text-white hover:text-red-500'
+                        )}
                       >
-                        <Heart size={16} />
+                        <Heart size={16} className={savedProductIds.has(product.id) ? 'fill-current' : ''} />
                       </button>
                     </div>
                     <div className="absolute bottom-3 left-3 bg-black/70 backdrop-blur-md text-white px-3 py-1 rounded-xl text-[10px] font-black uppercase tracking-widest border border-white/10">

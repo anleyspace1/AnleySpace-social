@@ -61,6 +61,9 @@ export type Message = {
   storyMediaType?: string | null;
   /** When current user is sender: false = Delivered, true = Seen by other party */
   isSeen?: boolean;
+  /** Marketplace DM offer (from `messages.offer_price` / `offer_status`) */
+  offer_price?: number;
+  offer_status?: string;
 };
 
 export type Chat = {

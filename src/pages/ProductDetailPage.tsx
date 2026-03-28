@@ -17,6 +17,8 @@ import { Product } from '../types';
 import { cn } from '../lib/utils';
 import { apiUrl } from '../lib/apiOrigin';
 import { productImagePublicUrl } from '../lib/marketplaceImage';
+import { fetchSingleProductAsApiShape } from '../lib/marketplaceRemote';
+import { isProductSavedInMarketplace, setSavedMarketplaceProduct } from '../lib/savedMarketplace';
 import { MOCK_USER } from '../constants';
 import { useAuth } from '../contexts/AuthContext';
 
@@ -29,6 +31,7 @@ export default function ProductDetailPage() {
   const [buying, setBuying] = useState(false);
 
   const [relatedProducts, setRelatedProducts] = useState<Product[]>([]);
+  const [isProductSaved, setIsProductSaved] = useState(false);
 
   useEffect(() => {
     fetchProduct();
@@ -40,31 +43,66 @@ export default function ProductDetailPage() {
     }
   }, [product]);
 
+  useEffect(() => {
+    if (!user?.id || !product?.id) {
+      setIsProductSaved(false);
+      return;
+    }
+    let cancelled = false;
+    isProductSavedInMarketplace(user.id, product.id).then((v) => {
+      if (!cancelled) setIsProductSaved(v);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id, product?.id]);
+
   const fetchProduct = async () => {
     try {
       const res = await fetch(apiUrl(`/api/marketplace/products/${id}`));
+      const ct = res.headers.get('content-type') || '';
       let payload: unknown;
       try {
-        payload = await res.json();
+        if (!ct.includes('application/json')) payload = null;
+        else payload = await res.json();
       } catch (parseErr) {
         console.log('marketplace error:', parseErr);
-        setProduct(null);
-        return;
+        payload = null;
       }
       console.log('marketplace data:', payload);
-      if (!res.ok) {
+      let data = payload as Record<string, unknown> | null;
+      if (!res.ok || !data || (data as { error?: string }).error) {
+        const direct = id ? await fetchSingleProductAsApiShape(id) : null;
+        data = direct;
+      }
+      if (!data || (data as { error?: string }).error) {
         console.log('marketplace error:', (payload as { error?: string })?.error ?? res.statusText);
         setProduct(null);
         return;
       }
-      const data = payload as Record<string, unknown>;
+      const sellerId = String((data as { seller_id?: string }).seller_id ?? '').trim();
       setProduct({
         ...(data as Product),
-        seller: { username: data.seller_username as string }
+        seller: {
+          username: (data.seller_username as string) || 'seller',
+          ...(sellerId ? { id: sellerId } : {}),
+        },
       } as Product);
     } catch (err) {
       console.log('marketplace error:', err);
-      setProduct(null);
+      const direct = id ? await fetchSingleProductAsApiShape(id) : null;
+      if (direct && !(direct as { error?: string }).error) {
+        const sid = String((direct as { seller_id?: string }).seller_id ?? '').trim();
+        setProduct({
+          ...(direct as Product),
+          seller: {
+            username: (direct.seller_username as string) || 'seller',
+            ...(sid ? { id: sid } : {}),
+          },
+        } as Product);
+      } else {
+        setProduct(null);
+      }
     } finally {
       setLoading(false);
     }
@@ -180,8 +218,29 @@ export default function ProductDetailPage() {
               alt={product.title} 
               className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-700" 
             />
-            <button className="absolute top-4 right-4 w-10 h-10 bg-white/90 dark:bg-black/90 backdrop-blur-md rounded-full flex items-center justify-center text-gray-600 dark:text-white hover:text-red-500 transition-colors shadow-md">
-              <Heart size={20} />
+            <button
+              type="button"
+              aria-label={isProductSaved ? 'Unsave' : 'Save'}
+              onClick={async (e) => {
+                e.stopPropagation();
+                if (!user?.id || !product?.id) {
+                  alert('Please log in to save items');
+                  return;
+                }
+                const next = !isProductSaved;
+                try {
+                  await setSavedMarketplaceProduct(user.id, product.id, next);
+                  setIsProductSaved(next);
+                } catch (err) {
+                  console.error('[ProductDetail] save toggle', err);
+                }
+              }}
+              className={cn(
+                'absolute top-4 right-4 w-10 h-10 bg-white/90 dark:bg-black/90 backdrop-blur-md rounded-full flex items-center justify-center transition-colors shadow-md',
+                isProductSaved ? 'text-red-500' : 'text-gray-600 dark:text-white hover:text-red-500'
+              )}
+            >
+              <Heart size={20} className={isProductSaved ? 'fill-current' : ''} />
             </button>
             <div className="absolute top-4 left-4 flex flex-col gap-2">
               <span className="bg-indigo-600 text-white px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest shadow-lg shadow-indigo-600/20">
@@ -288,7 +347,18 @@ export default function ProductDetailPage() {
                 </div>
 
                 <button 
-                  onClick={() => navigate(`/messages?user=${product.seller.username}`)}
+                  onClick={() => {
+                    const sellerId = product.seller?.id?.trim();
+                    if (sellerId) {
+                      navigate(
+                        `/messages?seller=${encodeURIComponent(sellerId)}&product=${encodeURIComponent(product.id)}`
+                      );
+                      return;
+                    }
+                    const u = product.seller?.username?.trim();
+                    if (u) navigate(`/messages?user=${encodeURIComponent(u)}`);
+                    else navigate('/messages');
+                  }}
                   className="w-full flex items-center justify-center gap-2 bg-gray-50 dark:bg-gray-800/50 py-3 rounded-xl font-bold hover:bg-gray-100 dark:hover:bg-gray-800 transition-all text-gray-900 dark:text-white border border-gray-100 dark:border-gray-800 text-sm"
                 >
                   <MessageCircle size={18} />
