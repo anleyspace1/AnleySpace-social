@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Search, 
@@ -12,11 +12,11 @@ import {
   Sparkles, 
   ShoppingBag, 
   Star,
-  Plus,
   Pizza,
   X,
   User,
-  Package
+  Package,
+  Coins
 } from 'lucide-react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { cn } from '../lib/utils';
@@ -38,18 +38,63 @@ const resolveCreatorDisplayName = (profile: { display_name?: string | null; user
   return resolveProfileUsername(profile?.username);
 };
 
-// Mock Data
-const LIVE_STREAMS = [
-  { id: '1', name: 'GamerMax', viewers: '2.1K', image: 'https://picsum.photos/seed/gamer/400/250', color: 'bg-blue-500', username: 'gamer_max' },
-  { id: '2', name: 'AnnaLive', viewers: '1.8K', image: 'https://picsum.photos/seed/anna/400/250', color: 'bg-red-500', username: 'anna_live' },
-  { id: '3', name: 'ChefTommy', viewers: '950', image: 'https://picsum.photos/seed/chef/400/250', color: 'bg-yellow-500', username: 'chef_tommy' },
-  { id: '4', name: 'TechTalk', viewers: '3.4K', image: 'https://picsum.photos/seed/tech/400/250', color: 'bg-indigo-500', username: 'tech_talk' },
-];
+type ExploreProductRow = {
+  id: string;
+  name: string;
+  price: number;
+  image: string;
+  seller_id: string;
+};
 
-const TRENDING = [
-  { id: '1', title: 'Popular Creators', image: 'https://picsum.photos/seed/creators/400/250', target: '/explore' },
-  { id: '2', title: 'Viral Videos', image: 'https://picsum.photos/seed/viral/400/250', icon: <Flame size={14} className="text-orange-500" />, target: '/reels' },
-  { id: '3', title: 'Trending Lives', image: 'https://picsum.photos/seed/trending/400/250', badge: 'LIVE', target: '/live' },
+type ExploreCreatorRow = {
+  id: string;
+  username: string;
+  displayName: string;
+  avatar_url: string | null;
+  followers_count: number;
+};
+
+type ExploreLiveRow = {
+  id: string;
+  name: string;
+  viewers: string;
+  image: string;
+  username: string;
+  color: string;
+};
+
+function isValidExploreProductUrl(url: string): boolean {
+  const u = url.trim().toLowerCase();
+  if (!u) return false;
+  if (!url.startsWith('https://')) return false;
+  if (u.includes('localhost') || u.includes('127.0.0.1')) return false;
+  if (u.includes('picsum.photos') || u.includes('placehold')) return false;
+  if (!u.includes('.supabase.co')) return false;
+  return true;
+}
+
+function isValidExploreLiveCoverUrl(url: string): boolean {
+  const u = url.trim();
+  const l = u.toLowerCase();
+  if (!u.startsWith('https://')) return false;
+  if (l.includes('localhost') || l.includes('127.0.0.1')) return false;
+  if (l.includes('picsum.photos') || l.includes('placehold')) return false;
+  return true;
+}
+
+function isValidProfileAvatarUrl(url: string | null | undefined): boolean {
+  const u = (url || '').trim();
+  if (!u) return false;
+  const lower = u.toLowerCase();
+  if (lower.includes('picsum') || lower.includes('placehold')) return false;
+  if (lower.includes('localhost') || lower.includes('127.0.0.1')) return false;
+  return u.startsWith('https://');
+}
+
+const TRENDING_LINKS = [
+  { id: '1', title: 'Viral Videos', target: '/reels', icon: <Flame size={14} className="text-orange-500" />, badge: null as string | null, gradient: 'from-orange-600/35 to-rose-950/60' },
+  { id: '2', title: 'Trending Lives', target: '/live', icon: <Flame size={14} className="text-red-400" />, badge: 'LIVE' as string | null, gradient: 'from-red-600/35 to-indigo-950/60' },
+  { id: '3', title: 'Marketplace', target: '/marketplace', icon: <ShoppingBag size={14} className="text-blue-400" />, badge: null as string | null, gradient: 'from-blue-600/35 to-slate-950/60' },
 ];
 
 const CATEGORIES = [
@@ -59,18 +104,6 @@ const CATEGORIES = [
   { id: 'tech', name: 'Tech', icon: <Smartphone size={24} />, color: 'bg-blue-500/20 text-blue-400' },
   { id: 'beauty', name: 'Beauty', icon: <Sparkles size={24} />, color: 'bg-orange-500/20 text-orange-400' },
   { id: 'food', name: 'Food', icon: <Pizza size={24} />, color: 'bg-yellow-500/20 text-yellow-400' },
-];
-
-const PRODUCTS = [
-  { id: 'p1', name: 'Headphones', price: 29, image: 'https://picsum.photos/seed/headphone/100/100', buyers: 7 },
-  { id: 'p2', name: 'Smart Watch', price: 199, image: 'https://picsum.photos/seed/watch/100/100', buyers: 12 },
-  { id: 'p3', name: 'Gaming Mouse', price: 45, image: 'https://picsum.photos/seed/mouse/100/100', buyers: 24 },
-];
-
-const CREATORS = [
-  { id: 'c1', name: 'Mike Gaming', username: 'mike_gaming', followers: '68K', avatar: 'https://picsum.photos/seed/mike/100/100' },
-  { id: 'c2', name: 'Sarah Style', username: 'sarah_style', followers: '120K', avatar: 'https://picsum.photos/seed/sarah/100/100' },
-  { id: 'c3', name: 'Chef Alex', username: 'chef_alex', followers: '45K', avatar: 'https://picsum.photos/seed/alex/100/100' },
 ];
 
 export default function ExplorePage() {
@@ -87,6 +120,128 @@ export default function ExplorePage() {
   const [following, setFollowing] = useState<Record<string, boolean>>({});
   const [realCreators, setRealCreators] = useState<any[]>([]);
   const [searching, setSearching] = useState(false);
+  const [exploreProducts, setExploreProducts] = useState<ExploreProductRow[]>([]);
+  const [suggestedCreators, setSuggestedCreators] = useState<ExploreCreatorRow[]>([]);
+  const [liveStreams, setLiveStreams] = useState<ExploreLiveRow[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(apiUrl('/api/marketplace/products'));
+        const data = await res.json();
+        if (cancelled) return;
+        if (!Array.isArray(data)) {
+          const products: ExploreProductRow[] = [];
+          console.log("EXPLORE PRODUCTS:", products);
+          setExploreProducts(products);
+        } else {
+          const products: ExploreProductRow[] = data
+            .map((p: Record<string, unknown>) => {
+              const sellerId = String(p.seller_id ?? '').trim();
+              const id = String(p.id ?? '').trim();
+              if (!id || !sellerId) return null;
+              const img = productImagePublicUrl(String(p.image ?? '').trim());
+              if (!isValidExploreProductUrl(img)) return null;
+              return {
+                id,
+                name: String((p.title as string) || 'Product'),
+                price: Number(p.price) || 0,
+                image: img,
+                seller_id: sellerId,
+              };
+            })
+            .filter((row): row is ExploreProductRow => row !== null);
+          console.log("EXPLORE PRODUCTS:", products);
+          setExploreProducts(products);
+        }
+      } catch {
+        if (!cancelled) {
+          const products: ExploreProductRow[] = [];
+          console.log("EXPLORE PRODUCTS:", products);
+          setExploreProducts(products);
+        }
+      }
+
+      try {
+        let q = supabase.from('profiles').select('id, username, display_name, avatar_url').limit(15);
+        if (user?.id) q = q.neq('id', user.id);
+        const { data: profs, error } = await q;
+        if (cancelled) return;
+        if (error || !profs?.length) {
+          const users: ExploreCreatorRow[] = [];
+          console.log("EXPLORE USERS:", users);
+          setSuggestedCreators(users);
+        } else {
+          const slice = profs.slice(0, 8);
+          const users: ExploreCreatorRow[] = await Promise.all(
+            slice.map(async (p: { id: string; username?: string | null; display_name?: string | null; avatar_url?: string | null }) => {
+              const { count } = await supabase
+                .from('follows')
+                .select('*', { count: 'exact', head: true })
+                .eq('following_id', p.id);
+              return {
+                id: p.id,
+                username: resolveProfileUsername(p.username),
+                displayName: resolveCreatorDisplayName(p),
+                avatar_url: p.avatar_url ?? null,
+                followers_count: count ?? 0,
+              };
+            })
+          );
+          console.log("EXPLORE USERS:", users);
+          if (!cancelled) setSuggestedCreators(users);
+        }
+      } catch {
+        if (!cancelled) {
+          const users: ExploreCreatorRow[] = [];
+          console.log("EXPLORE USERS:", users);
+          setSuggestedCreators(users);
+        }
+      }
+
+      try {
+        const res = await fetch(apiUrl('/api/live-calls'));
+        const data = await res.json();
+        if (!cancelled) {
+          if (!Array.isArray(data)) {
+            setLiveStreams([]);
+          } else {
+            const mapped: ExploreLiveRow[] = data
+              .map((c: Record<string, unknown>, i: number) => {
+                const id = String(c.id ?? c.stream_id ?? `live-${i}`);
+                const name = String(c.group_name ?? c.host_username ?? 'Live');
+                const rawImg = String(c.group_image ?? '').trim();
+                const resolved = productImagePublicUrl(rawImg);
+                const image = isValidExploreProductUrl(resolved)
+                  ? resolved
+                  : isValidExploreLiveCoverUrl(rawImg)
+                    ? rawImg
+                    : '';
+                const vc = c.viewer_count ?? c.viewers ?? 0;
+                const viewers =
+                  typeof vc === 'number' ? (vc >= 1000 ? `${(vc / 1000).toFixed(1)}K` : String(vc)) : String(vc || 0);
+                return {
+                  id,
+                  name,
+                  viewers,
+                  image,
+                  username: String(c.host_username ?? ''),
+                  color: 'bg-indigo-500',
+                };
+              })
+              .filter((row) => row.id);
+            setLiveStreams(mapped);
+          }
+        }
+      } catch {
+        if (!cancelled) setLiveStreams([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id]);
 
   React.useEffect(() => {
     // Sync all users from Supabase to local DB for search
@@ -149,11 +304,11 @@ export default function ExplorePage() {
     const query = (searchQuery || '').toLowerCase();
     
     return {
-      lives: LIVE_STREAMS.filter(s => (s.name || '').toLowerCase().includes(query)),
+      lives: liveStreams.filter(s => (s.name || '').toLowerCase().includes(query)),
       creators: realCreators,
-      products: PRODUCTS.filter(p => (p.name || '').toLowerCase().includes(query))
+      products: exploreProducts.filter(p => (p.name || '').toLowerCase().includes(query))
     };
-  }, [searchQuery, realCreators]);
+  }, [searchQuery, realCreators, exploreProducts, liveStreams]);
 
   const isSearching = searchQuery.trim().length > 0;
 
@@ -253,7 +408,13 @@ export default function ExplorePage() {
                           onClick={() => navigate('/live')}
                           className="bg-[#1a1c26] p-3 rounded-2xl flex items-center gap-3 group cursor-pointer"
                         >
-                          <ResponsiveImage src={stream.image} width={64} height={40} className="w-16 h-10 rounded-lg object-cover" alt="" />
+                          {stream.image ? (
+                            <ResponsiveImage src={stream.image} width={64} height={40} className="w-16 h-10 rounded-lg object-cover" alt="" />
+                          ) : (
+                            <div className="w-16 h-10 rounded-lg bg-[#252836] flex items-center justify-center shrink-0">
+                              <User size={16} className="text-gray-600" />
+                            </div>
+                          )}
                           <div className="flex-1">
                             <h3 className="text-sm font-bold">{stream.name}</h3>
                             <p className="text-[10px] text-gray-500">{stream.viewers} watching</p>
@@ -272,16 +433,31 @@ export default function ExplorePage() {
                       Creators
                     </h2>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                      {searchResults.creators.map(creator => (
+                      {searchResults.creators.map(creator => {
+                        const avatarRaw = (creator as { avatar_url?: string | null; avatar?: string | null }).avatar_url
+                          ?? (creator as { avatar?: string | null }).avatar
+                          ?? null;
+                        const avatarOk = isValidProfileAvatarUrl(avatarRaw);
+                        const searchLabel = resolveCreatorDisplayName({
+                          display_name: (creator as { full_name?: string | null; display_name?: string | null }).display_name
+                            ?? (creator as { full_name?: string | null }).full_name,
+                          username: creator.username,
+                        });
+                        return (
                         <div 
                           key={creator.id} 
                           onClick={() => navigate(`/profile/${creator.id}`)}
                           className="bg-[#1a1c26] p-3 rounded-2xl flex items-center gap-3 group cursor-pointer"
                         >
-                          <ResponsiveImage src={creator.avatar_url || `https://picsum.photos/seed/${creator.id}/100/100`} width={40} height={40} className="w-10 h-10 rounded-full object-cover" alt="" />
-                          <div className="flex-1">
-                            <h3 className="text-sm font-bold">{resolveCreatorDisplayName(creator)}</h3>
-                            <p className="text-[10px] text-gray-500">{creator.followers_count || 0} followers</p>
+                          {avatarOk ? (
+                            <ResponsiveImage src={avatarRaw!} width={40} height={40} className="w-10 h-10 rounded-full object-cover" alt="" />
+                          ) : (
+                            <div className="w-10 h-10 rounded-full bg-[#252836] flex items-center justify-center text-xs font-bold text-gray-400 shrink-0">
+                              {searchLabel.slice(0, 1).toUpperCase()}
+                            </div>
+                          )}
+                          <div className="flex-1 min-w-0">
+                            <h3 className="text-sm font-bold truncate">{searchLabel}</h3>
                           </div>
                           <button 
                             onClick={(e) => handleFollow(e, creator.id)}
@@ -295,7 +471,8 @@ export default function ExplorePage() {
                             {following[creator.id] ? 'Following' : 'Follow'}
                           </button>
                         </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </section>
                 )}
@@ -314,11 +491,14 @@ export default function ExplorePage() {
                           className="bg-[#1a1c26] p-3 rounded-2xl flex items-center gap-3 group cursor-pointer"
                         >
                           <div className="w-10 h-10 bg-[#252836] rounded-lg flex items-center justify-center p-1">
-                            <ResponsiveImage src={productImagePublicUrl(product.image) || product.image} width={100} height={100} className="w-full h-full object-contain" alt="" />
+                            <ResponsiveImage src={product.image} width={100} height={100} className="w-full h-full object-contain" alt="" />
                           </div>
                           <div className="flex-1">
                             <h3 className="text-sm font-bold">{product.name}</h3>
-                            <p className="text-[10px] text-gray-500">$ {product.price}</p>
+                            <p className="text-[10px] text-gray-500 flex items-center gap-1">
+                              <Coins size={10} />
+                              {(product.price || 0).toLocaleString()}
+                            </p>
                           </div>
                           <ShoppingBag size={16} className="text-gray-600" />
                         </div>
@@ -356,20 +536,31 @@ export default function ExplorePage() {
                   See All <ChevronRight size={14} />
                 </button>
               </div>
+              {liveStreams.length === 0 ? (
+                <div className="mx-4 rounded-2xl bg-[#1a1c26] py-10 px-4 text-center text-sm text-gray-500">
+                  No live streams right now.
+                </div>
+              ) : (
               <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3 px-4">
-                {LIVE_STREAMS.map((stream) => (
+                {liveStreams.map((stream) => (
                   <div 
                     key={stream.id} 
                     onClick={() => navigate('/live')}
                     className="group cursor-pointer"
                   >
-                    <div className="relative aspect-[4/3] rounded-xl overflow-hidden mb-2">
-                      <img 
-                        src={stream.image} 
-                        alt={stream.name} 
-                        className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
-                        referrerPolicy="no-referrer"
-                      />
+                    <div className="relative aspect-[4/3] rounded-xl overflow-hidden mb-2 bg-gradient-to-br from-[#252836] to-[#12141c]">
+                      {stream.image ? (
+                        <img 
+                          src={stream.image} 
+                          alt={stream.name} 
+                          className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
+                          referrerPolicy="no-referrer"
+                        />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center">
+                          <User size={28} className="text-gray-600" />
+                        </div>
+                      )}
                       <div className="absolute top-2 left-2 bg-red-600 text-[9px] font-black px-1.5 py-0.5 rounded">
                         LIVE
                       </div>
@@ -384,6 +575,7 @@ export default function ExplorePage() {
                   </div>
                 ))}
               </div>
+              )}
             </section>
 
             {/* TRENDING */}
@@ -401,28 +593,27 @@ export default function ExplorePage() {
                 </button>
               </div>
               <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3 px-4">
-                {TRENDING.map((item) => (
+                {TRENDING_LINKS.map((item) => (
                   <div 
                     key={item.id} 
                     onClick={() => navigate(item.target)}
                     className="group cursor-pointer"
                   >
-                    <div className="relative aspect-[4/3] rounded-xl overflow-hidden mb-2">
-                      <img 
-                        src={item.image} 
-                        alt={item.title} 
-                        className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
-                        referrerPolicy="no-referrer"
-                      />
+                    <div className={cn(
+                      'relative aspect-[4/3] rounded-xl overflow-hidden mb-2 bg-gradient-to-br flex items-center justify-center group-hover:opacity-95 transition-opacity',
+                      item.gradient
+                    )}>
                       {item.badge && (
-                        <div className="absolute top-2 left-2 bg-red-600 text-[8px] font-black px-1.5 py-0.5 rounded">
+                        <div className="absolute top-2 left-2 bg-red-600 text-[8px] font-black px-1.5 py-0.5 rounded z-10">
                           {item.badge}
                         </div>
                       )}
+                      <div className="text-white/90 opacity-80 group-hover:scale-105 transition-transform duration-500">
+                        {item.icon}
+                      </div>
                     </div>
                     <div className="flex items-center justify-between px-1">
                       <span className="text-[11px] font-bold text-gray-300 flex items-center gap-1 truncate">
-                        {item.icon}
                         {item.title}
                       </span>
                       <ChevronRight size={12} className="text-gray-600 shrink-0" />
@@ -476,8 +667,13 @@ export default function ExplorePage() {
                   See All <ChevronRight size={14} />
                 </button>
               </div>
+              {exploreProducts.length === 0 ? (
+                <div className="mx-4 rounded-2xl bg-[#1a1c26] py-10 px-4 text-center text-sm text-gray-500">
+                  No products yet. Listings from creators will show up here.
+                </div>
+              ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 px-4">
-                {PRODUCTS.slice(0, 2).map(product => (
+                {exploreProducts.slice(0, 8).map(product => (
                   <div 
                     key={product.id} 
                     onClick={() => navigate(`/marketplace/product/${product.id}`)}
@@ -493,18 +689,15 @@ export default function ExplorePage() {
                     </div>
                     <div className="flex-1 min-w-0">
                       <h3 className="text-[13px] font-bold text-gray-200 truncate">{product.name}</h3>
-                      <p className="text-[11px] text-gray-500">$ {product.price}</p>
-                    </div>
-                    <div className="flex items-center -space-x-1.5 shrink-0">
-                      <img src="https://picsum.photos/seed/u1/40/40" className="w-5 h-5 rounded-full border-2 border-[#1a1c26]" alt="" />
-                      <img src="https://picsum.photos/seed/u2/40/40" className="w-5 h-5 rounded-full border-2 border-[#1a1c26]" alt="" />
-                      <div className="w-5 h-5 rounded-full bg-gray-700 border-2 border-[#1a1c26] flex items-center justify-center text-[7px] font-bold">
-                        +{product.buyers}
-                      </div>
+                      <p className="text-[11px] text-gray-500 flex items-center gap-1">
+                        <Coins size={12} className="text-indigo-400 shrink-0" />
+                        {(product.price || 0).toLocaleString()}
+                      </p>
                     </div>
                   </div>
                 ))}
               </div>
+              )}
             </section>
 
             {/* SUGGESTED CREATORS */}
@@ -521,25 +714,40 @@ export default function ExplorePage() {
                   See All <ChevronRight size={14} />
                 </button>
               </div>
+              {suggestedCreators.length === 0 ? (
+                <div className="mx-4 rounded-2xl bg-[#1a1c26] py-10 px-4 text-center text-sm text-gray-500">
+                  No suggested creators yet.
+                </div>
+              ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 px-4">
-                {CREATORS.map(creator => (
+                {suggestedCreators.map(creator => {
+                  const av = creator.avatar_url;
+                  const avOk = isValidProfileAvatarUrl(av);
+                  return (
                   <div 
                     key={creator.id} 
-                    onClick={() => navigate(`/profile/${creator.username}`)}
+                    onClick={() => navigate(`/profile/${creator.id}`)}
                     className="bg-[#1a1c26] p-3 rounded-2xl flex items-center gap-3 group cursor-pointer hover:bg-[#252836] transition-colors"
                   >
                     <div className="relative shrink-0">
-                      <img 
-                        src={creator.avatar} 
-                        alt={creator.name} 
-                        className="w-12 h-12 rounded-full object-cover border-2 border-indigo-500/20"
-                        referrerPolicy="no-referrer"
-                      />
-                      <div className="absolute -bottom-1 -right-1 w-4 h-4 bg-green-500 border-2 border-[#1a1c26] rounded-full" />
+                      {avOk ? (
+                        <img 
+                          src={av!} 
+                          alt={creator.displayName} 
+                          className="w-12 h-12 rounded-full object-cover border-2 border-indigo-500/20"
+                          referrerPolicy="no-referrer"
+                        />
+                      ) : (
+                        <div className="w-12 h-12 rounded-full bg-[#252836] border-2 border-indigo-500/20 flex items-center justify-center text-sm font-bold text-gray-400">
+                          {creator.displayName.slice(0, 1).toUpperCase()}
+                        </div>
+                      )}
                     </div>
                     <div className="flex-1 min-w-0">
-                      <h3 className="text-[13px] font-bold text-gray-200 truncate">{creator.name}</h3>
-                      <p className="text-[11px] text-gray-500">{creator.followers} followers</p>
+                      <h3 className="text-[13px] font-bold text-gray-200 truncate">{creator.displayName}</h3>
+                      <p className="text-[11px] text-gray-500">
+                        {(creator.followers_count ?? 0).toLocaleString()} followers
+                      </p>
                     </div>
                     <button 
                       onClick={(e) => handleFollow(e, creator.id)}
@@ -553,19 +761,22 @@ export default function ExplorePage() {
                       {following[creator.id] ? 'Following' : 'Follow'}
                     </button>
                   </div>
-                ))}
+                  );
+                })}
               </div>
+              )}
             </section>
 
-            {/* FEATURED SPONSORED */}
+            {/* FEATURED (first marketplace product) */}
+            {exploreProducts[0] && (
             <section className="px-4 mb-10">
               <div 
-                onClick={() => navigate('/marketplace/product/p1')}
+                onClick={() => navigate(`/marketplace/product/${exploreProducts[0].id}`)}
                 className="relative rounded-2xl overflow-hidden group cursor-pointer"
               >
                 <img 
-                  src="https://picsum.photos/seed/scooter/800/400" 
-                  alt="XYZ Electric Scooter" 
+                  src={exploreProducts[0].image} 
+                  alt={exploreProducts[0].name} 
                   className="w-full aspect-[21/9] object-cover group-hover:scale-105 transition-transform duration-700"
                   referrerPolicy="no-referrer"
                 />
@@ -573,14 +784,18 @@ export default function ExplorePage() {
                 <div className="absolute bottom-4 left-4 right-4">
                   <div className="flex items-center gap-2 mb-1">
                     <span className="bg-white/10 backdrop-blur-md text-[8px] font-bold px-2 py-0.5 rounded uppercase tracking-wider border border-white/10">
-                      Sponsored
+                      Featured
                     </span>
                   </div>
-                  <h3 className="text-base font-black mb-0.5">XYZ Electric Scooter</h3>
-                  <p className="text-[10px] text-gray-400">35% OFF on All Models! Limited Time Offer</p>
+                  <h3 className="text-base font-black mb-0.5 truncate pr-4">{exploreProducts[0].name}</h3>
+                  <p className="text-[10px] text-gray-400 flex items-center gap-1">
+                    <Coins size={10} />
+                    {(exploreProducts[0].price || 0).toLocaleString()}
+                  </p>
                 </div>
               </div>
             </section>
+            )}
           </motion.div>
         )}
       </AnimatePresence>

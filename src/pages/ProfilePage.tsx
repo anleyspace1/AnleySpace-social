@@ -25,7 +25,7 @@ import {
   Maximize2
 } from 'lucide-react';
 import { NavLink, useParams, useNavigate, useSearchParams } from 'react-router-dom';
-import { MOCK_USER, MOCK_VIDEOS } from '../constants';
+import { MOCK_USER } from '../constants';
 import { cn } from '../lib/utils';
 import { Post, Video } from '../types';
 import { apiUrl } from '../lib/apiOrigin';
@@ -34,6 +34,16 @@ import { useAuth } from '../contexts/AuthContext';
 import ShareModal from '../components/ShareModal';
 import StoryEditor from '../components/StoryEditor';
 import { ResponsiveImage } from '../components/ResponsiveImage';
+
+function isValidProfileVideoUrl(url: string | null | undefined): boolean {
+  const u = (url || '').trim();
+  if (!u) return false;
+  const lower = u.toLowerCase();
+  if (lower.includes('localhost') || lower.includes('127.0.0.1')) return false;
+  if (!u.startsWith('https://')) return false;
+  if (lower.includes('picsum.photos') || lower.includes('placehold')) return false;
+  return true;
+}
 
 export default function ProfilePage() {
   const { id: profileIdParam } = useParams();
@@ -102,6 +112,7 @@ export default function ProfilePage() {
         };
         setUserProfile(formattedProfile);
         fetchPosts(profileData.id);
+        fetchVideos(profileData.id, formattedProfile.username);
       }
     } catch (err) {
       console.error('Error fetching profile:', err);
@@ -136,6 +147,47 @@ export default function ProfilePage() {
       setUserPosts(formattedPosts);
     } catch (err) {
       console.error('Error fetching posts:', err);
+    }
+  };
+
+  const fetchVideos = async (userId: string, ownerUsername: string) => {
+    try {
+      const { data, error } = await supabase
+        .from('posts')
+        .select('*')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+      console.log('PROFILE VIDEOS:', data);
+
+      const formatted: Video[] = (data || [])
+        .filter((p: { user_id?: string; video_url?: string | null }) => {
+          if (String(p.user_id || '') !== String(userId)) return false;
+          return isValidProfileVideoUrl(String(p.video_url || '').trim());
+        })
+        .map((p: any) => {
+          const url = String(p.video_url).trim();
+          const poster = String(p.image_url || '').trim();
+          return {
+            id: String(p.id),
+            url,
+            thumbnail: isValidProfileVideoUrl(poster) ? poster : url,
+            user: { username: ownerUsername },
+            caption: String(p.content || ''),
+            likes: Number(p.likes_count) || 0,
+            comments: Number(p.comments_count) || 0,
+            shares: Number(p.shares_count) || 0,
+            saves: 0,
+            coins: Number(p.likes_count) || 0,
+            sound: null,
+          } satisfies Video;
+        });
+
+      setUserVideos(formatted);
+    } catch (err) {
+      console.error('Error fetching profile videos:', err);
+      setUserVideos([]);
     }
   };
 
@@ -221,7 +273,7 @@ export default function ProfilePage() {
     isVerified: false,
   };
 
-  const [userVideos] = useState<Video[]>(MOCK_VIDEOS.filter(v => v.user.username === displayUser.username || isOwnProfile).slice(0, 4));
+  const [userVideos, setUserVideos] = useState<Video[]>([]);
 
   useEffect(() => {
     const postId = searchParams.get('post');
@@ -804,25 +856,43 @@ export default function ProfilePage() {
             </div>
           ))}
 
-          {activeTab === 'Videos' && userVideos.map((video) => (
+          {activeTab === 'Videos' && (userVideos.length > 0 ? (
+            userVideos.map((video) => (
             <div 
               key={video.id} 
               onClick={() => setSelectedVideo(video)}
               className="aspect-[9/16] bg-gray-100 dark:bg-gray-900 rounded-lg overflow-hidden relative group cursor-pointer"
             >
-              <ResponsiveImage 
-                src={video.thumbnail} 
-                alt="" 
-                width={400}
-                height={711}
-                className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500" 
-              />
+              {video.thumbnail !== video.url && isValidProfileVideoUrl(video.thumbnail) ? (
+                <ResponsiveImage 
+                  src={video.thumbnail} 
+                  alt="" 
+                  width={400}
+                  height={711}
+                  className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500" 
+                />
+              ) : (
+                <video
+                  src={video.url}
+                  muted
+                  playsInline
+                  preload="metadata"
+                  className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500 pointer-events-none"
+                />
+              )}
               <div className="absolute inset-0 bg-black/20 flex items-center justify-center">
                 <Play size={32} className="text-white opacity-80 group-hover:scale-125 transition-transform" />
               </div>
               <div className="absolute bottom-2 left-2 flex items-center gap-1 text-white text-[10px] font-bold bg-black/40 px-2 py-1 rounded-full">
-                <Play size={10} fill="white" /> {video.coins >= 1000 ? `${(video.coins / 1000).toFixed(1)}K` : video.coins}
+                <Play size={10} fill="white" /> {video.likes >= 1000 ? `${(video.likes / 1000).toFixed(1)}K` : video.likes}
               </div>
+            </div>
+            ))
+          ) : (
+            <div className="col-span-3 flex flex-col items-center justify-center py-16 text-center text-gray-500">
+              <Play size={40} className="mb-3 opacity-40" />
+              <p className="text-sm font-bold text-gray-600 dark:text-gray-400">No videos yet</p>
+              <p className="text-xs mt-1 max-w-xs">Uploaded reels appear here when they have a valid video URL.</p>
             </div>
           ))}
 

@@ -16,11 +16,21 @@ import {
   AlertCircle,
   PlaySquare,
   Grid,
-  Image as ImageIcon,
-  MessageCircle
+  Image as ImageIcon
 } from 'lucide-react';
-import { MOCK_PRODUCTS, MOCK_USER, MOCK_VIDEOS } from '../constants';
 import { Product, Video, Post } from '../types';
+
+/** Marketplace-only: real listing media from Supabase Storage (public HTTPS), not placeholders. */
+function isValidMarketplaceProductMediaUrl(url: string | undefined | null): boolean {
+  const u = (url || '').trim();
+  if (!u) return false;
+  const lower = u.toLowerCase();
+  if (lower.includes('picsum.photos') || lower.includes('placeholder')) return false;
+  if (lower.includes('localhost') || lower.includes('127.0.0.1')) return false;
+  if (!u.startsWith('https://')) return false;
+  if (!lower.includes('.supabase.co')) return false;
+  return true;
+}
 import { cn } from '../lib/utils';
 import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../lib/supabase';
@@ -36,7 +46,6 @@ export default function MarketplacePage() {
 
   const [products, setProducts] = useState<Product[]>([]);
   const [reels, setReels] = useState<Video[]>([]);
-  const [posts, setPosts] = useState<Post[]>([]);
   const [activeTab, setActiveTab] = useState<'products' | 'reels' | 'posts'>('products');
   const [userCoins, setUserCoins] = useState(0);
   const [isPostModalOpen, setIsPostModalOpen] = useState(false);
@@ -56,68 +65,85 @@ export default function MarketplacePage() {
   useEffect(() => {
     fetchProducts();
     fetchReels();
-    fetchPosts();
     if (user) {
       fetchUser();
     }
   }, [user]);
 
-  const fetchPosts = async () => {
-    try {
-      const { data, error } = await supabase
-        .from('posts')
-        .select('*')
-        .order('created_at', { ascending: false });
-
-      console.log('marketplace data:', data);
-      console.log('marketplace error:', error);
-
-      if (error) throw error;
-      setPosts(
-        (data || []).map((p: any) => ({
-          ...p,
-          user: { username: p.username || 'unknown', avatar: p.avatar_url || `https://picsum.photos/seed/${p.user_id}/100/100` },
-          timestamp: p.created_at
-        }))
-      );
-    } catch (err) {
-      console.log('marketplace error:', err);
-      setPosts([]);
-    }
-  };
+  const marketplacePostsGrid = React.useMemo((): Post[] => {
+    return products
+      .filter(
+        (p) =>
+          !!p.id &&
+          !!(p as { seller_id?: string }).seller_id &&
+          isValidMarketplaceProductMediaUrl(p.image)
+      )
+      .map((p) => {
+        const sellerUsername =
+          p.seller?.username ||
+          String((p as { seller_username?: string }).seller_username || '').trim() ||
+          'seller';
+        return {
+          id: p.id,
+          image: p.image,
+          caption: p.title || '',
+          likes: 0,
+          comments: 0,
+          shares: 0,
+          timestamp: String((p as { created_at?: string }).created_at || ''),
+          user: { username: sellerUsername, avatar: '' },
+        } satisfies Post;
+      });
+  }, [products]);
 
   const fetchReels = async () => {
     try {
-      const res = await fetch(apiUrl('/api/reels'));
-      if (res.ok) {
-        const data = await res.json();
-        if (data.length > 0) {
-          const formattedReels = data.map((r: any) => ({
-            id: r.id,
-            url: r.url,
-            thumbnail: r.thumbnail || `https://picsum.photos/seed/${r.id}/400/600`,
-            user: {
-              username: r.username || 'unknown',
-              avatar: r.avatar || `https://picsum.photos/seed/${r.username}/100/100`
-            },
-            caption: r.caption || '',
-            likes: r.likes || 0,
-            comments: r.comments || 0,
-            shares: r.shares || 0,
-            saves: r.saves || 0,
-            coins: r.coins || 0,
-            sound: r.sound_title ? { title: r.sound_title, artist: r.sound_artist } : null
-          }));
-          setReels(formattedReels);
-        } else {
-          setReels(MOCK_VIDEOS);
-        }
-      } else {
-        setReels(MOCK_VIDEOS);
+      const res = await fetch(apiUrl('/api/marketplace/products'));
+      let data: unknown;
+      try {
+        data = await res.json();
+      } catch {
+        data = null;
       }
+      console.log('REELS DATA:', data);
+      if (!res.ok || !Array.isArray(data)) {
+        setReels([]);
+        return;
+      }
+      const formattedReels: Video[] = (data as Record<string, unknown>[])
+        .map((p) => {
+          const id = String(p.id ?? '');
+          if (!id || !String((p as { seller_id?: string }).seller_id ?? '').trim()) return null;
+          const thumb = productImagePublicUrl(String(p.image ?? '').trim());
+          if (!thumb || !isValidMarketplaceProductMediaUrl(thumb)) return null;
+          const sellerUsername = String(
+            (p as { seller_username?: string }).seller_username ||
+              (p as { seller?: { username?: string } }).seller?.username ||
+              'seller'
+          );
+          return {
+            id,
+            url: '',
+            thumbnail: thumb,
+            user: {
+              username: sellerUsername,
+              avatar: '',
+            },
+            caption: String((p as { title?: string }).title ?? ''),
+            likes: 0,
+            comments: 0,
+            shares: 0,
+            saves: 0,
+            coins: Number((p as { price?: number }).price) || 0,
+            sound: null,
+          } satisfies Video;
+        })
+        .filter((v): v is Video => v !== null);
+      setReels(formattedReels);
     } catch (err) {
-      console.error("Error fetching reels:", err);
-      setReels(MOCK_VIDEOS);
+      console.log('REELS DATA:', null);
+      console.log('marketplace error:', err);
+      setReels([]);
     }
   };
 
@@ -132,7 +158,7 @@ export default function MarketplacePage() {
         setProducts([]);
         return;
       }
-      console.log('marketplace data:', payload);
+      console.log('MARKETPLACE PRODUCTS:', payload);
       if (!res.ok) {
         console.log('marketplace error:', (payload as { error?: string })?.error ?? res.statusText);
         setProducts([]);
@@ -143,13 +169,27 @@ export default function MarketplacePage() {
         setProducts([]);
         return;
       }
-      setProducts(
-        payload.map((p: any) => ({
-          ...p,
-          image: productImagePublicUrl(p.image) || `https://picsum.photos/seed/${p.id}/400/400`,
-          seller: { username: p.seller_username }
-        }))
-      );
+      const mapped: Product[] = (payload as Record<string, unknown>[])
+        .map((p: any) => {
+          const id = String(p.id ?? '');
+          const sellerId = String(p.seller_id ?? '').trim();
+          if (!id || !sellerId) return null;
+          const image = productImagePublicUrl(String(p.image ?? '').trim());
+          if (!isValidMarketplaceProductMediaUrl(image)) return null;
+          return {
+            ...p,
+            id,
+            title: String(p.title ?? ''),
+            price: Number(p.price) || 0,
+            location: String(p.location ?? ''),
+            image,
+            category: String(p.category ?? ''),
+            stock: p.stock != null ? Number(p.stock) : undefined,
+            seller: { username: String(p.seller_username ?? 'seller').trim() || 'seller' },
+          } as Product;
+        })
+        .filter((row): row is Product => row !== null);
+      setProducts(mapped);
     } catch (err) {
       console.log('marketplace error:', err);
       setProducts([]);
@@ -496,6 +536,7 @@ export default function MarketplacePage() {
           )}
         </>
       ) : activeTab === 'reels' ? (
+        reels.length > 0 ? (
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3 md:gap-6 px-4 lg:px-0">
           {reels.map((video, i) => (
             <motion.div 
@@ -503,12 +544,12 @@ export default function MarketplacePage() {
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ delay: i * 0.05 }}
-              onClick={() => navigate('/reels')}
+              onClick={() => navigate(`/marketplace/product/${video.id}`)}
               className="aspect-[9/16] bg-white dark:bg-gray-900 rounded-3xl overflow-hidden group cursor-pointer relative shadow-sm hover:shadow-xl hover:border-indigo-500/30 transition-all duration-300 border border-gray-100 dark:border-gray-800"
             >
               <ResponsiveImage 
                 src={video.thumbnail} 
-                alt="" 
+                alt={video.caption || 'Product'} 
                 width={400}
                 height={600}
                 className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700"
@@ -516,39 +557,50 @@ export default function MarketplacePage() {
               <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent" />
               <div className="absolute bottom-4 left-4 right-4">
                 <div className="flex items-center gap-2 text-white mb-2">
-                  <div className="w-6 h-6 rounded-full overflow-hidden border border-white/20">
-                    <ResponsiveImage src={video.user.avatar} alt="" width={50} height={50} className="w-full h-full object-cover" />
+                  <div className="w-6 h-6 rounded-full overflow-hidden border border-white/20 bg-indigo-600 flex items-center justify-center shrink-0">
+                    {video.user.avatar ? (
+                      <ResponsiveImage src={video.user.avatar} alt="" width={50} height={50} className="w-full h-full object-cover" />
+                    ) : (
+                      <span className="text-[10px] font-black">{(video.user.username || '?').charAt(0).toUpperCase()}</span>
+                    )}
                   </div>
                   <span className="text-xs font-bold truncate">@{video.user.username}</span>
                 </div>
                 <div className="flex items-center gap-3 text-white/90 text-[10px] font-bold">
                   <div className="flex items-center gap-1">
-                    <PlaySquare size={12} />
-                    {video.viewerCount || '1.2K'}
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <Heart size={12} />
-                    {(video.likes || 0).toLocaleString()}
+                    <Coins size={12} />
+                    {(video.coins || 0).toLocaleString()}
                   </div>
                 </div>
               </div>
             </motion.div>
           ))}
         </div>
-      ) : (
+        ) : (
+          <div className="flex flex-col items-center justify-center py-20 px-4 text-center">
+            <div className="w-20 h-20 bg-gray-100 dark:bg-gray-800 rounded-full flex items-center justify-center mb-4 text-gray-400">
+              <PlaySquare size={40} />
+            </div>
+            <h3 className="text-xl font-bold mb-2">No product videos yet</h3>
+            <p className="text-gray-500 max-w-xs mx-auto">
+              Listings with real product images appear here. Add a product with a photo in the Products tab.
+            </p>
+          </div>
+        )
+      ) : marketplacePostsGrid.length > 0 ? (
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3 md:gap-6 px-4 lg:px-0">
-          {posts.map((post, i) => (
+          {marketplacePostsGrid.map((post, i) => (
             <motion.div 
               key={post.id}
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ delay: i * 0.05 }}
-              onClick={() => navigate('/')}
+              onClick={() => navigate(`/marketplace/product/${post.id}`)}
               className="aspect-square bg-white dark:bg-gray-900 rounded-3xl overflow-hidden group cursor-pointer relative shadow-sm hover:shadow-xl hover:border-indigo-500/30 transition-all duration-300 border border-gray-100 dark:border-gray-800"
             >
               <ResponsiveImage 
-                src={post.image || `https://picsum.photos/seed/${post.id}/500/500`} 
-                alt="" 
+                src={post.image!} 
+                alt={post.caption || 'Product'} 
                 width={500}
                 height={500}
                 className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700"
@@ -556,24 +608,32 @@ export default function MarketplacePage() {
               <div className="absolute inset-0 bg-gradient-to-t from-black/60 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
               <div className="absolute bottom-4 left-4 right-4 opacity-0 group-hover:opacity-100 transition-opacity">
                 <div className="flex items-center gap-2 text-white mb-1">
-                  <div className="w-5 h-5 rounded-full overflow-hidden border border-white/20">
-                    <ResponsiveImage src={post.user.avatar} alt="" width={50} height={50} className="w-full h-full object-cover" />
+                  <div className="w-5 h-5 rounded-full overflow-hidden border border-white/20 bg-indigo-600 flex items-center justify-center shrink-0">
+                    {post.user.avatar ? (
+                      <ResponsiveImage src={post.user.avatar} alt="" width={50} height={50} className="w-full h-full object-cover" />
+                    ) : (
+                      <span className="text-[8px] font-black">{(post.user.username || '?').charAt(0).toUpperCase()}</span>
+                    )}
                   </div>
                   <span className="text-[10px] font-bold truncate">@{post.user.username}</span>
                 </div>
-                <div className="flex items-center gap-3 text-white/90 text-[10px] font-bold">
-                  <div className="flex items-center gap-1">
-                    <Heart size={10} />
-                    {(post.likes || 0).toLocaleString()}
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <MessageCircle size={10} />
-                    {(post.comments || 0).toLocaleString()}
-                  </div>
+                <div className="flex items-center gap-1 text-white/90 text-[10px] font-bold">
+                  <Coins size={10} />
+                  {(products.find((x) => x.id === post.id)?.price ?? 0).toLocaleString()}
                 </div>
               </div>
             </motion.div>
           ))}
+        </div>
+      ) : (
+        <div className="flex flex-col items-center justify-center py-20 px-4 text-center">
+          <div className="w-20 h-20 bg-gray-100 dark:bg-gray-800 rounded-full flex items-center justify-center mb-4 text-gray-400">
+            <ImageIcon size={40} />
+          </div>
+          <h3 className="text-xl font-bold mb-2">No marketplace listings yet</h3>
+          <p className="text-gray-500 max-w-xs mx-auto">
+            Products with a real Supabase image and seller appear here. List an item from the Products tab.
+          </p>
         </div>
       )}
 

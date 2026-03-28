@@ -3076,25 +3076,145 @@ function PeopleYouMayKnow() {
   );
 }
 
+function isValidTrendingPostMediaUrl(url: string | null | undefined): boolean {
+  const u = String(url ?? '').trim();
+  if (!u) return false;
+  const l = u.toLowerCase();
+  if (!u.startsWith('https://')) return false;
+  if (l.includes('localhost') || l.includes('127.0.0.1')) return false;
+  if (l.includes('picsum') || l.includes('placehold')) return false;
+  return true;
+}
+
+function postRowHasValidMedia(row: { image_url?: string | null; video_url?: string | null }): boolean {
+  return isValidTrendingPostMediaUrl(row.image_url) || isValidTrendingPostMediaUrl(row.video_url);
+}
+
+function normalizeHashtagToken(raw: string): string | null {
+  const t = raw.replace(/^[#]+/, '').replace(/[.,!?:;]+$/g, '').trim();
+  if (t.length < 1 || t.length > 80) return null;
+  return t;
+}
+
+function extractHashtagsFromContent(content: string): string[] {
+  const s = String(content ?? '');
+  const re = /#([^\s#]+)/g;
+  const out: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s)) !== null) {
+    const n = normalizeHashtagToken(m[1]);
+    if (n) out.push(n);
+  }
+  return out;
+}
+
+type TrendingPostRow = {
+  id: string;
+  user_id: string;
+  content: string | null;
+  image_url: string | null;
+  video_url: string | null;
+};
+
 function TrendingSection() {
   const navigate = useNavigate();
   const location = useLocation();
   const isHomeFeed = location.pathname === '/';
-  const trends = ['SummerVibes', 'TechNews', 'TravelGoals', 'FitnessJourney', 'FoodieLife'];
+  const [trendRows, setTrendRows] = useState<{ tag: string; count: number }[]>([]);
+  const [loadingTrends, setLoadingTrends] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoadingTrends(true);
+      try {
+        const { data: rows, error } = await supabase
+          .from('posts')
+          .select('id, user_id, content, image_url, video_url')
+          .not('user_id', 'is', null)
+          .order('created_at', { ascending: false })
+          .limit(500);
+
+        if (cancelled) return;
+        if (error || !rows?.length) {
+          const hashtags: { tag: string; count: number }[] = [];
+          const posts: TrendingPostRow[] = [];
+          console.log("TRENDING HASHTAGS:", hashtags);
+          console.log("TRENDING POSTS:", posts);
+          setTrendRows([]);
+          return;
+        }
+
+        const validPosts: TrendingPostRow[] = (rows as TrendingPostRow[]).filter(
+          (r) =>
+            Boolean(String(r.user_id || '').trim()) &&
+            postRowHasValidMedia(r) &&
+            String(r.content || '').includes('#')
+        );
+
+        const tagMap = new Map<string, { count: number; display: string }>();
+        for (const post of validPosts) {
+          for (const tag of extractHashtagsFromContent(post.content || '')) {
+            const key = tag.toLowerCase();
+            const cur = tagMap.get(key);
+            if (!cur) tagMap.set(key, { count: 1, display: tag });
+            else cur.count += 1;
+          }
+        }
+
+        const hashtags = [...tagMap.entries()]
+          .map(([, v]) => ({ tag: v.display, count: v.count }))
+          .filter((h) => h.count > 0)
+          .sort((a, b) => b.count - a.count)
+          .slice(0, 10);
+
+        const posts = validPosts;
+
+        console.log("TRENDING HASHTAGS:", hashtags);
+        console.log("TRENDING POSTS:", posts);
+
+        if (!cancelled) setTrendRows(hashtags);
+      } catch {
+        const hashtags: { tag: string; count: number }[] = [];
+        const posts: TrendingPostRow[] = [];
+        console.log("TRENDING HASHTAGS:", hashtags);
+        console.log("TRENDING POSTS:", posts);
+        if (!cancelled) setTrendRows([]);
+      } finally {
+        if (!cancelled) setLoadingTrends(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   return (
     <div className={cn(isHomeFeed ? homeCard : exploreGlassCard, 'p-5')}>
       <h3 className={cn('font-bold text-sm mb-4', isHomeFeed ? 'text-gray-900' : 'text-white')}>Trending</h3>
-      <div className="space-y-3">
-        {trends.map((trend) => (
-          <button
-            key={trend}
-            onClick={() => navigate(`/hashtag/${trend}`)}
-            className="block text-indigo-600 text-sm font-bold hover:underline"
-          >
-            #{trend}
-          </button>
-        ))}
-      </div>
+      {loadingTrends ? (
+        <p className={cn('text-xs', isHomeFeed ? 'text-gray-500' : 'text-gray-400')}>Loading…</p>
+      ) : trendRows.length === 0 ? (
+        <p className={cn('text-xs', isHomeFeed ? 'text-gray-500' : 'text-gray-400')}>
+          No trending hashtags yet. Posts with hashtags and valid media will appear here.
+        </p>
+      ) : (
+        <div className="space-y-3">
+          {trendRows.map((row) => (
+            <button
+              key={`${row.tag.toLowerCase()}-${row.count}`}
+              type="button"
+              onClick={() => navigate(`/hashtag/${encodeURIComponent(row.tag)}`)}
+              className={cn(
+                'block w-full text-left text-sm font-bold hover:underline',
+                isHomeFeed ? 'text-indigo-600' : 'text-indigo-300'
+              )}
+            >
+              #{row.tag}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
