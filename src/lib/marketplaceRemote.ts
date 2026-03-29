@@ -8,20 +8,41 @@ import { resolveMarketplaceListingImageUrl } from './marketplaceImage';
 import { supabase } from './supabase';
 
 export async function fetchMarketplaceTableRowsAsApiProducts(): Promise<Record<string, unknown>[]> {
+  try {
+    const { data: sessionData } = await supabase.auth.getSession();
+    const uid = sessionData?.session?.user?.id ?? null;
+    console.log('[Marketplace] fetch session', { userId: uid ?? 'anonymous' });
+  } catch (se) {
+    console.warn('[Marketplace] getSession (non-fatal)', se);
+  }
+
   const { data, error } = await supabase
     .from('marketplace')
     .select('*')
-    .order('is_featured', { ascending: false })
     .order('created_at', { ascending: false });
 
-  console.log('Marketplace rows:', data ?? null, error ? { error } : null);
+  const rowCount = data?.length ?? 0;
+  console.log('[Marketplace] Supabase select("*") full response', {
+    data,
+    error,
+    rowCount,
+  });
 
   if (error) {
-    console.warn('[Marketplace] Supabase marketplace select failed:', error.message);
+    console.error('[Marketplace] Supabase query error (full)', {
+      message: error.message,
+      code: error.code,
+      details: (error as { details?: string }).details,
+      hint: (error as { hint?: string }).hint,
+    });
     return [];
   }
-  if (!data?.length) return [];
 
+  if (!data?.length) {
+    return [];
+  }
+
+  const beforeMapCount = data.length;
   const sortedRows = [...data].sort((a, b) => {
     const fa = isMarketplaceEffectivelyFeatured(a as Record<string, unknown>) ? 1 : 0;
     const fb = isMarketplaceEffectivelyFeatured(b as Record<string, unknown>) ? 1 : 0;
@@ -34,12 +55,20 @@ export async function fetchMarketplaceTableRowsAsApiProducts(): Promise<Record<s
   const ids = [...new Set(sortedRows.map((r: { user_id?: string }) => r.user_id).filter(Boolean))] as string[];
   const profileMap = new Map<string, string>();
   if (ids.length) {
-    const { data: profs } = await supabase.from('profiles').select('id, username').in('id', ids);
+    const { data: profs, error: profErr } = await supabase.from('profiles').select('id, username').in('id', ids);
+    if (profErr) {
+      console.error('[Marketplace] profiles select error (full)', {
+        message: profErr.message,
+        code: profErr.code,
+        details: (profErr as { details?: string }).details,
+      });
+    }
     (profs || []).forEach((p: { id: string; username?: string }) => {
       if (p.id) profileMap.set(p.id, p.username || 'Unknown');
     });
   }
-  return sortedRows.map((m: Record<string, unknown>) => ({
+
+  const mappedRows = sortedRows.map((m: Record<string, unknown>) => ({
     ...m,
     id: m.id,
     title: m.title,
@@ -55,14 +84,23 @@ export async function fetchMarketplaceTableRowsAsApiProducts(): Promise<Record<s
     is_featured: isMarketplaceEffectivelyFeatured(m),
     seller_username: profileMap.get(String(m.user_id)) || 'Unknown',
   }));
+
+  console.log('[Marketplace] after shape mapping (before Product map)', {
+    beforeMapCount,
+    afterShapeCount: mappedRows.length,
+  });
+
+  return mappedRows;
 }
 
 /** Map API / Supabase-shaped rows to Product[] without dropping rows for image validation. */
 export function mapMarketplaceRowsToProducts(payload: Record<string, unknown>[]): Product[] {
-  return payload
+  console.log('[Marketplace] mapMarketplaceRowsToProducts input length', payload.length);
+
+  const mapped = payload
     .map((p: Record<string, unknown>) => {
-      const id = String(p.id ?? '');
-      const sellerId = String(p.seller_id ?? '').trim();
+      const id = String(p.id ?? '').trim();
+      const sellerId = String(p.seller_id ?? p.user_id ?? '').trim();
       if (!id || !sellerId) return null;
       const image = resolveMarketplaceListingImageUrl(String(p.image ?? ''));
       const is_featured_raw =
@@ -95,6 +133,12 @@ export function mapMarketplaceRowsToProducts(payload: Record<string, unknown>[])
       } as Product;
     })
     .filter((row): row is Product => row !== null);
+
+  console.log('[Marketplace] mapMarketplaceRowsToProducts output length', mapped.length);
+  if (payload.length > 0 && mapped.length === 0) {
+    console.warn('[Marketplace] mapping dropped all rows; sample input', payload[0]);
+  }
+  return mapped;
 }
 
 export async function fetchSingleProductAsApiShape(id: string): Promise<Record<string, unknown> | null> {

@@ -217,8 +217,14 @@ export default function MarketplacePage() {
   };
 
   const fetchProducts = async () => {
+    const apiEndpoint = apiUrl('/api/marketplace/products');
+    console.log('[Marketplace][diag] fetchProducts start', {
+      hostname: typeof window !== 'undefined' ? window.location.hostname : 'ssr',
+      apiEndpoint,
+      supabaseConfigured: isSupabaseConfigured,
+    });
     try {
-      const res = await fetch(apiUrl('/api/marketplace/products'));
+      const res = await fetch(apiEndpoint);
       const ct = res.headers.get('content-type') || '';
       let payload: unknown;
       try {
@@ -228,6 +234,14 @@ export default function MarketplacePage() {
         console.log('marketplace error:', parseErr);
         payload = null;
       }
+      console.log('[Marketplace][diag] API /marketplace/products', {
+        ok: res.ok,
+        status: res.status,
+        contentType: ct,
+        looksLikeJson: ct.includes('application/json'),
+        payloadType: Array.isArray(payload) ? 'array' : payload == null ? 'null' : typeof payload,
+        payloadLength: Array.isArray(payload) ? payload.length : null,
+      });
       console.log('MARKETPLACE PRODUCTS:', payload);
       let list: Record<string, unknown>[] = [];
       if (res.ok && Array.isArray(payload)) {
@@ -245,6 +259,11 @@ export default function MarketplacePage() {
         return;
       }
       const mapped = mapMarketplaceRowsToProducts(list);
+      if (list.length > 0 && mapped.length === 0) {
+        console.warn('[Marketplace][diag] mapMarketplaceRowsToProducts removed all rows', {
+          sampleRow: list[0],
+        });
+      }
       console.log('[Marketplace] Fetched rows → products', {
         supabaseConfigured: isSupabaseConfigured,
         rawRowCount: list.length,
