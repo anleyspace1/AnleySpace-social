@@ -52,6 +52,8 @@ type ExploreCreatorRow = {
   username: string;
   displayName: string;
   avatar_url: string | null;
+  /** Optional alias some APIs use; same display rules as avatar_url */
+  profile_image?: string | null;
   followers_count: number;
 };
 
@@ -92,6 +94,18 @@ function isValidProfileAvatarUrl(url: string | null | undefined): boolean {
   return u.startsWith('https://');
 }
 
+/** Suggested Creators only: show real avatars for http(s) or data URLs (stricter helper above is used elsewhere). */
+function resolveSuggestedCreatorAvatarDisplayUrl(creator: ExploreCreatorRow): string | null {
+  const raw = String(creator.avatar_url ?? creator.profile_image ?? '').trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  if (lower.includes('picsum') || lower.includes('placehold')) return null;
+  if (lower.includes('localhost') || lower.includes('127.0.0.1')) return null;
+  if (raw.startsWith('https://') || raw.startsWith('http://')) return raw;
+  if (raw.startsWith('data:image/')) return raw;
+  return null;
+}
+
 const TRENDING_LINKS = [
   { id: '1', title: 'Viral Videos', target: '/reels', icon: <Flame size={14} className="text-orange-500" />, badge: null as string | null, gradient: 'from-orange-600/35 to-rose-950/60' },
   { id: '2', title: 'Trending Lives', target: '/live', icon: <Flame size={14} className="text-red-400" />, badge: 'LIVE' as string | null, gradient: 'from-red-600/35 to-indigo-950/60' },
@@ -124,6 +138,129 @@ export default function ExplorePage() {
   const [exploreProducts, setExploreProducts] = useState<ExploreProductRow[]>([]);
   const [suggestedCreators, setSuggestedCreators] = useState<ExploreCreatorRow[]>([]);
   const [liveStreams, setLiveStreams] = useState<ExploreLiveRow[]>([]);
+
+  useEffect(() => {
+    const tag = '[Suggested Creators debug]';
+    const creators = suggestedCreators;
+
+    if (creators.length === 0) {
+      console.log(`${tag} total: 0, users with valid avatars: 0, users missing avatars: 0 (empty list)`);
+      return;
+    }
+
+    let validCount = 0;
+    let missingCount = 0;
+    let invalidCount = 0;
+
+    creators.forEach((user) => {
+      const av = user.avatar_url != null ? String(user.avatar_url).trim() : '';
+      const pi = user.profile_image != null ? String(user.profile_image).trim() : '';
+
+      if (!av || av === '') {
+        if (!pi) {
+          console.log(`${tag} User ${user.username} has NO avatar_url`);
+          missingCount++;
+        } else if (!pi.startsWith('http') && !pi.startsWith('data:image')) {
+          console.log(`${tag} User ${user.username} has INVALID profile_image: ${pi}`);
+          invalidCount++;
+        } else {
+          console.log(`${tag} User ${user.username} avatar OK (profile_image)`);
+          validCount++;
+        }
+      } else if (!av.startsWith('http') && !av.startsWith('data:image')) {
+        console.log(`${tag} User ${user.username} has INVALID avatar_url: ${av}`);
+        invalidCount++;
+      } else {
+        console.log(`${tag} User ${user.username} avatar OK`);
+        validCount++;
+      }
+    });
+
+    const missingAvatars = creators.length - validCount;
+    console.log(`${tag} total users: ${creators.length}`);
+    console.log(`${tag} users with valid avatars: ${validCount}`);
+    console.log(`${tag} users missing avatars: ${missingAvatars} (no URL: ${missingCount}, invalid format: ${invalidCount})`);
+  }, [suggestedCreators]);
+
+  useEffect(() => {
+    const TAG = '[Fake Profile]';
+    const creators = suggestedCreators;
+
+    if (creators.length === 0) {
+      console.log(`${TAG} total fake profiles: 0 (empty list)`);
+      return;
+    }
+
+    const isPlaceholderUrl = (url: string) => {
+      const l = url.toLowerCase();
+      return (
+        l.includes('picsum') ||
+        l.includes('placehold') ||
+        l.includes('placeholder') ||
+        l.includes('via.placeholder')
+      );
+    };
+
+    const looksLikeValidHttpImage = (url: string | null | undefined): boolean => {
+      const u = (url ?? '').trim();
+      if (!u) return false;
+      if (isPlaceholderUrl(u)) return false;
+      return (
+        u.startsWith('http://') ||
+        u.startsWith('https://') ||
+        u.startsWith('data:image/')
+      );
+    };
+
+    const looksSuspiciousUsername = (username: string): boolean => {
+      const u = username.trim().toLowerCase();
+      if (u.length > 0 && u.length < 5) return true;
+      if (u.includes('user') && /\d/.test(u)) return true;
+      if (/^user_[a-f0-9]{4,}$/i.test(username.trim())) return true;
+      return false;
+    };
+
+    const fakeProfiles: ExploreCreatorRow[] = [];
+
+    creators.forEach((user) => {
+      const avOk = looksLikeValidHttpImage(user.avatar_url);
+      const piOk = looksLikeValidHttpImage(user.profile_image);
+      const avRaw = user.avatar_url != null ? String(user.avatar_url).trim() : '';
+      const piRaw = user.profile_image != null ? String(user.profile_image).trim() : '';
+
+      const reasons: string[] = [];
+
+      if (!avOk && !piOk) {
+        reasons.push('no valid avatar_url or profile_image (http/https/data, non-placeholder)');
+      }
+      if (avRaw && isPlaceholderUrl(avRaw)) {
+        reasons.push(`placeholder/suspicious avatar_url: ${avRaw}`);
+      }
+      if (piRaw && isPlaceholderUrl(piRaw)) {
+        reasons.push(`placeholder/suspicious profile_image: ${piRaw}`);
+      }
+      if (looksSuspiciousUsername(user.username)) {
+        reasons.push('suspicious username (short, user+digits, user_* pattern)');
+      }
+
+      if (reasons.length > 0) {
+        fakeProfiles.push(user);
+        console.log(`${TAG} User ${user.username} (${user.id}): ${reasons.join(' | ')}`);
+      }
+    });
+
+    const missingValidAvatar = creators.filter(
+      (u) =>
+        !looksLikeValidHttpImage(u.avatar_url) && !looksLikeValidHttpImage(u.profile_image)
+    ).length;
+    const suspiciousUsernames = creators.filter((u) => looksSuspiciousUsername(u.username)).length;
+
+    console.log(`${TAG} Total fake profiles (flagged): ${fakeProfiles.length}`);
+    console.log(`${TAG} Profiles missing valid avatar_url and profile_image: ${missingValidAvatar}`);
+    console.log(
+      `${TAG} Profiles with suspicious usernames: ${suspiciousUsernames} (includes "user" pattern / short / user_*)`
+    );
+  }, [suggestedCreators]);
 
   useEffect(() => {
     let cancelled = false;
@@ -192,7 +329,7 @@ export default function ExplorePage() {
         } else {
           const slice = profs.slice(0, 8);
           const users: ExploreCreatorRow[] = await Promise.all(
-            slice.map(async (p: { id: string; username?: string | null; display_name?: string | null; avatar_url?: string | null }) => {
+            slice.map(async (p: { id: string; username?: string | null; display_name?: string | null; avatar_url?: string | null; profile_image?: string | null }) => {
               const { count } = await supabase
                 .from('follows')
                 .select('*', { count: 'exact', head: true })
@@ -202,6 +339,7 @@ export default function ExplorePage() {
                 username: resolveProfileUsername(p.username),
                 displayName: resolveCreatorDisplayName(p),
                 avatar_url: p.avatar_url ?? null,
+                profile_image: p.profile_image ?? null,
                 followers_count: count ?? 0,
               };
             })
@@ -738,8 +876,7 @@ export default function ExplorePage() {
               ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 px-4">
                 {suggestedCreators.map(creator => {
-                  const av = creator.avatar_url;
-                  const avOk = isValidProfileAvatarUrl(av);
+                  const avatarDisplayUrl = resolveSuggestedCreatorAvatarDisplayUrl(creator);
                   return (
                   <div 
                     key={creator.id} 
@@ -747,10 +884,10 @@ export default function ExplorePage() {
                     className="bg-[#1a1c26] p-3 rounded-2xl flex items-center gap-3 group cursor-pointer hover:bg-[#252836] transition-colors"
                   >
                     <div className="relative shrink-0">
-                      {avOk ? (
-                        <img 
-                          src={av!} 
-                          alt={creator.displayName} 
+                      {avatarDisplayUrl ? (
+                        <img
+                          src={avatarDisplayUrl}
+                          alt={creator.displayName}
                           className="w-12 h-12 rounded-full object-cover border-2 border-indigo-500/20"
                           referrerPolicy="no-referrer"
                         />

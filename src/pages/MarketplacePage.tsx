@@ -30,8 +30,42 @@ import {
   mapMarketplaceRowsToProducts,
 } from '../lib/marketplaceRemote';
 import { resolveMarketplaceListingImageUrl } from '../lib/marketplaceImage';
+import { isDemoOrPlaceholderImageUrl, isPlaceholderUsername } from '../lib/realDataGuards';
 import { fetchSavedMarketplaceProductIds, setSavedMarketplaceProduct } from '../lib/savedMarketplace';
 import { ResponsiveImage } from '../components/ResponsiveImage';
+import { validateNewListingFields } from '../lib/marketplaceListingValidation';
+
+/** After mapping: drop rows that cannot render as valid listings (never stored in `products` state). */
+function cleanMarketplaceProducts(products: Product[]): Product[] {
+  return products.filter((p) => {
+    const username =
+      (p as { username?: string }).username ||
+      p.seller?.username;
+
+    const title =
+      p.title ||
+      (p as { name?: string }).name;
+
+    const image = typeof p.image === 'string' ? p.image.trim().toLowerCase() : '';
+
+    const validImage =
+      !!image &&
+      image !== 'null' &&
+      image !== 'undefined' &&
+      image !== '/' &&
+      image.startsWith('http');
+
+    return (
+      !!username &&
+      String(username).trim() !== '' &&
+      !!title &&
+      String(title).trim() !== '' &&
+      validImage &&
+      typeof p.price === 'number' &&
+      Number.isFinite(p.price)
+    );
+  });
+}
 
 export default function MarketplacePage() {
   const navigate = useNavigate();
@@ -113,11 +147,12 @@ export default function MarketplacePage() {
       .map((p) => {
         const sellerUsername =
           p.seller?.username ||
-          String((p as { seller_username?: string }).seller_username || '').trim() ||
-          'seller';
+          String((p as { seller_username?: string }).seller_username || '').trim();
+        if (!sellerUsername || isPlaceholderUsername(sellerUsername)) return null;
+        const img = String(p.image ?? '').trim();
         return {
           id: p.id,
-          image: p.image || `https://picsum.photos/seed/${p.id}/400/400`,
+          image: img && !isDemoOrPlaceholderImageUrl(img) ? img : '',
           caption: p.title || '',
           likes: 0,
           comments: 0,
@@ -125,11 +160,16 @@ export default function MarketplacePage() {
           timestamp: String((p as { created_at?: string }).created_at || ''),
           user: { username: sellerUsername, avatar: '' },
         } satisfies Post;
-      });
+      })
+      .filter((row): row is Post => row !== null);
   }, [products]);
 
   const fetchReels = async () => {
     try {
+      let data: Record<string, unknown>[] = [];
+      if (isSupabaseConfigured) {
+        data = await fetchMarketplaceTableRowsAsApiProducts();
+      } else {
       const res = await fetch(apiUrl('/api/marketplace/products'));
       const ct = res.headers.get('content-type') || '';
       let raw: unknown;
@@ -140,9 +180,9 @@ export default function MarketplacePage() {
         raw = null;
       }
       console.log('REELS DATA:', raw);
-      let data: Record<string, unknown>[] = [];
       if (res.ok && Array.isArray(raw)) data = raw as Record<string, unknown>[];
       if (!data.length) data = await fetchMarketplaceTableRowsAsApiProducts();
+      }
       if (!data.length) {
         setReels([]);
         return;
@@ -155,12 +195,13 @@ export default function MarketplacePage() {
           const sellerUsername = String(
             (p as { seller_username?: string }).seller_username ||
               (p as { seller?: { username?: string } }).seller?.username ||
-              'seller'
-          );
+              ''
+          ).trim();
+          if (!sellerUsername || isPlaceholderUsername(sellerUsername)) return null;
           return {
             id,
             url: '',
-            thumbnail: thumb || '',
+            thumbnail: thumb && !isDemoOrPlaceholderImageUrl(thumb) ? thumb : '',
             user: {
               username: sellerUsername,
               avatar: '',
@@ -192,12 +233,13 @@ export default function MarketplacePage() {
           const sellerUsername = String(
             (p as { seller_username?: string }).seller_username ||
               (p as { seller?: { username?: string } }).seller?.username ||
-              'seller'
-          );
+              ''
+          ).trim();
+          if (!sellerUsername || isPlaceholderUsername(sellerUsername)) return null;
           return {
             id,
             url: '',
-            thumbnail: thumb || '',
+            thumbnail: thumb && !isDemoOrPlaceholderImageUrl(thumb) ? thumb : '',
             user: {
               username: sellerUsername,
               avatar: '',
@@ -224,9 +266,14 @@ export default function MarketplacePage() {
       supabaseConfigured: isSupabaseConfigured,
     });
     try {
-      const res = await fetch(apiEndpoint);
-      const ct = res.headers.get('content-type') || '';
+      let list: Record<string, unknown>[] = [];
+      let res: Response | undefined;
       let payload: unknown;
+      if (isSupabaseConfigured) {
+        list = await fetchMarketplaceTableRowsAsApiProducts();
+      } else {
+      res = await fetch(apiEndpoint);
+      const ct = res.headers.get('content-type') || '';
       try {
         if (!ct.includes('application/json')) payload = null;
         else payload = await res.json();
@@ -243,22 +290,23 @@ export default function MarketplacePage() {
         payloadLength: Array.isArray(payload) ? payload.length : null,
       });
       console.log('MARKETPLACE PRODUCTS:', payload);
-      let list: Record<string, unknown>[] = [];
       if (res.ok && Array.isArray(payload)) {
         list = payload as Record<string, unknown>[];
       }
       if (!list.length) {
         list = await fetchMarketplaceTableRowsAsApiProducts();
       }
+      }
       console.log('Marketplace rows (merged list length):', list.length);
       if (!list.length) {
-        if (!res.ok) console.log('marketplace error:', (payload as { error?: string })?.error ?? res.statusText);
-        else if (!Array.isArray(payload)) console.log('marketplace error:', 'Expected array of products');
+        if (res && !res.ok) console.log('marketplace error:', (payload as { error?: string })?.error ?? res.statusText);
+        else if (res && !Array.isArray(payload)) console.log('marketplace error:', 'Expected array of products');
         console.log('[Marketplace] No rows after API + Supabase fallback', { supabaseConfigured: isSupabaseConfigured });
         setProducts([]);
         return;
       }
       const mapped = mapMarketplaceRowsToProducts(list);
+      const clean = cleanMarketplaceProducts(mapped);
       if (list.length > 0 && mapped.length === 0) {
         console.warn('[Marketplace][diag] mapMarketplaceRowsToProducts removed all rows', {
           sampleRow: list[0],
@@ -268,20 +316,23 @@ export default function MarketplacePage() {
         supabaseConfigured: isSupabaseConfigured,
         rawRowCount: list.length,
         afterMapCount: mapped.length,
-        idsSample: mapped.slice(0, 5).map((p) => p.id),
+        afterCleanCount: clean.length,
+        idsSample: clean.slice(0, 5).map((p) => p.id),
       });
-      setProducts(mapped);
+      setProducts(clean);
     } catch (err) {
       console.log('marketplace error:', err);
       const direct = await fetchMarketplaceTableRowsAsApiProducts();
       const mappedCatch = direct.length ? mapMarketplaceRowsToProducts(direct) : [];
+      const cleanCatch = cleanMarketplaceProducts(mappedCatch);
       console.log('[Marketplace] Catch fallback', {
         supabaseConfigured: isSupabaseConfigured,
         rawRowCount: direct.length,
         afterMapCount: mappedCatch.length,
-        idsSample: mappedCatch.slice(0, 5).map((p) => p.id),
+        afterCleanCount: cleanCatch.length,
+        idsSample: cleanCatch.slice(0, 5).map((p) => p.id),
       });
-      setProducts(mappedCatch);
+      setProducts(cleanCatch);
     }
   };
 
@@ -370,8 +421,10 @@ export default function MarketplacePage() {
     e.preventDefault();
     if (!user) return;
     const formData = new FormData(e.currentTarget);
-    
-    let finalImageUrl = `https://picsum.photos/seed/${Date.now()}/400/400`;
+    const title = String(formData.get('title') ?? '');
+    const description = String(formData.get('description') ?? '');
+
+    let finalImageUrl = '';
 
     // Same upload + public URL flow as Home feed post images (`feed/{userId}/...` in `posts` bucket)
     if (selectedImages.length > 0) {
@@ -399,10 +452,16 @@ export default function MarketplacePage() {
         console.log('marketplace error:', err);
       }
     }
-    
+
+    const validationMessage = validateNewListingFields(finalImageUrl, title, description);
+    if (validationMessage) {
+      alert(validationMessage);
+      return;
+    }
+
     const payload = {
-      title: formData.get('title') as string,
-      description: formData.get('description') as string,
+      title,
+      description,
       price: Number(formData.get('price')),
       category: formData.get('category') as string,
       location: formData.get('location') as string,
@@ -425,7 +484,9 @@ export default function MarketplacePage() {
       }
       console.log('marketplace data:', body);
       if (!res.ok) {
-        console.log('marketplace error:', (body as { error?: string })?.error ?? res.statusText);
+        const msg = (body as { error?: string })?.error ?? res.statusText;
+        console.log('marketplace error:', msg);
+        if (msg) alert(msg);
         return;
       }
       fetchProducts();
@@ -551,13 +612,19 @@ export default function MarketplacePage() {
                     className="aspect-[1/1] relative overflow-hidden cursor-pointer"
                     onClick={() => navigate(`/marketplace/product/${product.id}`)}
                   >
+                    {product.image && !isDemoOrPlaceholderImageUrl(product.image) ? (
                     <ResponsiveImage 
-                      src={product.image || `https://picsum.photos/seed/${product.id}/400/400`} 
+                      src={product.image} 
                       alt={product.title} 
                       width={400}
                       height={400}
                       className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700"
                     />
+                    ) : (
+                      <div className="w-full h-full bg-gray-200 dark:bg-gray-700 flex items-center justify-center text-[10px] text-gray-500 font-medium px-2 text-center">
+                        No image
+                      </div>
+                    )}
                     {product.is_featured ? (
                       <div className="absolute top-2 left-2 z-[1] rounded-lg border border-amber-400/40 bg-black/60 px-2 py-1 text-[10px] font-black uppercase tracking-wide text-amber-200 backdrop-blur-sm">
                         ⭐ Featured
@@ -655,6 +722,7 @@ export default function MarketplacePage() {
               onClick={() => navigate(`/marketplace/product/${video.id}`)}
               className="aspect-[9/16] bg-white dark:bg-gray-900 rounded-3xl overflow-hidden group cursor-pointer relative shadow-sm hover:shadow-xl hover:border-indigo-500/30 transition-all duration-300 border border-gray-100 dark:border-gray-800"
             >
+              {video.thumbnail ? (
               <ResponsiveImage 
                 src={video.thumbnail} 
                 alt={video.caption || 'Product'} 
@@ -662,6 +730,11 @@ export default function MarketplacePage() {
                 height={600}
                 className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700"
               />
+              ) : (
+                <div className="w-full h-full bg-gray-200 dark:bg-gray-700 flex items-center justify-center text-[10px] text-gray-500 px-2 text-center">
+                  No image
+                </div>
+              )}
               <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent" />
               <div className="absolute bottom-4 left-4 right-4">
                 <div className="flex items-center gap-2 text-white mb-2">
@@ -706,13 +779,19 @@ export default function MarketplacePage() {
               onClick={() => navigate(`/marketplace/product/${post.id}`)}
               className="aspect-square bg-white dark:bg-gray-900 rounded-3xl overflow-hidden group cursor-pointer relative shadow-sm hover:shadow-xl hover:border-indigo-500/30 transition-all duration-300 border border-gray-100 dark:border-gray-800"
             >
+              {post.image ? (
               <ResponsiveImage 
-                src={post.image!} 
+                src={post.image} 
                 alt={post.caption || 'Product'} 
                 width={500}
                 height={500}
                 className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700"
               />
+              ) : (
+                <div className="w-full h-full bg-gray-200 dark:bg-gray-700 flex items-center justify-center text-[10px] text-gray-500 font-medium px-2 text-center">
+                  No image
+                </div>
+              )}
               <div className="absolute inset-0 bg-gradient-to-t from-black/60 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
               <div className="absolute bottom-4 left-4 right-4 opacity-0 group-hover:opacity-100 transition-opacity">
                 <div className="flex items-center gap-2 text-white mb-1">

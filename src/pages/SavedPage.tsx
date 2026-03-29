@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { motion } from 'motion/react';
 import { Bookmark, Search, Grid, List, MoreHorizontal, Trash2, Coins, ShoppingBag } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
@@ -6,6 +6,7 @@ import { cn } from '../lib/utils';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import { productImagePublicUrl } from '../lib/marketplaceImage';
+import { SavedGridSkeleton } from '../components/LoadingSkeletons';
 
 export type SavedListItem = {
   id: string;
@@ -61,6 +62,8 @@ export default function SavedPage() {
   const [searchQuery, setSearchQuery] = useState('');
   const [savedItems, setSavedItems] = useState<SavedListItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const savedItemsRef = useRef(savedItems);
+  savedItemsRef.current = savedItems;
 
   const fetchSavedItems = useCallback(async () => {
     if (!user?.id) {
@@ -68,7 +71,7 @@ export default function SavedPage() {
       setLoading(false);
       return;
     }
-    setLoading(true);
+    if (savedItemsRef.current.length === 0) setLoading(true);
     try {
       const items: SavedListItem[] = [];
 
@@ -304,10 +307,8 @@ export default function SavedPage() {
             </div>
           </div>
 
-          {loading ? (
-            <div className="flex justify-center py-20">
-              <div className="w-10 h-10 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin" />
-            </div>
+          {loading && filtered.length === 0 ? (
+            <SavedGridSkeleton />
           ) : filtered.length > 0 ? (
             <div
               className={cn(

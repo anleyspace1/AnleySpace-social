@@ -3336,25 +3336,33 @@ async function startServer() {
 
       if (error) throw error;
 
-      const fromProducts = (data || []).map((m: Record<string, unknown>) => ({
-        id: m.id,
-        title: m.title,
-        price: m.price,
-        image: m.image_url,
-        seller_id: m.user_id,
-        category: '',
-        location: '',
-        description: '',
-        stock: 10,
-        created_at: m.created_at,
-        view_count: m.view_count != null ? Number(m.view_count) : 0,
-        is_featured_raw: Boolean(m.is_featured),
-        is_featured: isMarketplaceEffectivelyFeatured({
-          is_featured: m.is_featured,
-          featured_until: m.featured_until,
-        }),
-        featured_until: m.featured_until ?? null,
-      }));
+      const fromProducts = (data || []).map((m: Record<string, unknown>) => {
+        const stockRaw = m.stock;
+        const stock =
+          stockRaw != null && String(stockRaw).trim() !== '' && Number.isFinite(Number(stockRaw))
+            ? Number(stockRaw)
+            : undefined;
+        return {
+          ...m,
+          id: m.id,
+          title: m.title,
+          price: m.price,
+          image: m.image_url,
+          seller_id: m.user_id,
+          category: String((m as { category?: string }).category ?? '').trim(),
+          location: String((m as { location?: string }).location ?? '').trim(),
+          description: String((m as { description?: string }).description ?? '').trim(),
+          stock,
+          created_at: m.created_at,
+          view_count: m.view_count != null ? Number(m.view_count) : 0,
+          is_featured_raw: Boolean(m.is_featured),
+          is_featured: isMarketplaceEffectivelyFeatured({
+            is_featured: m.is_featured,
+            featured_until: m.featured_until,
+          }),
+          featured_until: m.featured_until ?? null,
+        };
+      });
 
       const mergedById = new Map<string, Record<string, unknown>>();
       for (const p of fromProducts) {
@@ -3384,14 +3392,14 @@ async function startServer() {
         console.log("marketplace profiles error:", pErr);
         if (!pErr && profs) {
           (profs as { id: string; username?: string }[]).forEach((p) => {
-            if (p.id) profileMap.set(p.id, p.username || 'Unknown');
+            if (p.id) profileMap.set(p.id, String(p.username ?? '').trim());
           });
         }
       }
 
       const products = rows.map((p: Record<string, unknown>) => ({
         ...p,
-        seller_username: profileMap.get(p.seller_id as string) || 'Unknown',
+        seller_username: profileMap.get(String(p.seller_id ?? '')) || '',
       }));
 
       res.json(products);
@@ -3436,16 +3444,22 @@ async function startServer() {
       let row: Record<string, unknown> | null = null;
       if (data && !error) {
         const m = data as Record<string, unknown>;
+        const stockRaw = m.stock;
+        const stock =
+          stockRaw != null && String(stockRaw).trim() !== '' && Number.isFinite(Number(stockRaw))
+            ? Number(stockRaw)
+            : undefined;
         row = {
+          ...m,
           id: m.id,
           title: m.title,
           price: m.price,
           image: m.image_url,
           seller_id: m.user_id,
-          category: '',
-          location: '',
-          description: '',
-          stock: 10,
+          category: String((m as { category?: string }).category ?? '').trim(),
+          location: String((m as { location?: string }).location ?? '').trim(),
+          description: String((m as { description?: string }).description ?? '').trim(),
+          stock,
           created_at: m.created_at,
           view_count: m.view_count != null ? Number(m.view_count) : 0,
           is_featured_raw: Boolean(m.is_featured),
@@ -3460,7 +3474,7 @@ async function startServer() {
       if (error && !row) throw error;
       if (!row) return res.status(404).json({ error: 'Product not found' });
 
-      let seller_username = 'Unknown';
+      let seller_username = '';
       const sid = row.seller_id as string | undefined;
       if (sid) {
         const { data: prof, error: pErr } = await client
@@ -3495,12 +3509,26 @@ async function startServer() {
 
   app.post("/api/marketplace/products", async (req, res) => {
     const { title, price, category, location, image, sellerId, description, stock } = req.body;
+    const imageStr = typeof image === "string" ? image.trim() : "";
+    const titleStr = typeof title === "string" ? title.trim() : "";
+    const descStr = typeof description === "string" ? description.trim() : "";
+    if (!imageStr) {
+      return res.status(400).json({ error: "Product image is required" });
+    }
+    if (!titleStr) {
+      return res.status(400).json({ error: "Product title is required" });
+    }
+    if (!descStr) {
+      return res.status(400).json({ error: "Product description is required" });
+    }
     logToFile(`SERVER: Creating product ${title}, image length: ${image?.length || 0}`);
     const id = uuidv4();
     
     try {
+      const stockNum =
+        stock != null && String(stock).trim() !== '' && Number.isFinite(Number(stock)) ? Number(stock) : null;
       db.prepare('INSERT INTO products (id, title, price, category, location, image, seller_id, description, stock) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(id, title, price, category, location, image, sellerId, description || '', stock || 10);
+        .run(id, titleStr, price, category, location, imageStr, sellerId, descStr, stockNum ?? 0);
       
       // Sync to Supabase (prefer service role so RLS never blocks server-side upsert)
       try {
@@ -3508,10 +3536,14 @@ async function startServer() {
         if (syncClient) {
           const { error: syncError } = await syncClient.from('marketplace').upsert({
             id,
-            title,
+            title: titleStr,
             price,
-            image_url: image,
+            image_url: imageStr,
             user_id: sellerId,
+            category: category ?? null,
+            location: location ?? null,
+            description: descStr,
+            stock: stock != null && Number.isFinite(Number(stock)) ? Number(stock) : null,
           });
           if (syncError) logToFile(`SERVER: Supabase product sync error: ${syncError.message}`);
         }
@@ -3519,7 +3551,7 @@ async function startServer() {
         logToFile(`SERVER: Supabase product sync exception: ${e}`);
       }
       
-      res.json({ id, title, price });
+      res.json({ id, title: titleStr, price });
     } catch (err) {
       logToFile(`SERVER: Create product error: ${err}`);
       res.status(500).json({ error: 'Failed to create product' });
@@ -3535,10 +3567,15 @@ async function startServer() {
       try {
         const { data: m } = await supabase.from('marketplace').select('*').eq('id', productId).maybeSingle();
         if (m) {
+          const stockRaw = (m as { stock?: unknown }).stock;
+          const stockNum =
+            stockRaw != null && String(stockRaw).trim() !== '' && Number.isFinite(Number(stockRaw))
+              ? Number(stockRaw)
+              : 0;
           product = {
             ...m,
             seller_id: m.user_id,
-            stock: 10,
+            stock: stockNum,
             image: m.image_url,
           };
         }

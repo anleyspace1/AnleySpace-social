@@ -175,6 +175,7 @@ export default function MessagesPage() {
   const [offerDraft, setOfferDraft] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
   const [loading, setLoading] = useState(true);
+  const hasLoadedChatsOnceRef = useRef(false);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -224,6 +225,12 @@ export default function MessagesPage() {
   }, [selectedChat?.product_id]);
 
   useEffect(() => {
+    if (!user?.id) {
+      hasLoadedChatsOnceRef.current = false;
+    }
+  }, [user?.id]);
+
+  useEffect(() => {
     fetchChats();
 
     // Subscribe to real-time messages to update chat list
@@ -270,11 +277,12 @@ export default function MessagesPage() {
 
   const fetchChats = async () => {
     try {
-      setLoading(true);
+      if (!hasLoadedChatsOnceRef.current) setLoading(true);
       const { data: { user: authUser } } = await supabase.auth.getUser();
       
       if (!authUser) {
         setLoading(false);
+        hasLoadedChatsOnceRef.current = true;
         return;
       }
 
@@ -404,6 +412,7 @@ export default function MessagesPage() {
       if (contactIds.size === 0) {
         setChats([]);
         setLoading(false);
+        hasLoadedChatsOnceRef.current = true;
         return;
       }
 
@@ -494,6 +503,7 @@ export default function MessagesPage() {
       console.error('Error fetching chats:', err);
     } finally {
       setLoading(false);
+      hasLoadedChatsOnceRef.current = true;
     }
   };
 

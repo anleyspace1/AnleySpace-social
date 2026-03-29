@@ -35,12 +35,21 @@ import { useNavigate, useSearchParams, useLocation } from 'react-router-dom';
 import { cn } from '../lib/utils';
 import { apiUrl } from '../lib/apiOrigin';
 import { fetchActiveStories, filterActiveStories } from '../lib/activeStories';
-import { MOCK_USER } from '../constants';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import ShareModal from '../components/ShareModal';
 import StoryEditor from '../components/StoryEditor';
 import { ResponsiveImage } from '../components/ResponsiveImage';
+import { isValidVideoUrl } from '../lib/videoUrl';
+import { FeedSkeleton } from '../components/LoadingSkeletons';
+import { useDeferredMount } from '../lib/useDeferredMount';
+import {
+  feedStoragePath,
+  resolveStorageExtension,
+  storageUploadContentType,
+  storiesStoragePath,
+} from '../lib/storageUpload';
+import { isPlaceholderUsername } from '../lib/realDataGuards';
 
 /** Home feed: white cards on #F5F6FA (see App layout when path is `/`). */
 const homeCard =
@@ -433,16 +442,13 @@ function Stories() {
       '';
 
     try {
-      const ext = file.name.includes('.')
-        ? file.name.split('.').pop()
-        : file.type.startsWith('video/')
-          ? 'mp4'
-          : 'jpg';
-      const safeName = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
-      const filePath = `stories/${user.id}/${safeName}`;
+      const ext = resolveStorageExtension(file);
+      const filePath = storiesStoragePath(user.id, ext);
 
       // Reuse the same upload flow used by working post upload.
-      const { error: uploadError } = await supabase.storage.from('posts').upload(filePath, file);
+      const { error: uploadError } = await supabase.storage.from('posts').upload(filePath, file, {
+        contentType: storageUploadContentType(file),
+      });
       if (uploadError) {
         if (uploadError.message.includes('Bucket not found')) {
           throw new Error('Storage bucket "posts" not found. Create a public "posts" bucket in Supabase.');
@@ -926,7 +932,11 @@ function CreatePost({ onGoLive, onPostCreated }: { onGoLive: () => void; onPostC
       <div className={cn(homeCard, 'p-5')}>
         <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 mb-4">
           <div className="flex items-center gap-3 flex-1">
-            <img src={profile?.avatar_url || MOCK_USER.avatar} alt="" className="w-10 h-10 rounded-full object-cover flex-shrink-0" referrerPolicy="no-referrer" />
+            {profile?.avatar_url ? (
+            <img src={profile.avatar_url} alt="" className="w-10 h-10 rounded-full object-cover flex-shrink-0" referrerPolicy="no-referrer" />
+            ) : (
+              <div className="w-10 h-10 rounded-full bg-gray-200 flex-shrink-0" aria-hidden />
+            )}
             <button
               onClick={() => setIsModalOpen(true)}
               className="flex-1 bg-gray-50 border border-gray-100 text-gray-500 text-left px-4 py-2.5 rounded-xl hover:bg-gray-100 transition text-sm truncate"
@@ -1019,10 +1029,11 @@ function CreatePostModal({
     }
     setUploading(kind);
     try {
-      const ext = file.name.includes('.') ? file.name.split('.').pop() : kind === 'image' ? 'jpg' : 'mp4';
-      const safeName = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
-      const filePath = `feed/${user.id}/${safeName}`;
-      const { error: uploadError } = await supabase.storage.from('posts').upload(filePath, file);
+      const ext = resolveStorageExtension(file);
+      const filePath = feedStoragePath(user.id, ext);
+      const { error: uploadError } = await supabase.storage.from('posts').upload(filePath, file, {
+        contentType: storageUploadContentType(file),
+      });
       if (uploadError) {
         if (uploadError.message.includes('Bucket not found')) {
           throw new Error('Storage bucket "posts" not found. Create a public "posts" bucket in Supabase.');
@@ -1307,9 +1318,11 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
   const [suggestedReels, setSuggestedReels] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [userStoriesMap, setUserStoriesMap] = useState<Record<string, any[]>>({});
+  const postsRef = useRef(posts);
+  postsRef.current = posts;
 
   const fetchPosts = async () => {
-    setLoading(true);
+    if (postsRef.current.length === 0) setLoading(true);
     try {
       const { data: postsData, error: postsError } = await supabase
         .from('posts')
@@ -1356,10 +1369,12 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
       let commentsMergeOk = false;
 
       if (postIds.length > 0) {
-        const { data: likeRows, error: likesAggErr } = await supabase
-          .from('likes')
-          .select('post_id')
-          .in('post_id', postIds);
+        const [likesRes, commentsRes] = await Promise.all([
+          supabase.from('likes').select('post_id').in('post_id', postIds),
+          supabase.from('comments').select('post_id').in('post_id', postIds),
+        ]);
+        const { data: likeRows, error: likesAggErr } = likesRes;
+        const { data: commentRows, error: commentsAggErr } = commentsRes;
         if (likesAggErr) {
           console.error('Error loading likes for feed merge:', likesAggErr);
         } else {
@@ -1368,11 +1383,6 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
             likesByPost[row.post_id] = (likesByPost[row.post_id] || 0) + 1;
           });
         }
-
-        const { data: commentRows, error: commentsAggErr } = await supabase
-          .from('comments')
-          .select('post_id')
-          .in('post_id', postIds);
         if (commentsAggErr) {
           console.error('Error loading comments for feed merge:', commentsAggErr);
         } else {
@@ -1383,23 +1393,31 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
         }
       }
 
-      const mappedPosts = basePosts.map((post: any) => {
-        const prof = post.user_id ? profilesById[post.user_id] : null;
-        const likes_count = likesMergeOk
-          ? likesByPost[post.id] ?? 0
-          : post.likes_count ?? 0;
-        const comments_count = commentsMergeOk
-          ? commentsByPost[post.id] ?? 0
-          : post.comments_count ?? 0;
-        return {
-          ...post,
-          likes_count,
-          comments_count,
-          profiles: prof || null,
-          username: prof?.username || null,
-          avatar_url: prof?.avatar_url || null,
-        };
-      });
+      const mappedPosts = basePosts
+        .map((post: any) => {
+          const prof = post.user_id ? profilesById[post.user_id] : null;
+          const likes_count = likesMergeOk
+            ? likesByPost[post.id] ?? 0
+            : post.likes_count ?? 0;
+          const comments_count = commentsMergeOk
+            ? commentsByPost[post.id] ?? 0
+            : post.comments_count ?? 0;
+          return {
+            ...post,
+            likes_count,
+            comments_count,
+            profiles: prof || null,
+            username: prof?.username || null,
+            avatar_url: prof?.avatar_url || null,
+          };
+        })
+        .filter((post: any) => {
+          const uid = String(post.user_id ?? '').trim();
+          if (!uid) return false;
+          const u = String(post.username ?? '').trim();
+          if (!u || isPlaceholderUsername(u)) return false;
+          return true;
+        });
 
       setPosts(mappedPosts);
     } catch (err) {
@@ -1416,6 +1434,7 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
   }, [refreshKey, user?.id]);
 
   useEffect(() => {
+    if (loading) return;
     const fetchSuggestedReels = async () => {
       try {
         const { data: reelRows, error } = await supabase
@@ -1437,24 +1456,41 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
           profileMap = Object.fromEntries((profRows || []).map((p: any) => [String(p.id), p]));
         }
         setSuggestedReels(
-          rows.map((r: any) => ({
-            id: String(r.id),
-            video_url: String(r.video_url || ''),
-            image_url: r.image_url || null,
-            caption: String(r.content || ''),
-            username: profileMap[String(r.user_id)]?.username || 'User',
-            avatar_url:
-              profileMap[String(r.user_id)]?.avatar_url ||
-              `https://picsum.photos/seed/reel-${String(r.user_id || r.id)}/100/100`,
-          }))
+          rows
+            .map((r: any) => {
+              const uname = String(profileMap[String(r.user_id)]?.username ?? '').trim();
+              if (!r.user_id || !uname || isPlaceholderUsername(uname)) return null;
+              return {
+                id: String(r.id),
+                video_url: String(r.video_url || ''),
+                image_url: r.image_url || null,
+                caption: String(r.content || ''),
+                username: uname,
+                avatar_url: profileMap[String(r.user_id)]?.avatar_url || '',
+              };
+            })
+            .filter((row): row is NonNullable<typeof row> => row !== null)
         );
       } catch (err) {
         console.error('[Home] fetchSuggestedReels failed:', err);
         setSuggestedReels([]);
       }
     };
-    void fetchSuggestedReels();
-  }, [refreshKey, user?.id]);
+    let idleId: number | undefined;
+    const t = window.setTimeout(() => {
+      if (typeof window.requestIdleCallback !== 'undefined') {
+        idleId = window.requestIdleCallback(() => void fetchSuggestedReels(), { timeout: 2000 });
+      } else {
+        void fetchSuggestedReels();
+      }
+    }, 0);
+    return () => {
+      window.clearTimeout(t);
+      if (idleId !== undefined && typeof window.cancelIdleCallback !== 'undefined') {
+        window.cancelIdleCallback(idleId);
+      }
+    };
+  }, [loading, refreshKey, user?.id]);
 
   // Subscribe to real-time updates once
   useEffect(() => {
@@ -1501,19 +1537,13 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
     }
   };
 
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center py-12">
-        <div className="w-8 h-8 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
-      </div>
-    );
-  }
-
   const filteredPosts = posts;
 
   return (
     <div className="space-y-6 pb-4">
-      {filteredPosts.length > 0 ? (
+      {loading && filteredPosts.length === 0 ? (
+        <FeedSkeleton />
+      ) : filteredPosts.length > 0 ? (
         filteredPosts.map((post, index) => (
           <React.Fragment key={post.id}>
             <PostItem
@@ -1608,29 +1638,48 @@ function SuggestedReelsStrip({
           className="overflow-x-auto overscroll-x-contain [-webkit-overflow-scrolling:touch] touch-pan-x no-scrollbar"
         >
           <div className="flex gap-3 min-w-max">
-            {reels.map((reel, idx) => (
+            {reels.map((reel, idx) => {
+              const reelUrl = String(reel.video_url ?? '').trim();
+              console.log("VIDEO URL:", reelUrl);
+              const reelPlayable = isValidVideoUrl(reelUrl);
+              const reelPoster =
+                typeof reel.image_url === 'string' ? reel.image_url.trim() : '';
+              const showPoster = reelPoster && isValidVideoUrl(reelPoster);
+              return (
               <button
                 key={reel.id}
                 type="button"
                 onClick={() => onOpenReel(reel)}
                 className="group relative w-[170px] sm:w-[190px] aspect-[9/16] rounded-2xl overflow-hidden bg-black border border-gray-200 shrink-0 text-left"
               >
-                <video
-                  src={reel.video_url}
-                  muted
-                  autoPlay
-                  loop
-                  playsInline
-                  preload={idx < 3 ? 'metadata' : 'none'}
-                  className="w-full h-full object-cover pointer-events-none"
-                />
+                {reelPlayable ? (
+                  <video
+                    src={reelUrl}
+                    muted
+                    autoPlay
+                    loop
+                    playsInline
+                    preload={idx < 3 ? 'metadata' : 'none'}
+                    className="w-full h-full object-cover pointer-events-none"
+                  />
+                ) : showPoster ? (
+                  <img
+                    src={reelPoster}
+                    alt=""
+                    className="w-full h-full object-cover pointer-events-none"
+                    referrerPolicy="no-referrer"
+                  />
+                ) : (
+                  <div className="absolute inset-0 bg-gradient-to-br from-zinc-900 to-black pointer-events-none" aria-hidden />
+                )}
                 <div className="absolute inset-0 bg-gradient-to-t from-black/75 via-black/10 to-transparent pointer-events-none" />
                 <div className="absolute left-2 right-2 bottom-2 pointer-events-none">
                   <p className="text-white text-[10px] font-black truncate">@{reel.username || 'User'}</p>
                   <p className="text-white/80 text-[10px] truncate">{reel.caption || 'Watch now'}</p>
                 </div>
               </button>
-            ))}
+            );
+            })}
           </div>
         </div>
         {canScrollLeft && (
@@ -1727,8 +1776,9 @@ function PostItem({
   /** Latest handleLike for double-tap (avoids stale closure + duplicate triggers). */
   const handleLikeRef = useRef<() => Promise<void>>(async () => {});
 
-  // Track if post video is visible
-  const [videoVisible, setVideoVisible] = useState(false);
+  /** Feed video: on error, fall back to thumbnail-only */
+  const [feedVideoError, setFeedVideoError] = useState(false);
+  const [isReady, setIsReady] = useState(false);
 
   /** null = not loaded yet; portrait = tall → no crop; landscape/square → cover + max-height */
   const [feedImageMode, setFeedImageMode] = useState<'portrait' | 'landscape' | null>(null);
@@ -1741,20 +1791,44 @@ function PostItem({
     ? post.profiles[0]
     : post.profiles;
 
-  const displayUsername = postProfile?.username || post.username || (post.user_id ? `user_${String(post.user_id).slice(0, 6)}` : 'User');
-  const displayAvatar =
-    postProfile?.avatar_url ||
-    post.avatar_url ||
-    `https://picsum.photos/seed/${post.user_id}/100/100`;
+  const displayUsername = postProfile?.username || post.username || '';
+  const displayAvatar = postProfile?.avatar_url || post.avatar_url || '';
 
   const imageUrl =
     typeof post.image_url === 'string' ? post.image_url.trim() : post.image_url;
   const videoUrl =
     typeof post.video_url === 'string' ? post.video_url.trim() : post.video_url;
 
+  console.log("VIDEO URL:", post.video_url);
+  const canPlayVideo =
+    typeof videoUrl === 'string' &&
+    videoUrl.length > 0 &&
+    isValidVideoUrl(videoUrl);
+
+  /** poster ≈ video.thumbnail || "/fallback.jpg": real HTTP(S) images only; never video_url or #t=0.1 */
+  const videoThumb = String((post as { thumbnail?: string | null }).thumbnail ?? '').trim();
+  const rawPreview = typeof imageUrl === 'string' ? imageUrl.trim() : '';
+  const videoUrlNorm = typeof videoUrl === 'string' ? videoUrl.trim() : '';
+  const imagePreview =
+    rawPreview.startsWith('http') && rawPreview !== videoUrlNorm ? rawPreview : '';
+  const feedPosterResolved =
+    videoThumb.startsWith('http') ? videoThumb : imagePreview || '';
+  /** <video> poster: real image first, else first-frame hint (autoplay preview / no black flash) */
+  const posterForVideo =
+    typeof imageUrl === 'string' && imageUrl.trim().startsWith('http')
+      ? imageUrl.trim()
+      : typeof videoUrl === 'string' && videoUrl.length > 0
+        ? `${videoUrl}#t=0.1`
+        : feedPosterResolved;
+
   useEffect(() => {
     setFeedImageMode(null);
   }, [imageUrl]);
+
+  useEffect(() => {
+    setFeedVideoError(false);
+    setIsReady(false);
+  }, [post.id, videoUrl]);
 
   useEffect(() => {
     const mq = window.matchMedia('(pointer: coarse)');
@@ -1765,10 +1839,14 @@ function PostItem({
   }, []);
 
   useEffect(() => {
-    if (isTouchDevice && videoRef.current) {
-      videoRef.current.muted = isMuted;
+    const el = videoRef.current;
+    if (!el) return;
+    if (isTouchDevice) {
+      el.muted = isMuted;
+    } else {
+      el.muted = true;
     }
-  }, [isMuted, isTouchDevice]);
+  }, [isMuted, isTouchDevice, isReady]);
 
   const postUser = {
     name: displayUsername,
@@ -1812,22 +1890,17 @@ function PostItem({
     setTimeout(() => setShowHeart(false), 800);
   }, [isLiked]);
 
-  // Intersection observer for video autoplay (desktop/mobile)
+  // Feed video: play when mostly visible, pause when scrolled away (muted autoplay policy)
   useEffect(() => {
-    if (!videoRef.current || !videoUrl) return;
+    if (!videoRef.current || !canPlayVideo || feedVideoError) return;
     const node = videoRef.current;
-    let pausedByObserver = false;
 
     const handler = (entries: IntersectionObserverEntry[]) => {
       const entry = entries[0];
       if (entry.isIntersecting) {
-        setVideoVisible(true);
-        node.play().catch(() => {}); // suppress
-        pausedByObserver = false;
+        void node.play().catch(() => {});
       } else {
-        setVideoVisible(false);
         node.pause();
-        pausedByObserver = true;
       }
     };
 
@@ -1838,9 +1911,17 @@ function PostItem({
     observer.observe(node);
     return () => {
       observer.disconnect();
-      if (pausedByObserver) node.pause();
     };
-  }, [videoUrl, videoRef]);
+  }, [canPlayVideo, feedVideoError, videoUrl, videoRef]);
+
+  // Kick off autoplay after mount / src change (ref may attach next frame; muted comes from <video muted> + touch sync)
+  useEffect(() => {
+    if (!canPlayVideo || feedVideoError) return;
+    const id = requestAnimationFrame(() => {
+      void videoRef.current?.play().catch(() => {});
+    });
+    return () => cancelAnimationFrame(id);
+  }, [canPlayVideo, feedVideoError, videoUrl, post.id]);
 
   // Keep like/saved/counts sync separate from comments toggle — re-running checkIfLiked when
   // opening comments used to overwrite optimistic isLiked when RLS blocked anon reads.
@@ -1968,7 +2049,7 @@ function PostItem({
         id: c.id,
         user: resolveProfileUsername(profilesMap[c.user_id]?.username),
         text: c.content,
-        avatar: profilesMap[c.user_id]?.avatar_url || `https://picsum.photos/seed/${c.user_id}/100/100`,
+        avatar: profilesMap[c.user_id]?.avatar_url || '',
         time: new Date(c.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       }));
 
@@ -2174,7 +2255,7 @@ function PostItem({
         id: data.id,
         user: resolveProfileUsername(profile?.username),
         text: data.content,
-        avatar: profile?.avatar_url || `https://picsum.photos/seed/${data.user_id}/100/100`,
+        avatar: profile?.avatar_url || '',
         time: 'now',
       };
 
@@ -2442,12 +2523,18 @@ function PostItem({
             }
             tabIndex={0}
           >
+            {postUser.avatar ? (
             <img
               src={postUser.avatar}
               alt=""
               className="w-full h-full object-cover"
               referrerPolicy="no-referrer"
             />
+            ) : (
+              <div className="w-full h-full bg-gray-200 flex items-center justify-center text-xs font-bold text-gray-600">
+                {(postUser.name || '?').charAt(0).toUpperCase()}
+              </div>
+            )}
           </button>
           <div>
             {/* USERNAME NAVIGATION */}
@@ -2502,12 +2589,19 @@ function PostItem({
         )}
       </div>
 
-      {(videoUrl || imageUrl) && (
+      {(canPlayVideo || imageUrl) && (
         <div className="px-0 relative">
-          {videoUrl ? (
-            // Same pattern as Explore "Live Now" / Trending cards: outer div is the tap target (onClick on wrapper), not the media element.
+          {canPlayVideo ? (
+            // Tap target on wrapper; feed video: contain (full frame visible), poster first to avoid black flash
             <div
-              className="relative overflow-hidden bg-black border border-gray-100 rounded-xl w-full max-h-[500px] flex items-center justify-center group cursor-pointer touch-manipulation"
+              className="group relative w-full cursor-pointer touch-manipulation overflow-hidden rounded-xl bg-black bg-cover bg-center"
+              style={
+                feedPosterResolved
+                  ? {
+                      backgroundImage: `url(${JSON.stringify(feedPosterResolved)})`,
+                    }
+                  : undefined
+              }
               onClick={(e) => {
                 doubleTapHandlers.onClick?.(e);
                 if (e.detail === 1) {
@@ -2518,53 +2612,67 @@ function PostItem({
               }}
               onTouchStart={doubleTapHandlers.onTouchStart}
             >
-              <div className="relative w-full flex items-center justify-center select-none">
-                <video
-                  ref={videoRef}
-                  src={videoUrl}
-                  poster={imageUrl || `${videoUrl}#t=0.1`}
-                  controls={!isTouchDevice}
-                  autoPlay
-                  muted={isTouchDevice ? isMuted : undefined}
-                  defaultMuted
-                  loop
-                  playsInline
-                  preload="metadata"
-                  className="w-full h-auto object-contain max-h-[500px] pointer-events-none md:pointer-fine:pointer-events-auto [will-change:transform]"
-                  style={
-                    isTouchDevice
-                      ? {
-                          width: '100%',
-                          height: '100%',
-                          objectFit: 'cover',
-                          backgroundColor: '#000',
-                        }
-                      : { cursor: 'pointer' }
-                  }
-                />
-                {isTouchDevice && (
-                  <div
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setIsMuted((prev) => !prev);
+              {feedVideoError ? (
+                <div className="flex w-full justify-center bg-black/80">
+                  {feedPosterResolved ? (
+                  <img
+                    src={feedPosterResolved}
+                    alt=""
+                    className="max-h-[500px] w-full object-contain bg-transparent"
+                  />
+                  ) : (
+                    <div className="w-full min-h-[200px] flex items-center justify-center text-white/60 text-sm">
+                      Video unavailable
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="relative flex w-full justify-center bg-transparent">
+                  <video
+                    ref={videoRef}
+                    src={videoUrl}
+                    poster={posterForVideo}
+                    controls
+                    autoPlay
+                    muted
+                    playsInline
+                    loop
+                    preload="metadata"
+                    className={cn(
+                      'relative z-[1] max-h-[500px] w-full bg-transparent object-contain pointer-events-none transition-opacity duration-300 md:pointer-events-auto',
+                      isReady ? 'opacity-100' : 'opacity-0'
+                    )}
+                    style={isTouchDevice ? undefined : { cursor: 'pointer' }}
+                    onLoadedData={() => {
+                      setIsReady(true);
+                      void videoRef.current?.play().catch(() => {});
                     }}
-                    style={{
-                      position: 'absolute',
-                      bottom: '80px',
-                      right: '16px',
-                      zIndex: 20,
-                      background: 'rgba(0,0,0,0.4)',
-                      borderRadius: '50%',
-                      padding: '8px',
-                    }}
-                  >
-                    {isMuted ? '🔇' : '🔊'}
-                  </div>
-                )}
-                <HeartOverlay show={showHeart} />
-              </div>
+                    onError={() => setFeedVideoError(true)}
+                  />
+                </div>
+              )}
+              {isTouchDevice && !feedVideoError && (
+                <div
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setIsMuted((prev) => !prev);
+                  }}
+                  style={{
+                    position: 'absolute',
+                    bottom: '80px',
+                    right: '16px',
+                    zIndex: 20,
+                    background: 'rgba(0,0,0,0.4)',
+                    borderRadius: '50%',
+                    padding: '8px',
+                  }}
+                >
+                  {isMuted ? '🔇' : '🔊'}
+                </div>
+              )}
+              <HeartOverlay show={showHeart} />
             </div>
-          ) : (
+          ) : imageUrl ? (
             <div className="relative overflow-hidden bg-gray-100 border border-gray-100 rounded-xl w-full">
               <div
                 className={cn(
@@ -2587,7 +2695,7 @@ function PostItem({
                 <HeartOverlay show={showHeart} />
               </div>
             </div>
-          )}
+          ) : null}
         </div>
       )}
 
@@ -2661,7 +2769,11 @@ function PostItem({
                   ) : comments.length > 0 ? (
                     comments.map((comment) => (
                       <div key={comment.id} className="flex gap-3">
+                        {comment.avatar ? (
                         <ResponsiveImage src={comment.avatar} alt="" width={40} height={40} className="w-8 h-8 rounded-full object-cover" />
+                        ) : (
+                          <div className="w-8 h-8 rounded-full bg-gray-200 shrink-0" aria-hidden />
+                        )}
                         <div className="flex-1 bg-gray-50 border border-gray-100 p-3 rounded-xl">
                           <div className="flex items-center justify-between mb-1">
                             <span className="font-bold text-xs text-gray-900">@{comment.user}</span>
@@ -2677,7 +2789,11 @@ function PostItem({
                 </div>
 
                 <form onSubmit={handleAddComment} className="flex items-center gap-2 bg-gray-50 border border-gray-100 rounded-xl p-1.5">
-                  <ResponsiveImage src={profile?.avatar_url || MOCK_USER.avatar} alt="" width={40} height={40} className="w-7 h-7 rounded-full object-cover ml-1" />
+                  {profile?.avatar_url ? (
+                  <ResponsiveImage src={profile.avatar_url} alt="" width={40} height={40} className="w-7 h-7 rounded-full object-cover ml-1" />
+                  ) : (
+                    <div className="w-7 h-7 rounded-full bg-gray-200 ml-1 shrink-0" aria-hidden />
+                  )}
                   <input
                     type="text"
                     value={newComment}
@@ -2864,7 +2980,8 @@ function PeopleYouMayKnow() {
   const { user } = useAuth();
   const [following, setFollowing] = useState<Record<string, boolean>>({});
   const [people, setPeople] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const sidebarDeferred = useDeferredMount(500);
 
   useEffect(() => {
     if (!user) {
@@ -2873,6 +2990,7 @@ function PeopleYouMayKnow() {
       setLoading(false);
       return;
     }
+    if (!sidebarDeferred) return;
 
     let cancelled = false;
 
@@ -2942,26 +3060,7 @@ function PeopleYouMayKnow() {
           .slice(0, limit);
 
         if (pick.length === 0) {
-          pick = [
-            {
-              id: '__pymk_fb_1__',
-              username: 'dance_queen',
-              avatar_url: 'https://picsum.photos/seed/pymkfb1/100/100',
-              _fallback: true,
-            },
-            {
-              id: '__pymk_fb_2__',
-              username: 'nature_lover',
-              avatar_url: 'https://picsum.photos/seed/pymkfb2/100/100',
-              _fallback: true,
-            },
-            {
-              id: '__pymk_fb_3__',
-              username: 'tech_guru',
-              avatar_url: 'https://picsum.photos/seed/pymkfb3/100/100',
-              _fallback: true,
-            },
-          ];
+          pick = [];
         }
 
         if (cancelled) return;
@@ -2986,7 +3085,7 @@ function PeopleYouMayKnow() {
     return () => {
       cancelled = true;
     };
-  }, [user]);
+  }, [user, sidebarDeferred]);
 
   const openProfileOrExplore = (person: { id: string; _fallback?: boolean }) => {
     if (person._fallback) {
@@ -3029,7 +3128,7 @@ function PeopleYouMayKnow() {
 
   if (!user) return null;
 
-  if (loading) {
+  if (!sidebarDeferred || loading) {
     return (
       <div className={cardClass}>
         <h3 className={cn('font-bold text-sm mb-4', isHomeFeed ? 'text-gray-900' : 'text-white')}>
@@ -3082,12 +3181,18 @@ function PeopleYouMayKnow() {
                     isHomeFeed ? 'border border-gray-200' : 'border border-gray-100 dark:border-gray-800'
                   )}
                 >
+                  {person.avatar_url ? (
                   <img
-                    src={person.avatar_url || `https://picsum.photos/seed/${person.id}/100/100`}
+                    src={person.avatar_url}
                     alt=""
                     className="h-full w-full object-cover"
                     referrerPolicy="no-referrer"
                   />
+                  ) : (
+                    <div className="h-full w-full bg-gray-200 flex items-center justify-center text-xs font-bold text-gray-600">
+                      {(person.username || '?').charAt(0).toUpperCase()}
+                    </div>
+                  )}
                 </button>
                 <button
                   type="button"
@@ -3170,9 +3275,11 @@ function TrendingSection() {
   const location = useLocation();
   const isHomeFeed = location.pathname === '/';
   const [trendRows, setTrendRows] = useState<{ tag: string; count: number }[]>([]);
-  const [loadingTrends, setLoadingTrends] = useState(true);
+  const [loadingTrends, setLoadingTrends] = useState(false);
+  const sidebarDeferred = useDeferredMount(600);
 
   useEffect(() => {
+    if (!sidebarDeferred) return;
     let cancelled = false;
     (async () => {
       setLoadingTrends(true);
@@ -3236,12 +3343,12 @@ function TrendingSection() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [sidebarDeferred]);
 
   return (
     <div className={cn(isHomeFeed ? homeCard : exploreGlassCard, 'p-5')}>
       <h3 className={cn('font-bold text-sm mb-4', isHomeFeed ? 'text-gray-900' : 'text-white')}>Trending</h3>
-      {loadingTrends ? (
+      {!sidebarDeferred || loadingTrends ? (
         <p className={cn('text-xs', isHomeFeed ? 'text-gray-500' : 'text-gray-400')}>Loading…</p>
       ) : trendRows.length === 0 ? (
         <p className={cn('text-xs', isHomeFeed ? 'text-gray-500' : 'text-gray-400')}>
@@ -3273,10 +3380,7 @@ function SuggestedGroups() {
   const location = useLocation();
   const [joined, setJoined] = useState<Record<string, boolean>>({});
 
-  const groups = [
-    { id: 'g1', name: 'Photographers', icon: '📸', image: 'https://picsum.photos/seed/photo/400/200' },
-    { id: 'g2', name: 'Travelers', icon: '✈️', image: 'https://picsum.photos/seed/travel/400/200' },
-  ];
+  const groups: { id: string; name: string; icon: string }[] = [];
 
   const handleJoin = (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
@@ -3284,6 +3388,15 @@ function SuggestedGroups() {
   };
 
   const isHomeFeed = location.pathname === '/';
+
+  if (!groups.length) {
+    return (
+      <div className={cn(isHomeFeed ? homeCard : exploreGlassCard, 'p-5')}>
+        <h3 className={cn('font-bold text-sm mb-2', isHomeFeed ? 'text-gray-900' : 'text-white')}>Suggested Groups</h3>
+        <p className={cn('text-xs', isHomeFeed ? 'text-gray-500' : 'text-white/60')}>No groups to show yet.</p>
+      </div>
+    );
+  }
 
   return (
     <div className={cn(isHomeFeed ? homeCard : exploreGlassCard, 'p-5')}>
@@ -3332,14 +3445,16 @@ function SuggestedForYou() {
   const location = useLocation();
   const isHomeFeed = location.pathname === '/';
 
-  const items = [
-    { id: 'sfy-food', label: 'Foodie', image: 'https://picsum.photos/seed/sfyfood/400/520', tag: 'Foodie' },
-    { id: 'sfy-nature', label: 'Nature', image: 'https://picsum.photos/seed/sfynature/400/520', tag: 'Nature' },
-    { id: 'sfy-fitness', label: 'Fitness', image: 'https://picsum.photos/seed/sfyfit/400/520', tag: 'Fitness' },
-    { id: 'sfy-fashion', label: 'Fashion', image: 'https://picsum.photos/seed/sfyfash/400/520', tag: 'Fashion' },
-    { id: 'sfy-tech', label: 'Tech', image: 'https://picsum.photos/seed/sfytech/400/520', tag: 'TechNews' },
-    { id: 'sfy-music', label: 'Music', image: 'https://picsum.photos/seed/sfymusic/400/520', tag: 'Music' },
-  ];
+  const items: { id: string; label: string; image: string; tag: string }[] = [];
+
+  if (!items.length) {
+    return (
+      <div className={cn(isHomeFeed ? homeCard : exploreGlassCard, 'p-5')}>
+        <h3 className={cn('font-bold text-sm mb-2', isHomeFeed ? 'text-gray-900' : 'text-white')}>Suggested for you</h3>
+        <p className={cn('text-xs', isHomeFeed ? 'text-gray-500' : 'text-white/60')}>No suggestions yet.</p>
+      </div>
+    );
+  }
 
   return (
     <div className={cn(isHomeFeed ? homeCard : exploreGlassCard, 'p-5')}>

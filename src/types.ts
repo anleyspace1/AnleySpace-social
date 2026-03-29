@@ -37,6 +37,10 @@ export type Product = {
   price: number;
   location: string;
   image: string;
+  /** Optional extra gallery URLs when provided by API / DB (e.g. JSON array). */
+  images?: string[];
+  /** Some APIs use this alias for multiple images. */
+  image_urls?: string[];
   category: string;
   seller: Partial<User>;
   stock?: number;

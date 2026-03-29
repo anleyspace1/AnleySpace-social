@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { motion } from 'motion/react';
 import { 
@@ -28,10 +28,42 @@ import { BOOST_OPTIONS, boostMarketplaceProduct } from '../lib/marketplaceBoost'
 import { BOOST_COST, fetchOrCreateWalletBalance } from '../lib/marketplaceCoins';
 import { isMarketplaceEffectivelyFeatured } from '../lib/marketplaceFeatured';
 import { incrementMarketplaceView } from '../lib/incrementMarketplaceView';
+import { isPlaceholderUsername } from '../lib/realDataGuards';
 import { toggleMarketplaceLike } from '../lib/toggleMarketplaceLike';
-import { supabase } from '../lib/supabase';
-import { MOCK_USER } from '../constants';
+import { isSupabaseConfigured, supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
+import { ProductDetailSkeleton } from '../components/LoadingSkeletons';
+
+function parseProductImagesField(value: any): string[] {
+  if (!value) return [];
+
+  if (Array.isArray(value)) return value;
+
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+
+  return [];
+}
+
+function resolveProductGalleryThumbUrls(product: any): string[] {
+  if (!product) return [];
+
+  const images = [
+    ...parseProductImagesField(product.images),
+    ...parseProductImagesField(product.image_urls),
+    product.image,
+  ].filter(Boolean);
+
+  const unique = Array.from(new Set(images));
+
+  return unique.slice(0, 4);
+}
 
 export default function ProductDetailPage() {
   const { id } = useParams();
@@ -158,6 +190,10 @@ export default function ProductDetailPage() {
       });
   }, [product, id]);
 
+  const galleryThumbUrls = useMemo(() => {
+    return resolveProductGalleryThumbUrls(product);
+  }, [product]);
+
   const fetchProduct = async () => {
     try {
       const res = await fetch(apiUrl(`/api/marketplace/products/${id}`));
@@ -182,11 +218,13 @@ export default function ProductDetailPage() {
         return;
       }
       const sellerId = String((data as { seller_id?: string }).seller_id ?? '').trim();
+      const rawSellerName = String((data as { seller_username?: string }).seller_username ?? '').trim();
+      const sellerName = isPlaceholderUsername(rawSellerName) ? '' : rawSellerName;
       setProduct({
         ...(data as Product),
         user_id: sellerId || (data as { user_id?: string }).user_id,
         seller: {
-          username: (data.seller_username as string) || 'seller',
+          username: sellerName,
           ...(sellerId ? { id: sellerId } : {}),
         },
       } as Product);
@@ -195,11 +233,13 @@ export default function ProductDetailPage() {
       const direct = id ? await fetchSingleProductAsApiShape(id) : null;
       if (direct && !(direct as { error?: string }).error) {
         const sid = String((direct as { seller_id?: string }).seller_id ?? '').trim();
+        const rawName = String((direct as { seller_username?: string }).seller_username ?? '').trim();
+        const sellerName = isPlaceholderUsername(rawName) ? '' : rawName;
         setProduct({
           ...(direct as Product),
           user_id: sid || (direct as { user_id?: string }).user_id,
           seller: {
-            username: (direct.seller_username as string) || 'seller',
+            username: sellerName,
             ...(sid ? { id: sid } : {}),
           },
         } as Product);
@@ -213,6 +253,10 @@ export default function ProductDetailPage() {
 
   const fetchRelatedProducts = async () => {
     try {
+      let list: Record<string, unknown>[] = [];
+      if (isSupabaseConfigured) {
+        list = await fetchMarketplaceTableRowsAsApiProducts();
+      } else {
       const res = await fetch(apiUrl('/api/marketplace/products'));
       const ct = res.headers.get('content-type') || '';
       let payload: unknown;
@@ -224,12 +268,12 @@ export default function ProductDetailPage() {
         payload = null;
       }
       console.log('marketplace data:', payload);
-      let list: Record<string, unknown>[] = [];
       if (res.ok && Array.isArray(payload)) {
         list = payload as Record<string, unknown>[];
       }
       if (!list.length) {
         list = await fetchMarketplaceTableRowsAsApiProducts();
+      }
       }
       console.log('Marketplace rows (related list length):', list.length);
       const products = mapMarketplaceRowsToProducts(list);
@@ -321,12 +365,19 @@ export default function ProductDetailPage() {
     });
   };
 
+  const handleGoToSellerProfile = () => {
+    if (!product) return;
+
+    const p = product as Product & { username?: string; user?: { username?: string } };
+    const username = p.username || p.user?.username || p.seller?.username;
+
+    if (!username) return;
+
+    navigate(`/profile/${username}`);
+  };
+
   if (loading) {
-    return (
-      <div className="flex items-center justify-center min-h-[60vh]">
-        <div className="w-12 h-12 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin" />
-      </div>
-    );
+    return <ProductDetailSkeleton />;
   }
 
   if (!product) {
@@ -343,7 +394,7 @@ export default function ProductDetailPage() {
     );
   }
 
-  const mainImageUrl = productImagePublicUrl(product.image) || `https://picsum.photos/seed/${product.id}/800/800`;
+  const mainImageUrl = productImagePublicUrl(product.image);
 
   return (
     <motion.div 
@@ -363,11 +414,17 @@ export default function ProductDetailPage() {
         {/* Images Section */}
         <div className="lg:col-span-7 space-y-4">
           <div className="aspect-square rounded-[2.5rem] overflow-hidden bg-gray-100 dark:bg-gray-900 border border-gray-100 dark:border-gray-800 shadow-xl relative group">
+            {mainImageUrl ? (
             <img 
               src={mainImageUrl} 
               alt={product.title} 
               className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-700" 
             />
+            ) : (
+              <div className="w-full h-full flex items-center justify-center text-sm text-gray-500 px-6 text-center">
+                No product image
+              </div>
+            )}
             <div className="absolute top-4 right-4 z-10 flex gap-2 items-center">
               <button
                 type="button"
@@ -420,13 +477,23 @@ export default function ProductDetailPage() {
               )}
             </div>
           </div>
-          <div className="grid grid-cols-4 gap-3">
-            {[...Array(4)].map((_, i) => (
-              <div key={i} className="aspect-square rounded-xl overflow-hidden bg-gray-100 dark:bg-gray-900 border border-gray-100 dark:border-gray-800 cursor-pointer hover:opacity-80 transition-opacity shadow-sm">
-                <img src={`https://picsum.photos/seed/prod${i}${product.id}/200/200`} alt="" className="w-full h-full object-cover" />
-              </div>
-            ))}
-          </div>
+          {galleryThumbUrls?.length > 0 && (
+            <div className="grid grid-cols-4 gap-3">
+              {galleryThumbUrls.map((src, index) => (
+                <div
+                  key={`${src}-${index}`}
+                  className="aspect-square rounded-xl overflow-hidden bg-gray-100 dark:bg-gray-900 border border-gray-100 dark:border-gray-800 cursor-pointer hover:opacity-80 transition-opacity shadow-sm"
+                >
+                  <img
+                    src={src}
+                    alt=""
+                    className="w-full h-full object-cover"
+                    referrerPolicy="no-referrer"
+                  />
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Product Info Section */}
@@ -536,7 +603,7 @@ export default function ProductDetailPage() {
             <div className="mb-6">
               <h4 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Description</h4>
               <p className="text-gray-600 dark:text-gray-400 leading-relaxed text-sm">
-                {product.description || "This is a premium item in excellent condition. Perfect for anyone looking for quality and value. Includes all original accessories and packaging."}
+                {product.description?.trim() ? product.description : 'No description provided.'}
               </p>
             </div>
 
@@ -575,14 +642,19 @@ export default function ProductDetailPage() {
               {/* Seller Card */}
               <div className="bg-white dark:bg-gray-900 rounded-2xl p-4 border border-gray-100 dark:border-gray-800 shadow-sm">
                 <div 
-                  onClick={() => navigate(`/profile/${product.seller.username}`)}
-                  className="flex items-center gap-3 mb-4 cursor-pointer group"
+                  onClick={product.seller?.username ? handleGoToSellerProfile : undefined}
+                  className={cn(
+                    'flex items-center gap-3 mb-4 group',
+                    product.seller?.username ? 'cursor-pointer' : 'cursor-default'
+                  )}
                 >
-                  <div className="w-12 h-12 rounded-full overflow-hidden border border-gray-100 dark:border-gray-800">
-                    <img src={`https://picsum.photos/seed/${product.seller.username}/100/100`} alt="" className="w-full h-full object-cover" />
+                  <div className="w-12 h-12 rounded-full overflow-hidden border border-gray-100 dark:border-gray-800 bg-gray-200 dark:bg-gray-700 flex items-center justify-center text-sm font-bold text-gray-600 dark:text-gray-300">
+                    {(product.seller?.username || '?').charAt(0).toUpperCase()}
                   </div>
                   <div>
-                    <h4 className="font-bold text-base group-hover:text-indigo-600 transition-colors">@{product.seller.username}</h4>
+                    <h4 className="font-bold text-base group-hover:text-indigo-600 transition-colors">
+                      {product.seller?.username ? `@${product.seller.username}` : 'Seller'}
+                    </h4>
                     <div className="flex items-center gap-0.5 text-yellow-500">
                       <Star size={12} className="fill-current" />
                       <Star size={12} className="fill-current" />
@@ -646,14 +718,22 @@ export default function ProductDetailPage() {
             </button>
           </div>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            {relatedProducts.map((p) => (
+            {relatedProducts.map((p) => {
+              const relImg = productImagePublicUrl(p.image);
+              return (
               <div 
                 key={p.id}
                 onClick={() => navigate(`/marketplace/product/${p.id}`)}
                 className="bg-white dark:bg-gray-900 rounded-2xl overflow-hidden border border-gray-100 dark:border-gray-800 shadow-sm cursor-pointer group"
               >
                 <div className="aspect-square overflow-hidden">
-                  <img src={productImagePublicUrl(p.image) || `https://picsum.photos/seed/${p.id}/400/400`} alt={p.title} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" />
+                  {relImg ? (
+                  <img src={relImg} alt={p.title} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" />
+                  ) : (
+                    <div className="w-full h-full bg-gray-200 dark:bg-gray-700 flex items-center justify-center text-[10px] text-gray-500 px-2 text-center">
+                      No image
+                    </div>
+                  )}
                 </div>
                 <div className="p-3">
                   <h4 className="font-bold text-sm truncate mb-1">{p.title}</h4>
@@ -663,7 +743,8 @@ export default function ProductDetailPage() {
                   </div>
                 </div>
               </div>
-            ))}
+            );
+            })}
           </div>
         </div>
       )}

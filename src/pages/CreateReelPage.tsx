@@ -20,11 +20,16 @@ import {
   Check,
   Plus
 } from 'lucide-react';
-import { MOCK_USER, MOCK_SOUNDS } from '../constants';
+import { MOCK_SOUNDS } from '../constants';
 import { cn } from '../lib/utils';
 import { supabase } from '../lib/supabase';
 import { apiUrl } from '../lib/apiOrigin';
 import { useAuth } from '../contexts/AuthContext';
+import {
+  feedStoragePath,
+  resolveStorageExtension,
+  storageUploadContentType,
+} from '../lib/storageUpload';
 
 export default function CreateReelPage() {
   const navigate = useNavigate();
@@ -129,6 +134,10 @@ export default function CreateReelPage() {
 
   const handleSubmit = async () => {
     if (!file) return;
+    if (!user?.id) {
+      alert('You must be logged in to upload a reel.');
+      return;
+    }
     setIsUploading(true);
 
     try {
@@ -159,7 +168,7 @@ export default function CreateReelPage() {
         throw uploadError;
       }
 
-      const uploadedPath = uploadData?.path || fileName;
+      const uploadedPath = uploadData?.path || filePath;
       const { data: { publicUrl } } = supabase.storage
         .from('posts')
         .getPublicUrl(uploadedPath);
@@ -173,7 +182,7 @@ export default function CreateReelPage() {
 
       // Save reel metadata to posts table (same stable path as Home posts).
       const insertPayload = {
-        user_id: user?.id || MOCK_USER.id,
+        user_id: user.id,
         content: caption || '',
         image_url: null,
         video_url: publicUrl,

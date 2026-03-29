@@ -34,16 +34,8 @@ import { useAuth } from '../contexts/AuthContext';
 import ShareModal from '../components/ShareModal';
 import StoryEditor from '../components/StoryEditor';
 import { ResponsiveImage } from '../components/ResponsiveImage';
-
-function isValidProfileVideoUrl(url: string | null | undefined): boolean {
-  const u = (url || '').trim();
-  if (!u) return false;
-  const lower = u.toLowerCase();
-  if (lower.includes('localhost') || lower.includes('127.0.0.1')) return false;
-  if (!u.startsWith('https://')) return false;
-  if (lower.includes('picsum.photos') || lower.includes('placehold')) return false;
-  return true;
-}
+import { isValidVideoUrl } from '../lib/videoUrl';
+import { ProfileHeaderSkeleton } from '../components/LoadingSkeletons';
 
 export default function ProfilePage() {
   const { id: profileIdParam } = useParams();
@@ -80,39 +72,48 @@ export default function ProfilePage() {
       }
 
       if (profileData) {
-        // Fetch extra data from local DB (counts, etc)
-        let localData = { followers_count: 0, following_count: 0, bio: profileData.bio };
-        try {
-          console.log(`DEBUG: Fetching local data for ${profileData.id}`);
-          const res = await fetch(apiUrl(`/api/user/${profileData.id}`));
-          if (!res.ok) {
-            console.error(`DEBUG: Local API error: ${res.status} ${res.statusText}`);
-          } else {
-            const data = await res.json();
-            console.log('DEBUG: Local data received:', data);
-            if (!data.error) {
-              localData = data;
-            }
-          }
-        } catch (e) {
-          console.error('DEBUG: Failed to fetch local user data:', e);
-        }
-
         const formattedProfile = {
           id: profileData.id,
           username: profileData.username || profileData.display_name || profileData.email?.split('@')[0] || `user_${String(profileData.id || '').slice(0, 6)}`,
           displayName: profileData.display_name || profileData.username || profileData.email?.split('@')[0] || 'User',
           avatar: profileData.avatar_url || `https://picsum.photos/seed/${profileData.id}/200/200`,
-          bio: localData.bio || profileData.bio || 'Digital creator and enthusiast. Sharing my journey on AnleySpace! ✨',
+          bio: profileData.bio || 'Digital creator and enthusiast. Sharing my journey on AnleySpace! ✨',
           coins: profileData.coins || 0,
-          // Counts are sourced from follows table via refreshFollowCounts().
           followers: 0,
           following: 0,
           isVerified: profileData.is_verified || false,
         };
         setUserProfile(formattedProfile);
-        fetchPosts(profileData.id);
-        fetchVideos(profileData.id, formattedProfile.username);
+        setLoading(false);
+
+        void (async () => {
+          try {
+            console.log(`DEBUG: Fetching local data for ${profileData.id}`);
+            const res = await fetch(apiUrl(`/api/user/${profileData.id}`));
+            if (!res.ok) {
+              console.error(`DEBUG: Local API error: ${res.status} ${res.statusText}`);
+              return;
+            }
+            const data = await res.json();
+            console.log('DEBUG: Local data received:', data);
+            if (data.error) return;
+            setUserProfile((prev) =>
+              prev && prev.id === profileData.id
+                ? {
+                    ...prev,
+                    bio: data.bio ?? prev.bio,
+                    followers: data.followers_count ?? prev.followers,
+                    following: data.following_count ?? prev.following,
+                  }
+                : prev
+            );
+          } catch (e) {
+            console.error('DEBUG: Failed to fetch local user data:', e);
+          }
+        })();
+
+        void fetchPosts(profileData.id, formattedProfile.username);
+        void fetchVideos(profileData.id, formattedProfile.username);
       }
     } catch (err) {
       console.error('Error fetching profile:', err);
@@ -121,7 +122,7 @@ export default function ProfilePage() {
     }
   };
 
-  const fetchPosts = async (userId: string) => {
+  const fetchPosts = async (userId: string, ownerUsername?: string) => {
     try {
       const { data, error } = await supabase
         .from('posts')
@@ -131,11 +132,13 @@ export default function ProfilePage() {
       
       if (error) throw error;
 
+      const nameForPosts = (ownerUsername ?? userProfile?.username ?? '').trim();
+
       const formattedPosts: Post[] = data.map(p => ({
         id: p.id,
         image: p.image_url,
         user: { 
-          username: userProfile?.username || '', 
+          username: nameForPosts || userProfile?.username || '', 
           avatar: userProfile?.avatar || '' 
         },
         caption: p.content,
@@ -164,7 +167,7 @@ export default function ProfilePage() {
       const formatted: Video[] = (data || [])
         .filter((p: { user_id?: string; video_url?: string | null }) => {
           if (String(p.user_id || '') !== String(userId)) return false;
-          return isValidProfileVideoUrl(String(p.video_url || '').trim());
+          return isValidVideoUrl(String(p.video_url || '').trim());
         })
         .map((p: any) => {
           const url = String(p.video_url).trim();
@@ -172,7 +175,7 @@ export default function ProfilePage() {
           return {
             id: String(p.id),
             url,
-            thumbnail: isValidProfileVideoUrl(poster) ? poster : url,
+            thumbnail: isValidVideoUrl(poster) ? poster : url,
             user: { username: ownerUsername },
             caption: String(p.content || ''),
             likes: Number(p.likes_count) || 0,
@@ -676,10 +679,10 @@ export default function ProfilePage() {
     }
   };
 
-  if (loading) {
+  if (loading && !userProfile && (!isOwnProfile || !myProfile)) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        <div className="w-12 h-12 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
+      <div className="lg:max-w-4xl lg:mx-auto p-4 lg:p-8 pb-12">
+        <ProfileHeaderSkeleton />
       </div>
     );
   }
@@ -863,7 +866,7 @@ export default function ProfilePage() {
               onClick={() => setSelectedVideo(video)}
               className="aspect-[9/16] bg-gray-100 dark:bg-gray-900 rounded-lg overflow-hidden relative group cursor-pointer"
             >
-              {video.thumbnail !== video.url && isValidProfileVideoUrl(video.thumbnail) ? (
+              {video.thumbnail !== video.url && isValidVideoUrl(video.thumbnail) ? (
                 <ResponsiveImage 
                   src={video.thumbnail} 
                   alt="" 
@@ -871,7 +874,7 @@ export default function ProfilePage() {
                   height={711}
                   className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500" 
                 />
-              ) : (
+              ) : isValidVideoUrl(video.url) ? (
                 <video
                   src={video.url}
                   muted
@@ -879,6 +882,8 @@ export default function ProfilePage() {
                   preload="metadata"
                   className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500 pointer-events-none"
                 />
+              ) : (
+                <div className="w-full h-full bg-gray-200 dark:bg-gray-800" aria-hidden />
               )}
               <div className="absolute inset-0 bg-black/20 flex items-center justify-center">
                 <Play size={32} className="text-white opacity-80 group-hover:scale-125 transition-transform" />
@@ -1251,6 +1256,10 @@ function PostDetailModal({ post, onClose }: { post: Post; onClose: () => void })
 }
 
 function VideoPlayerModal({ video, onClose }: { video: Video; onClose: () => void }) {
+  console.log("VIDEO URL:", video.url);
+  const ok = isValidVideoUrl(video.url);
+  const fallbackThumb = String(video.thumbnail || '').trim();
+
   return (
     <div className="fixed inset-0 z-[120] flex items-center justify-center p-0 md:p-4">
       <motion.div 
@@ -1266,13 +1275,23 @@ function VideoPlayerModal({ video, onClose }: { video: Video; onClose: () => voi
         exit={{ scale: 0.9, opacity: 0 }}
         className="relative w-full max-w-md aspect-[9/16] bg-black md:rounded-3xl overflow-hidden shadow-2xl"
       >
-        <video 
-          src={video.url} 
-          autoPlay 
-          loop 
-          controls
-          className="w-full h-full object-cover"
-        />
+        {ok ? (
+          <video 
+            src={video.url} 
+            autoPlay 
+            loop 
+            controls
+            playsInline
+            preload="metadata"
+            className="w-full h-full object-cover"
+          />
+        ) : isValidVideoUrl(fallbackThumb) ? (
+          <img src={fallbackThumb} alt="" className="w-full h-full object-cover" />
+        ) : (
+          <div className="w-full h-full flex items-center justify-center text-white/70 text-sm px-6 text-center">
+            Video unavailable
+          </div>
+        )}
         <button 
           onClick={onClose}
           className="absolute top-4 right-4 p-2 bg-black/40 text-white rounded-full backdrop-blur-md"

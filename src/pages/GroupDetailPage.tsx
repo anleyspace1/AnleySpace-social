@@ -28,6 +28,11 @@ import {
 import { cn } from '../lib/utils';
 import { MOCK_USER } from '../constants';
 import { supabase } from '../lib/supabase';
+import {
+  groupPostVideoStoragePath,
+  resolveStorageExtension,
+  storageUploadContentType,
+} from '../lib/storageUpload';
 
 /** Detect Postgres/Supabase permission / RLS-style failures for clearer production alerts. */
 function isLikelyRlsOrPolicyError(error: unknown): boolean {
@@ -369,10 +374,11 @@ export default function GroupDetailPage() {
         imageUrlPayload = publicUrl || '';
       }
       if (selectedVideoFile) {
-        const ext = (selectedVideoFile.name.split('.').pop() || 'mp4').toLowerCase();
-        const safeName = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
-        const filePath = `group-posts/${user.id}/${safeName}`;
-        const { error: uploadError } = await supabase.storage.from('posts').upload(filePath, selectedVideoFile);
+        const ext = resolveStorageExtension(selectedVideoFile);
+        const filePath = groupPostVideoStoragePath(user.id, ext);
+        const { error: uploadError } = await supabase.storage.from('posts').upload(filePath, selectedVideoFile, {
+          contentType: storageUploadContentType(selectedVideoFile),
+        });
         if (uploadError) throw uploadError;
         const { data: { publicUrl } } = supabase.storage.from('posts').getPublicUrl(filePath);
         videoUrlPayload = publicUrl || '';

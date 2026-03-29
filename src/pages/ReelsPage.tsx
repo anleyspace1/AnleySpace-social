@@ -35,7 +35,7 @@ import {
   Sparkles,
   Scissors
 } from 'lucide-react';
-import { MOCK_VIDEOS, MOCK_USER, MOCK_SOUNDS, MOCK_PRODUCTS } from '../constants';
+import { MOCK_SOUNDS } from '../constants';
 import { cn } from '../lib/utils';
 import { supabase } from '../lib/supabase';
 import { apiUrl } from '../lib/apiOrigin';
@@ -44,12 +44,32 @@ import { Video } from '../types';
 import ShareModal from '../components/ShareModal';
 import StoryEditor from '../components/StoryEditor';
 import { ResponsiveImage } from '../components/ResponsiveImage';
+import { isValidVideoUrl } from '../lib/videoUrl';
+import { isPlaceholderUsername } from '../lib/realDataGuards';
+import { ReelsFeedSkeleton } from '../components/LoadingSkeletons';
+import {
+  feedStoragePath,
+  resolveStorageExtension,
+  storageUploadContentType,
+} from '../lib/storageUpload';
 
 const resolveProfileUsername = (username?: string | null) => {
   const value = (username || '').trim();
   if (!value) return 'User';
   return value;
 };
+
+/** Pause every <video> in the document so only one reel can play audio at a time. */
+function pauseAllVideos() {
+  document.querySelectorAll('video').forEach((el) => {
+    el.pause();
+    try {
+      el.currentTime = 0;
+    } catch {
+      /* ignore */
+    }
+  });
+}
 
 export default function ReelsPage() {
   const navigate = useNavigate();
@@ -112,7 +132,24 @@ export default function ReelsPage() {
 
   // (base "/reels" selection persistence is handled inside fetchReels)
 
+  /** Prefetch feed from navigation (e.g. Home) so the list is never empty while the network loads. */
   useEffect(() => {
+    const st = location.state as { videos?: any[]; startIndex?: number } | undefined;
+    if (st?.videos?.length) {
+      setVideos(st.videos);
+      const si = typeof st.startIndex === 'number' ? st.startIndex : 0;
+      const clamped = Math.max(0, Math.min(si, st.videos.length - 1));
+      setCurrentIndex(clamped);
+      const id = st.videos[clamped]?.id;
+      if (id) setActiveVideoId(String(id));
+      setReelsLoaded(true);
+    }
+  }, [location.key]);
+
+  useEffect(() => {
+    const st = location.state as { videos?: any[] } | undefined;
+    if (st?.videos?.length) return;
+
     const fetchReels = async () => {
       try {
         const likedStorageKey = 'reels_liked_ids_v1';
@@ -171,21 +208,18 @@ export default function ReelsPage() {
         let likesByPost: Record<string, number> = {};
         let commentsByPost: Record<string, number> = {};
         if (postIds.length > 0) {
-          const { data: likeRows, error: likesAggErr } = await supabase
-            .from('likes')
-            .select('post_id')
-            .in('post_id', postIds);
+          const [likesRes, commentsRes] = await Promise.all([
+            supabase.from('likes').select('post_id').in('post_id', postIds),
+            supabase.from('comments').select('post_id').in('post_id', postIds),
+          ]);
+          const { data: likeRows, error: likesAggErr } = likesRes;
+          const { data: commentRows, error: commentsAggErr } = commentsRes;
           if (!likesAggErr && Array.isArray(likeRows)) {
             likeRows.forEach((row: any) => {
               const pid = String(row.post_id);
               likesByPost[pid] = (likesByPost[pid] || 0) + 1;
             });
           }
-
-          const { data: commentRows, error: commentsAggErr } = await supabase
-            .from('comments')
-            .select('post_id')
-            .in('post_id', postIds);
           if (!commentsAggErr && Array.isArray(commentRows)) {
             commentRows.forEach((row: any) => {
               const pid = String(row.post_id);
@@ -203,14 +237,18 @@ export default function ReelsPage() {
           .map((r: any) => {
             const id = String(r.id);
             const playUrl = r.video_url || r.url || '';
+            const uid = String(r.user_id ?? '').trim();
+            const uname = String(profileMap[uid]?.username ?? r.username ?? '').trim();
+            if (!uid || !uname || isPlaceholderUsername(uname)) return null;
+            if (!isValidVideoUrl(playUrl)) return null;
             return {
               id,
               url: playUrl,
               videoUrl: playUrl,
               thumbnail: r.image_url || r.thumbnail || playUrl,
               user: {
-                username: profileMap[String(r.user_id)]?.username || r.username || 'User',
-                avatar: profileMap[String(r.user_id)]?.avatar_url || r.avatar || `https://picsum.photos/seed/${r.user_id || id}/100/100`,
+                username: uname,
+                avatar: profileMap[uid]?.avatar_url || r.avatar || '',
               },
               caption: String(r.content || r.caption || ''),
               likes: likesByPost[id] ?? 0,
@@ -224,7 +262,7 @@ export default function ReelsPage() {
               liked: likedIds.has(id),
             };
           })
-          .filter((v: any) => !!v.url);
+          .filter((v: any): v is NonNullable<typeof v> => v != null && !!v.url);
 
         setVideos(list);
         const targetById = targetId
@@ -237,15 +275,13 @@ export default function ReelsPage() {
         setActiveVideoId(target ? String(target.id) : null);
       } catch (e) {
         console.error('[ReelsPage] fetchReels', e);
-        setVideos([]);
       } finally {
         setReelsLoaded(true);
       }
     };
 
-    // In selected mode we already set the single video; no need to fetch the feed.
-    fetchReels();
-  }, [isSelectedMode, params.id, selectedVideoId, selectedVideoUrl]);
+    void fetchReels();
+  }, [isSelectedMode, params.id, selectedVideoId, selectedVideoUrl, location.key]);
 
   useEffect(() => {
     const state = location.state as any;
@@ -397,15 +433,11 @@ export default function ReelsPage() {
     videos[currentIndex] ||
     videos[0];
 
-  if (!reelsLoaded) {
-    return (
-      <div className="relative h-screen overflow-hidden bg-[#0A0A0A] flex items-center justify-center">
-        <div className="w-10 h-10 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin" />
-      </div>
-    );
+  if (!videos.length && !reelsLoaded) {
+    return <ReelsFeedSkeleton />;
   }
 
-  if (reelsLoaded && videos.length === 0) {
+  if (!videos.length && reelsLoaded) {
     return (
       <div className="relative h-screen overflow-hidden bg-[#0A0A0A] flex items-center justify-center">
         <div className="text-center text-white/80 px-6">
@@ -702,12 +734,17 @@ function UploadReelModal({ onClose, onUpload, initialSound }: { onClose: () => v
         authError: authError ?? null,
       });
 
-      // Upload directly to the "reels" bucket.
-      // This avoids false negatives when listBuckets is restricted for anon keys.
-      const fileName = `${Date.now()}-${file.name.replace(/[^a-zA-Z0-9.]/g, '_')}`;
+      const uid = user?.id;
+      if (!uid) {
+        throw new Error('You must be logged in to upload a reel.');
+      }
+      const ext = resolveStorageExtension(file);
+      const filePath = feedStoragePath(uid, ext);
       const { data: uploadData, error: uploadError } = await supabase.storage
         .from('posts')
-        .upload(fileName, file);
+        .upload(filePath, file, {
+          contentType: storageUploadContentType(file),
+        });
 
       if (uploadError) {
         if (uploadError.message.includes('Bucket not found') || uploadError.message.includes('not found')) {
@@ -716,7 +753,7 @@ function UploadReelModal({ onClose, onUpload, initialSound }: { onClose: () => v
         throw uploadError;
       }
 
-      const uploadedPath = uploadData?.path || fileName;
+      const uploadedPath = uploadData?.path || filePath;
       const { data: { publicUrl } } = supabase.storage
         .from('posts')
         .getPublicUrl(uploadedPath);
@@ -730,7 +767,7 @@ function UploadReelModal({ onClose, onUpload, initialSound }: { onClose: () => v
 
       // Save reel metadata to posts table (same stable path as Home posts).
       const insertPayload = {
-        user_id: user?.id || MOCK_USER.id,
+        user_id: uid,
         content: caption || '',
         image_url: null,
         video_url: publicUrl,
@@ -764,7 +801,7 @@ function UploadReelModal({ onClose, onUpload, initialSound }: { onClose: () => v
         url: publicUrl,
         user: {
           username: resolveProfileUsername(profile?.username),
-          avatar: profile?.avatar_url || MOCK_USER.avatar
+          avatar: profile?.avatar_url || ''
         },
         caption: caption || 'New Reel!',
         likes: 0,
@@ -1182,7 +1219,9 @@ function VideoPost({
   const [isStoryEditorOpen, setIsStoryEditorOpen] = useState(false);
   const [showSoundIcon, setShowSoundIcon] = useState(false);
   const [isReady, setIsReady] = useState(false);
+  const [videoFailed, setVideoFailed] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const blurVideoRef = useRef<HTMLVideoElement>(null);
   const soundIconTimerRef = useRef<number | null>(null);
 
   const REEL_GIFTS = [
@@ -1193,6 +1232,13 @@ function VideoPost({
     { id: 'g5', icon: '🏆', price: 490 },
     { id: 'g6', icon: '🌹', price: 50 },
   ];
+
+  const playUrl = String((video as any).videoUrl || video.url || '').trim();
+  console.log("VIDEO URL:", playUrl);
+  const urlOk = isValidVideoUrl(playUrl);
+  const thumbStr = String((video as any).thumbnail || '').trim();
+  const thumbOk = isValidVideoUrl(thumbStr);
+  const posterForPlayer = thumbOk ? thumbStr : urlOk ? `${playUrl}#t=0.1` : undefined;
 
   const handleLike = async () => {
     const reelId = video?.id != null ? String(video.id) : null;
@@ -1332,7 +1378,8 @@ function VideoPost({
       console.log('[ReelsPage] gift send: missing reelId', { reelId, video });
       return;
     }
-    const userId = user?.id || MOCK_USER.id;
+    const userId = user?.id;
+    if (!userId) return;
     const giftToSend =
       selectedGiftId ? REEL_GIFTS.find((g) => g.id === selectedGiftId) : undefined;
     const finalGift = giftToSend || REEL_GIFTS[0];
@@ -1368,22 +1415,30 @@ function VideoPost({
   };
 
   const togglePlay = useCallback(async () => {
+    if (!urlOk) return;
     if (videoRef.current) {
       try {
         if (isPlaying) {
           videoRef.current.pause();
           setIsPlaying(false);
         } else {
-          await videoRef.current.play();
+          pauseAllVideos();
+          const v = videoRef.current;
+          const b = blurVideoRef.current;
+          v.currentTime = 0;
+          if (b) b.currentTime = 0;
+          void b?.play().catch(() => {});
+          await v.play();
           setIsPlaying(true);
         }
       } catch (error) {
         console.error("Video play failed:", error);
       }
     }
-  }, [isPlaying]);
+  }, [isPlaying, urlOk]);
 
   const handleVideoSurfaceTap = useCallback(() => {
+    if (!urlOk) return;
     const el = videoRef.current;
     if (!el) return;
 
@@ -1397,9 +1452,15 @@ function VideoPost({
         setShowSoundIcon(false);
       }, 2000);
       if (el.paused) {
+        pauseAllVideos();
+        el.currentTime = 0;
+        const b = blurVideoRef.current;
+        if (b) b.currentTime = 0;
+        void b?.play().catch(() => {});
         void el.play().then(() => setIsPlaying(true)).catch(() => {});
       } else {
         el.pause();
+        blurVideoRef.current?.pause();
         setIsPlaying(false);
       }
       return;
@@ -1408,11 +1469,16 @@ function VideoPost({
     if (!hasUserInteracted) {
       onUserInteract();
       el.muted = false;
+      pauseAllVideos();
+      el.currentTime = 0;
+      const b = blurVideoRef.current;
+      if (b) b.currentTime = 0;
+      void b?.play().catch(() => {});
       void el.play().then(() => setIsPlaying(true)).catch(() => {});
       return;
     }
     void togglePlay();
-  }, [hasUserInteracted, onToggleGlobalMute, onUserInteract, togglePlay, isTouchDevice]);
+  }, [hasUserInteracted, onToggleGlobalMute, onUserInteract, togglePlay, isTouchDevice, urlOk]);
 
   useEffect(() => {
     if (videoRef.current) {
@@ -1422,6 +1488,7 @@ function VideoPost({
 
   useEffect(() => {
     setIsReady(false);
+    setVideoFailed(false);
   }, [video?.id]);
 
   useEffect(() => {
@@ -1433,11 +1500,47 @@ function VideoPost({
   }, []);
 
   useEffect(() => {
+    return () => {
+      const v = videoRef.current;
+      const b = blurVideoRef.current;
+      if (v) {
+        v.pause();
+        try {
+          v.currentTime = 0;
+        } catch {
+          /* ignore */
+        }
+      }
+      if (b) {
+        b.pause();
+        try {
+          b.currentTime = 0;
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!urlOk || videoFailed) return;
     const observer = new IntersectionObserver(
       (entries) => {
-        entries.forEach(async (entry) => {
+        entries.forEach((entry) => {
           if (entry.isIntersecting) {
+            pauseAllVideos();
             onActive();
+            const v = videoRef.current;
+            const b = blurVideoRef.current;
+            if (v) {
+              v.currentTime = 0;
+              void v.play().catch(() => {});
+              setIsPlaying(true);
+            }
+            if (b) {
+              b.currentTime = 0;
+              void b.play().catch(() => {});
+            }
             fetch(apiUrl(`/api/reels/${video.id}/view`), {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -1450,16 +1553,25 @@ function VideoPost({
                 }
               })
               .catch(() => {});
-            try {
-              if (videoRef.current) {
-                await videoRef.current.play();
-                setIsPlaying(true);
-              }
-            } catch (error) {
-              setIsPlaying(false);
-            }
           } else {
-            videoRef.current?.pause();
+            const v = videoRef.current;
+            const b = blurVideoRef.current;
+            if (v) {
+              v.pause();
+              try {
+                v.currentTime = 0;
+              } catch {
+                /* ignore */
+              }
+            }
+            if (b) {
+              b.pause();
+              try {
+                b.currentTime = 0;
+              } catch {
+                /* ignore */
+              }
+            }
             setIsPlaying(false);
           }
         });
@@ -1469,59 +1581,100 @@ function VideoPost({
 
     if (videoRef.current) observer.observe(videoRef.current);
     return () => observer.disconnect();
-  }, [onActive, onCountsChange, user?.id, video.id, hasUserInteracted]);
+  }, [onActive, onCountsChange, user?.id, video.id, urlOk, videoFailed]);
+
+  const desktopMuted = !hasUserInteracted;
 
   return (
-    <div className="relative h-full w-full bg-black overflow-hidden group flex items-center justify-center">
-      {/* Blurred background using the same video */}
-      <video
-        src={(video as any).videoUrl || video.url}
-        className="absolute inset-0 h-full w-full object-cover blur-[20px] scale-[1.2] z-0 [will-change:transform]"
-        poster={(video as any).thumbnail || `${(video as any).videoUrl || video.url}#t=0.1`}
-        muted
-        autoPlay
-        loop
-        playsInline
-        preload="metadata"
-        aria-hidden="true"
-        tabIndex={-1}
-        style={{ backgroundColor: '#000' }}
-      />
-      {/* Video Player */}
-      <video
-        key={video.id}
-        ref={(el) => {
-          videoRef.current = el;
-          onVideoElementRef(String(video.id), el);
-        }}
-        src={(video as any).videoUrl || video.url}
-        poster={(video as any).thumbnail || `${(video as any).videoUrl || video.url}#t=0.1`}
-        className="relative z-[1] h-full w-full object-contain [will-change:transform]"
-        controls={!isTouchDevice}
-        loop
-        muted={isTouchDevice ? globalMuted : undefined}
-        autoPlay
-        playsInline
-        preload="metadata"
-        onLoadedData={() => setIsReady(true)}
-        onClick={handleVideoSurfaceTap}
-        style={
-          isTouchDevice
-            ? {
-                width: '100%',
-                height: '100%',
-                objectFit: 'cover',
-                backgroundColor: '#000',
+    <div className="relative w-full h-screen overflow-hidden bg-black group">
+      {urlOk && !videoFailed ? (
+        <>
+          {thumbOk && (
+            <img
+              src={thumbStr}
+              alt=""
+              className="absolute inset-0 z-0 h-full w-full object-cover"
+              aria-hidden
+            />
+          )}
+          {!thumbOk && <div className="absolute inset-0 z-0 bg-neutral-900" aria-hidden />}
+          {/* Blurred background — same src as main; fills letterbox edges */}
+          <video
+            ref={blurVideoRef}
+            src={playUrl}
+            className="absolute inset-0 z-[1] h-full w-full object-cover blur-2xl scale-110 [will-change:transform]"
+            poster={posterForPlayer}
+            muted
+            loop
+            playsInline
+            preload="metadata"
+            aria-hidden="true"
+            tabIndex={-1}
+            onError={() => setVideoFailed(true)}
+            style={{ backgroundColor: '#000' }}
+          />
+          {/* Main player — shrink-wrapped + centered so sides/top-bottom show blur, not black pillarbox */}
+          <div className="absolute inset-0 z-10 flex min-h-0 min-w-0 items-center justify-center">
+            <video
+              key={video.id}
+              ref={(el) => {
+                videoRef.current = el;
+                onVideoElementRef(String(video.id), el);
+              }}
+              src={playUrl}
+              poster={posterForPlayer}
+              className="max-h-full max-w-full object-contain [will-change:transform] transition-opacity duration-300"
+              controls={!isTouchDevice}
+              loop
+              muted={isTouchDevice ? globalMuted : desktopMuted}
+              playsInline
+              preload="metadata"
+              onLoadedData={() => setIsReady(true)}
+              onError={() => setVideoFailed(true)}
+              onClick={handleVideoSurfaceTap}
+              style={{
                 opacity: isReady ? 1 : 0,
-                transition: 'opacity 0.25s ease',
-                transform: 'translateZ(0)',
-                willChange: 'transform',
-              }
-            : undefined
-        }
-      />
+                ...(isTouchDevice
+                  ? {
+                      transform: 'translateZ(0)',
+                      willChange: 'transform',
+                    }
+                  : { cursor: 'pointer' }),
+              }}
+            />
+          </div>
+        </>
+      ) : urlOk && videoFailed ? (
+        <div className="absolute inset-0 z-[1] flex flex-col items-stretch">
+          {thumbOk ? (
+            <img src={thumbStr} alt="" className="h-full w-full object-cover" />
+          ) : (
+            <div className="h-full w-full bg-neutral-900" aria-hidden />
+          )}
+          <div className="absolute inset-0 flex items-center justify-center bg-black/60 text-white text-sm font-semibold px-4 text-center">
+            Video unavailable
+          </div>
+        </div>
+      ) : thumbOk ? (
+        <>
+          <img
+            src={thumbStr}
+            alt=""
+            className="absolute inset-0 h-full w-full object-cover blur-[20px] scale-[1.2] z-0 [will-change:transform]"
+            aria-hidden
+          />
+          <img
+            src={thumbStr}
+            alt=""
+            className="relative z-[1] h-full w-full object-cover"
+            onLoad={() => setIsReady(true)}
+          />
+        </>
+      ) : (
+        <div className="absolute inset-0 z-[1] bg-black" aria-hidden />
+      )}
 
-      {isTouchDevice && showSoundIcon && (
+      {urlOk && !videoFailed && isTouchDevice && showSoundIcon && (
         <div
           onClick={(e) => {
             e.stopPropagation();
@@ -1548,7 +1701,7 @@ function VideoPost({
         </div>
       )}
 
-      {!hasUserInteracted && !isTouchDevice && (
+      {urlOk && !videoFailed && !hasUserInteracted && !isTouchDevice && (
         <button
           type="button"
           className="absolute left-1/2 top-1/2 z-[12] -translate-x-1/2 -translate-y-1/2 rounded-full bg-black/45 px-3 py-2 text-[12px] font-bold text-white shadow-sm backdrop-blur-md touch-manipulation"
@@ -1626,39 +1779,13 @@ function VideoPost({
       <div className="absolute bottom-12 sm:bottom-24 left-6 right-20 z-10">
         <div className="flex flex-col gap-3">
           {/* Product Integration */}
-          {video.id === 'v1' && (
-            <div className="flex flex-col gap-1">
-              <span className="text-white font-bold text-xs drop-shadow-md">PS5 Wireless Headset 5K Coins</span>
-              <motion.div 
-                initial={{ x: -20, opacity: 0 }}
-                animate={{ x: 0, opacity: 1 }}
-                className="bg-white/10 backdrop-blur-xl border border-white/20 rounded-2xl p-3 flex items-center justify-between gap-4 max-w-sm"
-              >
-                <div className="flex items-center gap-3">
-                  <div className="w-12 h-12 bg-white rounded-xl overflow-hidden flex-shrink-0">
-                    <img src="https://picsum.photos/seed/headset/100/100" alt="" className="w-full h-full object-cover" />
-                  </div>
-                  <div>
-                    <h4 className="text-white font-bold text-xs">PS5 Wireless Headset</h4>
-                    <div className="flex items-center gap-1 text-yellow-500 text-[10px] font-black">
-                      <Coins size={10} />
-                      5K Coins
-                    </div>
-                  </div>
-                </div>
-                <div className="flex flex-col items-end gap-1">
-                  <div className="bg-white/20 px-2 py-0.5 rounded text-[8px] font-black text-white uppercase tracking-widest">70%</div>
-                  <button className="bg-gradient-to-r from-orange-400 to-yellow-500 text-white px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-widest shadow-lg shadow-orange-500/20">
-                    BUY NOW
-                  </button>
-                </div>
-              </motion.div>
-            </div>
-          )}
-
           <div className="flex items-center gap-3">
-            <div className="w-12 h-12 rounded-full border-2 border-white/20 overflow-hidden shadow-xl">
+            <div className="w-12 h-12 rounded-full border-2 border-white/20 overflow-hidden shadow-xl bg-white/10 flex items-center justify-center">
+              {video.user.avatar ? (
               <img src={video.user.avatar} alt="" className="w-full h-full object-cover" />
+              ) : (
+                <span className="text-white text-sm font-black">{(video.user.username || '?').charAt(0).toUpperCase()}</span>
+              )}
             </div>
             <div>
               <div className="flex items-center gap-1.5">
@@ -1765,6 +1892,37 @@ function VideoPost({
 }
 
 function SuggestedReels({ videos, onSelect }: { videos: any[]; onSelect: (id: string) => void }) {
+  const renderSuggestedMedia = (video: any, thumbWidth: number, thumbHeight: number) => {
+    const reelSrc = String((video as any).video_url || video.url || '').trim();
+    console.log("VIDEO URL:", reelSrc);
+    if (isValidVideoUrl(reelSrc)) {
+      return (
+        <video
+          src={reelSrc}
+          muted
+          autoPlay
+          loop
+          playsInline
+          className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500"
+          preload="metadata"
+        />
+      );
+    }
+    const t = String(video.thumbnail || '').trim();
+    if (isValidVideoUrl(t)) {
+      return (
+        <ResponsiveImage
+          src={t}
+          alt=""
+          width={thumbWidth}
+          height={thumbHeight}
+          className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500"
+        />
+      );
+    }
+    return <div className="w-full h-full bg-zinc-900" aria-hidden />;
+  };
+
   return (
     <div className="p-4 space-y-6">
       <div className="flex items-center gap-2">
@@ -1781,25 +1939,7 @@ function SuggestedReels({ videos, onSelect }: { videos: any[]; onSelect: (id: st
             onClick={() => onSelect(video.id)}
             className="relative aspect-[9/16] rounded-xl overflow-hidden group border border-white/5"
           >
-            {((video as any).video_url || video.url) ? (
-              <video
-                src={(video as any).video_url || video.url}
-                muted
-                autoPlay
-                loop
-                playsInline
-                className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500"
-                preload="metadata"
-              />
-            ) : (
-              <ResponsiveImage
-                src={video.thumbnail}
-                alt=""
-                width={400}
-                height={711}
-                className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500"
-              />
-            )}
+            {renderSuggestedMedia(video, 400, 711)}
             <div className="absolute inset-0 bg-gradient-to-t from-black/60 to-transparent" />
             <div className="absolute bottom-2 left-2 flex items-center gap-1.5">
               <div className="w-4 h-4 rounded-full overflow-hidden border border-white/20">
@@ -1825,25 +1965,7 @@ function SuggestedReels({ videos, onSelect }: { videos: any[]; onSelect: (id: st
             onClick={() => onSelect(video.id)}
             className="relative aspect-[9/16] rounded-lg overflow-hidden group border border-white/5"
           >
-            {((video as any).video_url || video.url) ? (
-              <video
-                src={(video as any).video_url || video.url}
-                muted
-                autoPlay
-                loop
-                playsInline
-                className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500"
-                preload="metadata"
-              />
-            ) : (
-              <ResponsiveImage
-                src={video.thumbnail}
-                alt=""
-                width={300}
-                height={533}
-                className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500"
-              />
-            )}
+            {renderSuggestedMedia(video, 300, 533)}
             <div className="absolute bottom-1 right-1">
               <span className="text-white text-[7px] font-bold">{(video.likes / 10).toFixed(1)}K</span>
             </div>
@@ -1902,7 +2024,7 @@ function CommentsSection({
           id: c.id,
           user: resolveProfileUsername(profilesMap[String(c.user_id)]?.username),
           text: c.content,
-          avatar: profilesMap[String(c.user_id)]?.avatar_url || `https://picsum.photos/seed/${c.user_id}/100/100`,
+          avatar: profilesMap[String(c.user_id)]?.avatar_url || '',
           time: c.created_at ? new Date(c.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'now',
           likes: '0',
         })));
@@ -1994,7 +2116,7 @@ function CommentsSection({
             id: inserted.id,
             user: resolveProfileUsername(profile?.username),
             text: inserted.content,
-            avatar: profile?.avatar_url || MOCK_USER.avatar,
+            avatar: profile?.avatar_url || '',
             time: 'now',
             likes: '0',
           },
@@ -2029,7 +2151,7 @@ function CommentsSection({
         id: c.id,
         user: resolveProfileUsername(freshProfilesMap[String(c.user_id)]?.username),
         text: c.content,
-        avatar: freshProfilesMap[String(c.user_id)]?.avatar_url || `https://picsum.photos/seed/${c.user_id}/100/100`,
+        avatar: freshProfilesMap[String(c.user_id)]?.avatar_url || '',
         time: c.created_at ? new Date(c.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'now',
         likes: '0',
       })));
@@ -2071,7 +2193,11 @@ function CommentsSection({
       <div className="flex-1 overflow-y-auto p-4 space-y-6 no-scrollbar">
         {comments.map((comment) => (
           <div key={comment.id} className="flex gap-3 group">
+            {comment.avatar ? (
             <ResponsiveImage src={comment.avatar} alt="" width={40} height={40} className="w-8 h-8 rounded-full object-cover border border-white/10" />
+            ) : (
+              <div className="w-8 h-8 rounded-full border border-white/10 bg-white/10 shrink-0" aria-hidden />
+            )}
             <div className="flex-1">
               <div className="flex items-center justify-between">
                 <span className="text-white/60 font-bold text-[10px]">@{comment.user}</span>
