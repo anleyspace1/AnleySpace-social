@@ -55,6 +55,12 @@ const resolveProfileUsername = (username?: string | null) => {
   return value;
 };
 
+/** Feed routes use Express; static hosts (e.g. Vercel SPA) may return 200 HTML — must not treat as JSON. */
+function feedApiResponseIsJson(res: Response): boolean {
+  const ct = res.headers.get('content-type') || '';
+  return ct.includes('application/json');
+}
+
 const reelCache = new Map<string, string>();
 let isStoryUploadSupabaseLocked = false;
 
@@ -1976,7 +1982,7 @@ function PostItem({
 
   const handleLike = async () => {
     if (!user) {
-      console.error('User not authenticated');
+      alert('Please sign in to like posts.');
       return;
     }
     if (!post?.id) {
@@ -2002,28 +2008,56 @@ function PostItem({
         headers: jsonHeaders,
         body: likePayload,
       });
-      if (apiRes.ok) {
-        const data = await apiRes.json().catch(() => ({}));
-        // Server may return only { success: true }; keep optimistic isLiked/likesCount unless server sends fields.
-        if (typeof data.liked === 'boolean') setIsLiked(data.liked);
-        if (typeof data.likesCount === 'number') setLikesCount(data.likesCount);
-      } else {
-        // Fallback: direct Supabase (e.g. server without service role / feed routes unavailable)
+
+      let handledByApi = false;
+      if (apiRes.ok && feedApiResponseIsJson(apiRes)) {
+        const data = await apiRes.json().catch((e) => {
+          console.error('[PostItem] like API JSON parse failed', e);
+          return null;
+        });
+        if (data && (data.success === true || typeof data.liked === 'boolean')) {
+          handledByApi = true;
+        }
+        if (typeof data?.liked === 'boolean') setIsLiked(data.liked);
+        if (typeof data?.likesCount === 'number') setLikesCount(data.likesCount);
+      } else if (apiRes.ok && !feedApiResponseIsJson(apiRes)) {
+        console.warn(
+          '[PostItem] like API returned non-JSON (likely SPA on static host). Using Supabase for like/unlike.'
+        );
+      }
+
+      if (!handledByApi) {
         if (wasLiked) {
           const { error } = await supabase
             .from('likes')
             .delete()
             .eq('post_id', post.id)
             .eq('user_id', user.id);
-          if (error) throw error;
+          if (error) {
+            console.error('[PostItem] Supabase unlike failed', error);
+            throw error;
+          }
         } else {
-          const { error } = await supabase
+          const { data: existing, error: exErr } = await supabase
             .from('likes')
-            .insert({
+            .select('id')
+            .eq('post_id', post.id)
+            .eq('user_id', user.id)
+            .maybeSingle();
+          if (exErr) {
+            console.error('[PostItem] Supabase like check failed', exErr);
+            throw exErr;
+          }
+          if (!existing) {
+            const { error: insErr } = await supabase.from('likes').insert({
               post_id: post.id,
               user_id: user.id,
             });
-          if (error) throw error;
+            if (insErr && insErr.code !== '23505') {
+              console.error('[PostItem] Supabase like insert failed', insErr);
+              throw insErr;
+            }
+          }
           try {
             const notifyRes = await fetch(apiUrl('/api/notifications/from-feed-like'), {
               method: 'POST',
@@ -2037,12 +2071,12 @@ function PostItem({
         }
       }
 
-      // Ensure UI remains synced with persisted DB state deterministically.
       await fetchLikesCount();
     } catch (err) {
       console.error('[LikeError]', err);
       setIsLiked(wasLiked);
       setLikesCount((prev) => (wasLiked ? prev + 1 : prev - 1));
+      alert(err instanceof Error ? err.message : 'Could not update like. Please try again.');
     } finally {
       likeRequestInFlightRef.current = false;
     }
@@ -2053,7 +2087,7 @@ function PostItem({
   const handleAddComment = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!user) {
-      console.error('User not authenticated');
+      alert('Please sign in to comment.');
       return;
     }
     if (!post?.id) {
@@ -2061,7 +2095,6 @@ function PostItem({
       return;
     }
     if (!newComment.trim()) {
-      console.error('[CommentError]', { message: 'Comment content is empty', postId: post?.id, userId: user?.id });
       return;
     }
     if (commentRequestInFlightRef.current) {
@@ -2086,23 +2119,35 @@ function PostItem({
         headers: jsonHeaders,
         body: commentPayload,
       });
+
       let data: { id: string; user_id: string; content: string; created_at?: string } | null = null;
-      if (apiRes.ok) {
-        const payload = await apiRes.json().catch(() => ({}));
+
+      if (apiRes.ok && feedApiResponseIsJson(apiRes)) {
+        const payload = await apiRes.json().catch((e) => {
+          console.error('[PostItem] comment API JSON parse failed', e);
+          return null;
+        });
         data = payload?.comment ?? null;
+      } else if (apiRes.ok && !feedApiResponseIsJson(apiRes)) {
+        console.warn(
+          '[PostItem] comment API returned non-JSON (likely SPA on static host). Inserting comment via Supabase.'
+        );
       }
-      if (!data && !apiRes.ok) {
+
+      if (!data) {
         const { data: ins, error } = await supabase
           .from('comments')
           .insert({
             post_id: post.id,
             user_id: user.id,
             content: commentText,
-            created_at: new Date(),
           })
           .select('id, user_id, content, created_at')
           .single();
-        if (error) throw error;
+        if (error) {
+          console.error('[PostItem] Supabase comment insert failed', error);
+          throw error;
+        }
         data = ins;
         try {
           const notifyPayload = JSON.stringify({
@@ -2120,13 +2165,9 @@ function PostItem({
           /* non-fatal */
         }
       }
+
       if (!data) {
-        data = {
-          id: `temp-${Date.now()}`,
-          user_id: user.id,
-          content: commentText,
-          created_at: new Date().toISOString(),
-        };
+        throw new Error('Comment was not saved.');
       }
 
       const newCommentObj = {
@@ -2144,7 +2185,15 @@ function PostItem({
     } catch (err) {
       console.error('[CommentError]', err);
       setNewComment(commentText);
-      alert('Failed to add comment');
+      const raw =
+        err && typeof err === 'object' && 'message' in err && typeof (err as { message?: unknown }).message === 'string'
+          ? (err as { message: string }).message
+          : '';
+      const msg =
+        /jwt|session|auth/i.test(raw) || /not authenticated/i.test(raw)
+          ? 'Please sign in again to comment.'
+          : raw || 'Could not add comment. Please try again.';
+      alert(msg);
     } finally {
       commentRequestInFlightRef.current = false;
     }

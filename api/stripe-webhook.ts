@@ -1,12 +1,15 @@
 /**
- * Vercel Serverless Function — Stripe webhook (production).
- * Uses Web Standard Request so the body is read raw via request.text() (required for signature verification).
- * Env: STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, SUPABASE_URL|VITE_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (for coin credit).
+ * Vercel Serverless Function — Stripe webhook (Web Request API, no Express).
+ * Raw body via request.text(); verify with STRIPE_WEBHOOK_SECRET.
  */
 import Stripe from 'stripe';
 import { createClient } from '@supabase/supabase-js';
 
-export async function POST(request: Request): Promise<Response> {
+export default async function handler(request: Request): Promise<Response> {
+  if (request.method !== 'POST') {
+    return Response.json({ error: 'Method not allowed' }, { status: 405 });
+  }
+
   const stripeSecret = process.env.STRIPE_SECRET_KEY?.trim();
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET?.trim();
 
@@ -14,8 +17,8 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ error: 'Stripe webhook not configured' }, { status: 503 });
   }
 
-  const sig = request.headers.get('stripe-signature');
-  if (!sig) {
+  const signature = request.headers.get('stripe-signature');
+  if (!signature) {
     return Response.json({ error: 'Missing stripe-signature' }, { status: 400 });
   }
 
@@ -24,7 +27,7 @@ export async function POST(request: Request): Promise<Response> {
   const stripe = new Stripe(stripeSecret);
   let event: Stripe.Event;
   try {
-    event = stripe.webhooks.constructEvent(rawBody, sig, webhookSecret);
+    event = stripe.webhooks.constructEvent(rawBody, signature, webhookSecret);
   } catch (err) {
     console.warn('[stripe-webhook] signature verification failed', err);
     return new Response('Webhook signature verification failed', { status: 400 });
@@ -32,15 +35,15 @@ export async function POST(request: Request): Promise<Response> {
 
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object as Stripe.Checkout.Session;
-    console.log('[stripe-webhook] checkout.session.completed', {
-      id: session.id,
-      amount_total: session.amount_total,
-      currency: session.currency,
-      customer_email: session.customer_email,
-      payment_status: session.payment_status,
-      metadata: session.metadata,
-      mode: session.mode,
-    });
+    console.log(
+      '[stripe-webhook] checkout.session.completed',
+      'session_id:',
+      session.id,
+      'amount_total:',
+      session.amount_total,
+      'customer_email:',
+      session.customer_email
+    );
 
     const meta = session.metadata ?? {};
     const userId = typeof meta.user_id === 'string' ? meta.user_id.trim() : '';
