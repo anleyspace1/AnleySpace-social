@@ -2,11 +2,27 @@
  * Base URL for API calls.
  * - Default / empty: use **relative** paths like `/api/...` so the browser hits the same origin
  *   (Express+Vite on :3000 via `npm run dev`, or Vite on :5173 with `vite.config` proxy → :3000).
- * - Set `VITE_API_ORIGIN=http://localhost:3000` only if you must call the API by absolute URL
- *   (e.g. multipart workarounds). Do **not** set this to `http://localhost:5173` — that breaks API routing.
+ * - Set `VITE_API_ORIGIN` (or `NEXT_PUBLIC_API_ORIGIN`) to your **deployed** API base URL when the
+ *   frontend is on static hosting (e.g. Vercel) and the Express API is elsewhere.
+ * - Do **not** set this to `http://localhost:...` in production — browsers will try the user's
+ *   own machine, `fetch` throws "Failed to fetch", and feed fallbacks never run.
  */
-const raw = (import.meta.env.VITE_API_ORIGIN as string | undefined)?.trim() ?? "";
-export const API_ORIGIN = raw.replace(/\/$/, "");
+function resolveApiOrigin(): string {
+  const raw =
+    (import.meta.env.VITE_API_ORIGIN as string | undefined)?.trim() ||
+    (import.meta.env.NEXT_PUBLIC_API_ORIGIN as string | undefined)?.trim() ||
+    "";
+  let o = raw.replace(/\/$/, "");
+  if (import.meta.env.PROD && o && /localhost|127\.0\.0\.1/i.test(o)) {
+    console.warn(
+      '[apiOrigin] Ignoring localhost/127.0.0.1 API origin in production. Use your deployed API URL or leave unset (Supabase fallbacks for feed like/comment).'
+    );
+    o = '';
+  }
+  return o;
+}
+
+export const API_ORIGIN = resolveApiOrigin();
 
 /**
  * Build API URL: relative `/api/...` when `VITE_API_ORIGIN` is unset (preferred for dev proxy).
@@ -15,4 +31,17 @@ export function apiUrl(path: string): string {
   const p = path.startsWith("/") ? path : `/${path}`;
   if (!API_ORIGIN) return p;
   return `${API_ORIGIN}${p}`;
+}
+
+/**
+ * `fetch` that does not throw on network failure — returns `null` so callers can fall back
+ * (e.g. Supabase) when the static host has no `/api/*` server or the API URL is unreachable.
+ */
+export async function fetchFeedApiSafe(url: string, init?: RequestInit): Promise<Response | null> {
+  try {
+    return await fetch(url, init);
+  } catch (e) {
+    console.warn('[fetchFeedApiSafe] request failed (fallback may apply):', url, e);
+    return null;
+  }
 }

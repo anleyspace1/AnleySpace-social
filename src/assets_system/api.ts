@@ -46,6 +46,14 @@ export interface RewardState {
   eligibility_status: 'locked' | 'unlocked' | string;
   progress_percent: number;
   estimated_reward: number;
+  /** Optional breakdown for dashboard (0–100 each). */
+  activity_watch_pct?: number;
+  activity_likes_pct?: number;
+  activity_comments_pct?: number;
+  activity_shares_pct?: number;
+  /** Precomputed composite 0–100 if server sends it. */
+  activity_composite_pct?: number;
+  tier_multiplier?: number;
   logs?: Array<{
     id: string;
     reward_amount: number;
@@ -118,14 +126,39 @@ const mockDb = {
   ] as MarketplaceListing[],
 };
 
+function mockActivityForUser(userId: string) {
+  let h = 0;
+  for (let i = 0; i < userId.length; i++) h = (Math.imul(31, h) + userId.charCodeAt(i)) | 0;
+  const u = (n: number) => 55 + (Math.abs(h >> n) % 36);
+  return {
+    activity_watch_pct: u(0),
+    activity_likes_pct: u(3),
+    activity_comments_pct: u(6),
+    activity_shares_pct: u(9),
+  };
+}
+
 function ensureReward(userId: string): RewardState {
   if (!mockDb.rewards[userId]) {
+    const pts = 6400;
+    const act = mockActivityForUser(userId);
+    const composite =
+      act.activity_watch_pct * 0.4 +
+      act.activity_likes_pct * 0.2 +
+      act.activity_comments_pct * 0.2 +
+      act.activity_shares_pct * 0.2;
     mockDb.rewards[userId] = {
-      points: 6400,
+      points: pts,
       current_tier: 'Bronze',
-      eligibility_status: 'locked',
-      progress_percent: 64,
-      estimated_reward: 128,
+      eligibility_status: pts >= 10000 ? 'unlocked' : 'locked',
+      progress_percent: Math.min(100, (pts / 10000) * 100),
+      estimated_reward: Math.min(200, Math.round((composite / 100) * 100 * 1.0)),
+      activity_watch_pct: act.activity_watch_pct,
+      activity_likes_pct: act.activity_likes_pct,
+      activity_comments_pct: act.activity_comments_pct,
+      activity_shares_pct: act.activity_shares_pct,
+      activity_composite_pct: Math.round(composite),
+      tier_multiplier: pts >= 10000 ? 1.0 : undefined,
       logs: [],
     };
   }
@@ -149,7 +182,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return res.json();
 }
 
-async function requestOrMock<T>(url: string, init?: RequestInit, fallback: () => T): Promise<T> {
+async function requestOrMock<T>(url: string, init: RequestInit | undefined, fallback: () => T): Promise<T> {
   if (!useHttpAssetsApi) return fallback();
   try {
     return await request<T>(url, init);
@@ -344,7 +377,7 @@ export const assetsApi = {
       },
       () => {
         const rw = ensureReward(userId);
-        const amount = rw.eligibility_status === 'unlocked' ? Math.max(20, rw.estimated_reward) : 0;
+        const amount = rw.points >= 10000 ? Math.max(20, rw.estimated_reward) : 0;
         if (amount > 0) {
           rw.logs = [{ id: `log-${Date.now()}`, reward_amount: amount, activity_score: 0.7, points_snapshot: rw.points, created_at: new Date().toISOString() }, ...(rw.logs || [])];
         }

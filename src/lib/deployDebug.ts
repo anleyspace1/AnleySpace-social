@@ -3,6 +3,8 @@
  * Does not change UI — console only.
  */
 
+import { API_ORIGIN } from './apiOrigin';
+
 let clientEnvLogged = false;
 
 function safeHost(url: string | undefined): string {
@@ -21,7 +23,8 @@ export function logClientDeployEnvOnce(): void {
 
   const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined;
   const anonPresent = !!(import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined)?.length;
-  const apiOrigin = (import.meta.env.VITE_API_ORIGIN as string | undefined)?.trim() || '';
+  const rawViteApi = (import.meta.env.VITE_API_ORIGIN as string | undefined)?.trim() || '';
+  const rawNextApi = (import.meta.env.NEXT_PUBLIC_API_ORIGIN as string | undefined)?.trim() || '';
 
   const hostname =
     typeof window !== 'undefined' ? window.location.hostname : '(ssr)';
@@ -31,7 +34,9 @@ export function logClientDeployEnvOnce(): void {
     hostname,
     supabaseHost: safeHost(supabaseUrl),
     supabaseAnonKeyPresent: anonPresent,
-    viteApiOrigin: apiOrigin || '(empty — requests use same-origin /api/...)',
+    viteApiOriginRaw: rawViteApi || '(empty)',
+    nextPublicApiOriginRaw: rawNextApi || '(empty)',
+    effectiveApiOrigin: API_ORIGIN || '(empty — relative /api/...; feed like/comment use Supabase if API missing)',
   });
 
   if (hostname.includes('vercel.app') || hostname.endsWith('vercel.com')) {

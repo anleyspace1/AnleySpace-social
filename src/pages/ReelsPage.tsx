@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
@@ -10,7 +10,6 @@ import {
   Gift,
   Music, 
   Plus,
-  Zap,
   X,
   Video as VideoIcon,
   Home,
@@ -33,12 +32,13 @@ import {
   RefreshCw,
   Type,
   Sparkles,
-  Scissors
+  Scissors,
+  Lock,
 } from 'lucide-react';
 import { MOCK_SOUNDS } from '../constants';
 import { cn } from '../lib/utils';
 import { supabase } from '../lib/supabase';
-import { apiUrl } from '../lib/apiOrigin';
+import { apiUrl, fetchFeedApiSafe } from '../lib/apiOrigin';
 import { useAuth } from '../contexts/AuthContext';
 import { Video } from '../types';
 import ShareModal from '../components/ShareModal';
@@ -49,7 +49,12 @@ import { isPlaceholderUsername } from '../lib/realDataGuards';
 import { getViews, getViralScore } from '../lib/postViews';
 import { getPersonalizedScore, trackWatchTime, updateInterest } from '../lib/personalizedRanking';
 import { maybeRewardViralPost } from '../lib/viralRewards';
-import { boostPostAction, BOOST_COST } from '../lib/boostPost';
+import {
+  fetchMonetizationPost,
+  sendMonetizationGift,
+  type MonetizationPostStatus,
+} from '../lib/monetization';
+import { subscribePostMonetization } from '../lib/monetizationRealtime';
 import { hasRecordedViewThisSession, markPostViewRecordedSession } from '../lib/postViewTracking';
 import { ReelsFeedSkeleton } from '../components/LoadingSkeletons';
 import {
@@ -57,29 +62,12 @@ import {
   resolveStorageExtension,
   storageUploadContentType,
 } from '../lib/storageUpload';
+import { fetchCommentsWithProfiles, resolveProfileUsername } from '../lib/postComments';
 
 /** Views per hour above this = show “Viral” badge and sort higher. */
 const VIRAL_THRESHOLD = 50;
 /** Minimum total views before a post can be marked viral. */
 const MIN_VIEWS = 100;
-
-const resolveProfileUsername = (username?: string | null) => {
-  const value = (username || '').trim();
-  if (!value) return 'User';
-  return value;
-};
-
-/** Pause every <video> in the document so only one reel can play audio at a time. */
-function pauseAllVideos() {
-  document.querySelectorAll('video').forEach((el) => {
-    el.pause();
-    try {
-      el.currentTime = 0;
-    } catch {
-      /* ignore */
-    }
-  });
-}
 
 export default function ReelsPage() {
   const navigate = useNavigate();
@@ -109,8 +97,13 @@ export default function ReelsPage() {
   const [isTouchDevice, setIsTouchDevice] = useState(false);
   const [isMuted, setIsMuted] = useState(true);
   const feedRef = useRef<HTMLDivElement | null>(null);
+  const [feedScrollRoot, setFeedScrollRoot] = useState<HTMLElement | null>(null);
   const videoRefs = useRef<(HTMLDivElement | null)[]>([]);
   const reelVideoElsRef = useRef<Record<string, HTMLVideoElement | null>>({});
+
+  useLayoutEffect(() => {
+    setFeedScrollRoot(feedRef.current);
+  }, [videos.length]);
 
   useEffect(() => {
     const mq = window.matchMedia('(pointer: coarse)');
@@ -470,14 +463,35 @@ export default function ReelsPage() {
     return () => cancelAnimationFrame(raf);
   }, [videos, selectedPost?.id]);
 
-  const updateVideoCounts = (
-    videoId: string,
-    patch: Partial<{ likes: number; comments: number; views: number; liked: boolean }>
-  ) => {
-    setVideos(prev =>
-      prev.map((v) => (String(v.id) === String(videoId) ? { ...v, ...patch } : v))
-    );
-  };
+  const updateVideoCounts = useCallback(
+    (
+      videoId: string,
+      patch: Partial<{ likes: number; comments: number; views: number; liked: boolean }>
+    ) => {
+      setVideos((prev) =>
+        prev.map((v) => (String(v.id) === String(videoId) ? { ...v, ...patch } : v))
+      );
+    },
+    []
+  );
+
+  /** Pause every reel <video> inside the feed only (avoids touching other pages’ media). */
+  const pauseAllReelVideos = useCallback(() => {
+    const root = feedRef.current;
+    if (!root) return;
+    root.querySelectorAll('video').forEach((el) => {
+      el.pause();
+      try {
+        el.currentTime = 0;
+      } catch {
+        /* ignore */
+      }
+    });
+  }, []);
+
+  const setActiveReel = useCallback((id: string) => {
+    setActiveVideoId(id);
+  }, []);
 
   const refreshPostCounts = useCallback(async (postId: string) => {
     try {
@@ -647,17 +661,20 @@ export default function ReelsPage() {
             >
               <VideoPost
                 video={video}
+                reelId={String(video.id)}
+                feedScrollRoot={feedScrollRoot}
                 hasUserInteracted={hasUserInteracted}
                 isTouchDevice={isTouchDevice}
                 globalMuted={isMuted}
                 activeVideoId={activeVideoId}
+                pauseAllReelVideos={pauseAllReelVideos}
                 onToggleGlobalMute={() => setIsMuted((prev) => !prev)}
                 onUserInteract={() => setHasUserInteracted(true)}
                 onVideoElementRef={(videoId, el) => {
                   reelVideoElsRef.current[String(videoId)] = el;
                 }}
                 onToggleComments={() => setIsCommentsOpen(!isCommentsOpen)}
-                onActive={() => setActiveVideoId(String(video.id))}
+                onReelActive={setActiveReel}
                 onCountsChange={updateVideoCounts}
                 onRefreshPostCounts={(postId) => void refreshPostCounts(postId)}
                 onUseSound={(sound) => {
@@ -1279,29 +1296,35 @@ function SoundSelector({ onClose, onSelect, selectedSoundId }: { onClose: () => 
 
 function VideoPost({
   video,
+  reelId,
+  feedScrollRoot,
   hasUserInteracted,
   isTouchDevice,
   globalMuted,
   activeVideoId,
+  pauseAllReelVideos,
   onToggleGlobalMute,
   onUserInteract,
   onVideoElementRef,
   onToggleComments,
-  onActive,
+  onReelActive,
   onUseSound,
   onCountsChange,
   onRefreshPostCounts,
 }: {
   video: any;
+  reelId: string;
+  feedScrollRoot: HTMLElement | null;
   hasUserInteracted: boolean;
   isTouchDevice: boolean;
   globalMuted: boolean;
   activeVideoId: string | null;
+  pauseAllReelVideos: () => void;
   onToggleGlobalMute: () => void;
   onUserInteract: () => void;
   onVideoElementRef: (videoId: string, el: HTMLVideoElement | null) => void;
   onToggleComments: () => void;
-  onActive: () => void;
+  onReelActive: (id: string) => void;
   onUseSound: (sound: any) => void;
   onCountsChange: (videoId: string, patch: Partial<{ likes: number; comments: number; views: number; liked: boolean }>) => void;
   onRefreshPostCounts: (postId: string) => void;
@@ -1321,11 +1344,18 @@ function VideoPost({
   const [showSoundIcon, setShowSoundIcon] = useState(false);
   const [isReady, setIsReady] = useState(false);
   const [videoFailed, setVideoFailed] = useState(false);
+  const [monetization, setMonetization] = useState<MonetizationPostStatus | null>(null);
+  const reelContainerRef = useRef<HTMLDivElement>(null);
+  const intersectingRef = useRef(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const blurVideoRef = useRef<HTMLVideoElement>(null);
   const soundIconTimerRef = useRef<number | null>(null);
   const hasReelViewCountedRef = useRef(false);
   const watchStartRef = useRef<number | null>(null);
+  const monetizationPromoTimersRef = useRef<{ show?: number; hide?: number }>({});
+  const [monetizationPromoVisible, setMonetizationPromoVisible] = useState(false);
+
+  const TIP_COINS = 50;
 
   const REEL_GIFTS = [
     { id: 'g1', icon: '🎁', price: 500 },
@@ -1336,12 +1366,70 @@ function VideoPost({
     { id: 'g6', icon: '🌹', price: 50 },
   ];
 
+  const ownerId = String(
+    (video as { post_user_id?: string; user_id?: string })?.post_user_id ??
+      (video as { user_id?: string })?.user_id ??
+      (video as { user?: { id?: string } })?.user?.id ??
+      ''
+  ).trim();
+  const isOwner = !!user?.id && ownerId === user.id;
+  const monetizationUnlocked = !!monetization?.unlocked;
+  const canGiftOrTip = monetizationUnlocked && !isOwner && !!user?.id;
+
+  const reloadMonetization = useCallback(async () => {
+    const reelId = video?.id != null ? String(video.id) : null;
+    if (!reelId) return;
+    const s = await fetchMonetizationPost(reelId);
+    setMonetization(s);
+  }, [video?.id]);
+
+  useEffect(() => {
+    void reloadMonetization();
+  }, [reloadMonetization]);
+
+  useEffect(() => {
+    return subscribePostMonetization((postId) => {
+      const reelId = video?.id != null ? String(video.id) : null;
+      if (reelId && postId === reelId) void reloadMonetization();
+    });
+  }, [video?.id, reloadMonetization]);
+
   const playUrl = String((video as any).videoUrl || video.url || '').trim();
   console.log("VIDEO URL:", playUrl);
   const urlOk = isValidVideoUrl(playUrl);
   const thumbStr = String((video as any).thumbnail || '').trim();
   const thumbOk = isValidVideoUrl(thumbStr);
   const posterForPlayer = thumbOk ? thumbStr : urlOk ? `${playUrl}#t=0.1` : undefined;
+
+  /** Short timed promo when monetization is locked; resets on reel / unlock / player state change. */
+  useEffect(() => {
+    const t = monetizationPromoTimersRef.current;
+    if (t.show != null) window.clearTimeout(t.show);
+    if (t.hide != null) window.clearTimeout(t.hide);
+    t.show = undefined;
+    t.hide = undefined;
+    setMonetizationPromoVisible(false);
+
+    const eligible = !monetizationUnlocked && urlOk && !videoFailed;
+    if (!eligible) return;
+
+    const DELAY_MS = 2600;
+    const VISIBLE_MS = 2600;
+
+    t.show = window.setTimeout(() => {
+      setMonetizationPromoVisible(true);
+      t.hide = window.setTimeout(() => {
+        setMonetizationPromoVisible(false);
+        t.hide = undefined;
+      }, VISIBLE_MS);
+      t.show = undefined;
+    }, DELAY_MS);
+
+    return () => {
+      if (t.show != null) window.clearTimeout(t.show);
+      if (t.hide != null) window.clearTimeout(t.hide);
+    };
+  }, [video?.id, monetizationUnlocked, urlOk, videoFailed]);
 
   const flushMainVideoWatchSegment = useCallback(() => {
     if (watchStartRef.current != null) {
@@ -1391,12 +1479,12 @@ function VideoPost({
     setIsLiked(nextLiked);
     onCountsChange(reelId, { likes: prevLikesCount + (nextLiked ? 1 : -1), liked: nextLiked });
     try {
-      const response = await fetch(apiUrl('/api/feed/post-like'), {
+      const response = await fetchFeedApiSafe(apiUrl('/api/feed/post-like'), {
         method: 'POST',
         headers: jsonHeaders,
         body: JSON.stringify({ userId, postId: reelId })
       });
-      if (!response.ok) throw new Error('Failed to like post');
+      if (!response || !response.ok) throw new Error('Failed to like post');
       const data = await response.json().catch(() => null);
       console.log('[ReelsPage] post-like response', { postId: reelId, data });
 
@@ -1563,20 +1651,38 @@ function VideoPost({
       return;
     }
     const userId = user?.id;
-    if (!userId) return;
+    if (!userId) {
+      alert('Sign in to send gifts.');
+      return;
+    }
+    if (!monetizationUnlocked) {
+      alert('Monetization is locked on this reel until the creator boosts.');
+      return;
+    }
+    if (isOwner) {
+      alert('You cannot gift your own content.');
+      return;
+    }
     const giftToSend =
       selectedGiftId ? REEL_GIFTS.find((g) => g.id === selectedGiftId) : undefined;
     const finalGift = giftToSend || REEL_GIFTS[0];
+    const coins = finalGift?.price ?? 50;
 
     console.log('[ReelsPage] gift send', {
       reelId,
       userId,
       giftId: finalGift?.id,
-      giftPrice: finalGift?.price
+      giftPrice: coins,
     });
 
-    // Local animation/UX fix (this page didn't previously wire any gift logic).
-    // This restores click functionality without changing layout.
+    const res = await sendMonetizationGift(reelId, coins);
+    if (!res.ok) {
+      alert(res.error || 'Gift failed');
+      return;
+    }
+    await refreshProfile();
+    await reloadMonetization();
+
     setActiveGifts((prev) => [
       ...prev,
       {
@@ -1584,11 +1690,44 @@ function VideoPost({
         reelId,
         senderId: userId,
         giftId: finalGift?.id,
-        coins: finalGift?.price
-      }
+        coins,
+      },
     ]);
 
     const newHearts = Array.from({ length: 8 }).map((_, i) => ({
+      id: Date.now() + i,
+      x: Math.random() * 60 - 30,
+    }));
+    setFloatingHearts((prev) => [...prev, ...newHearts]);
+    setTimeout(() => {
+      setFloatingHearts((prev) => prev.filter((h) => !newHearts.find((nh) => nh.id === h.id)));
+    }, 2000);
+  };
+
+  const handleSendTip = async () => {
+    const reelId = video?.id != null ? String(video.id) : null;
+    if (!reelId || !user?.id) {
+      alert('Sign in to tip.');
+      return;
+    }
+    if (!monetizationUnlocked) {
+      alert('Monetization is locked until the creator boosts.');
+      return;
+    }
+    if (isOwner) return;
+    const bal = Number(profile?.coins) || 0;
+    if (bal < TIP_COINS) {
+      alert(`You need at least ${TIP_COINS} coins to tip.`);
+      return;
+    }
+    const res = await sendMonetizationGift(reelId, TIP_COINS);
+    if (!res.ok) {
+      alert(res.error || 'Tip failed');
+      return;
+    }
+    await refreshProfile();
+    await reloadMonetization();
+    const newHearts = Array.from({ length: 5 }).map((_, i) => ({
       id: Date.now() + i,
       x: Math.random() * 60 - 30,
     }));
@@ -1606,7 +1745,8 @@ function VideoPost({
           videoRef.current.pause();
           setIsPlaying(false);
         } else {
-          pauseAllVideos();
+          pauseAllReelVideos();
+          onReelActive(reelId);
           const v = videoRef.current;
           const b = blurVideoRef.current;
           v.currentTime = 0;
@@ -1619,7 +1759,7 @@ function VideoPost({
         console.error("Video play failed:", error);
       }
     }
-  }, [isPlaying, urlOk]);
+  }, [isPlaying, urlOk, pauseAllReelVideos, onReelActive, reelId]);
 
   const handleVideoSurfaceTap = useCallback(() => {
     if (!urlOk) return;
@@ -1636,7 +1776,8 @@ function VideoPost({
         setShowSoundIcon(false);
       }, 2000);
       if (el.paused) {
-        pauseAllVideos();
+        pauseAllReelVideos();
+        onReelActive(reelId);
         el.currentTime = 0;
         const b = blurVideoRef.current;
         if (b) b.currentTime = 0;
@@ -1653,7 +1794,8 @@ function VideoPost({
     if (!hasUserInteracted) {
       onUserInteract();
       el.muted = false;
-      pauseAllVideos();
+      pauseAllReelVideos();
+      onReelActive(reelId);
       el.currentTime = 0;
       const b = blurVideoRef.current;
       if (b) b.currentTime = 0;
@@ -1662,7 +1804,7 @@ function VideoPost({
       return;
     }
     void togglePlay();
-  }, [hasUserInteracted, onToggleGlobalMute, onUserInteract, togglePlay, isTouchDevice, urlOk]);
+  }, [hasUserInteracted, onToggleGlobalMute, onUserInteract, togglePlay, isTouchDevice, urlOk, pauseAllReelVideos, onReelActive, reelId]);
 
   useEffect(() => {
     if (videoRef.current) {
@@ -1710,26 +1852,62 @@ function VideoPost({
     };
   }, []);
 
+  const tryPlayMain = useCallback(() => {
+    const v = videoRef.current;
+    const b = blurVideoRef.current;
+    if (!v || !urlOk || videoFailed) return;
+    const run = () => {
+      if (!intersectingRef.current) return;
+      void b?.play().catch(() => {});
+      void v.play().then(() => setIsPlaying(true)).catch(() => {});
+    };
+    if (v.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+      run();
+    } else {
+      const onCanPlay = () => {
+        v.removeEventListener('canplay', onCanPlay);
+        run();
+      };
+      v.addEventListener('canplay', onCanPlay);
+    }
+  }, [urlOk, videoFailed]);
+
+  /** Observe the full reel cell (not the letterboxed <video>) so visibility matches viewport / scroll root. */
   useEffect(() => {
     if (!urlOk || videoFailed) return;
+    const root = reelContainerRef.current;
+    if (!root) return;
+
+    const REEL_VISIBLE_RATIO = 0.65;
+
     const observer = new IntersectionObserver(
       (entries) => {
         entries.forEach((entry) => {
-          if (entry.isIntersecting) {
-            pauseAllVideos();
-            onActive();
+          if (entry.target !== root) return;
+          const visible = entry.isIntersecting && entry.intersectionRatio >= REEL_VISIBLE_RATIO;
+
+          if (visible) {
+            intersectingRef.current = true;
+            pauseAllReelVideos();
+            onReelActive(reelId);
             const v = videoRef.current;
             const b = blurVideoRef.current;
             if (v) {
-              v.currentTime = 0;
-              void v.play().catch(() => {});
-              setIsPlaying(true);
+              try {
+                v.currentTime = 0;
+              } catch {
+                /* ignore */
+              }
             }
             if (b) {
-              b.currentTime = 0;
-              void b.play().catch(() => {});
+              try {
+                b.currentTime = 0;
+              } catch {
+                /* ignore */
+              }
             }
-            const reelId = video?.id != null ? String(video.id) : '';
+            tryPlayMain();
+
             if (
               reelId &&
               !hasReelViewCountedRef.current &&
@@ -1751,6 +1929,7 @@ function VideoPost({
                 });
             }
           } else {
+            intersectingRef.current = false;
             const v = videoRef.current;
             const b = blurVideoRef.current;
             if (v) {
@@ -1773,17 +1952,39 @@ function VideoPost({
           }
         });
       },
-      { threshold: 0.9 }
+      {
+        root: feedScrollRoot,
+        rootMargin: '0px',
+        threshold: [0, 0.15, 0.35, 0.5, 0.65, 0.75, 0.85, 1],
+      }
     );
 
-    if (videoRef.current) observer.observe(videoRef.current);
+    observer.observe(root);
     return () => observer.disconnect();
-  }, [onActive, onCountsChange, video, urlOk, videoFailed]);
+  }, [
+    feedScrollRoot,
+    onReelActive,
+    onCountsChange,
+    pauseAllReelVideos,
+    reelId,
+    tryPlayMain,
+    urlOk,
+    videoFailed,
+    video,
+  ]);
+
+  /** If metadata loads after the reel became active, ensure playback starts once the element is ready. */
+  useEffect(() => {
+    if (!isReady || !intersectingRef.current || !urlOk || videoFailed) return;
+    const v = videoRef.current;
+    if (!v || !v.paused) return;
+    tryPlayMain();
+  }, [isReady, urlOk, videoFailed, tryPlayMain]);
 
   const desktopMuted = !hasUserInteracted;
 
   return (
-    <div className="relative w-full h-screen overflow-hidden bg-black group">
+    <div ref={reelContainerRef} className="relative w-full h-screen overflow-hidden bg-black group">
       {video.isViral && (
         <div className="pointer-events-none absolute top-2 left-2 z-30 bg-orange-500 text-white text-xs px-2 py-1 rounded-full font-bold shadow-lg">
           🔥 Viral
@@ -1960,40 +2161,39 @@ function VideoPost({
           onClick={() => setIsShareModalOpen(true)}
         />
         <ActionButton 
-          icon={<Zap className="text-amber-400" size={30} />} 
-          label="Boost" 
-          onClick={(e) => {
-            e.stopPropagation();
-            if (!user?.id) {
-              alert('Sign in to boost posts.');
-              return;
-            }
-            const bal = Number(profile?.coins) || 0;
-            if (bal < BOOST_COST) {
-              alert(`You need at least ${BOOST_COST} coins to boost.`);
-              return;
-            }
-            void boostPostAction(String(video.id), user.id).then((res) => {
-              if (res.ok) void refreshProfile();
-              else alert(res.message || 'Boost failed');
-            });
-          }}
-        />
-        <ActionButton 
           icon={<Bookmark className={cn("transition-all duration-300", isSaved ? "text-white fill-white" : "text-white")} size={30} />} 
           label="" 
           onClick={() => void handleSaveToggle()}
         />
-        <ActionButton 
-          icon={<Gift className="text-orange-400" size={30} />} 
-          label="Send Gift" 
-          onClick={() => {
-            // Keep the existing scroll affordance, but also perform the send action.
-            const el = document.getElementById('gift-selection-row');
-            el?.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
-            void handleSendGift();
-          }}
-        />
+        {canGiftOrTip && (
+          <ActionButton
+            icon={<Gift className="text-orange-400" size={30} />}
+            label="Gift"
+            onClick={() => {
+              const el = document.getElementById('gift-selection-row');
+              el?.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
+              void handleSendGift();
+            }}
+          />
+        )}
+        {canGiftOrTip && (
+          <ActionButton
+            icon={<Coins className="text-yellow-400" size={30} />}
+            label="Tip"
+            onClick={(e) => {
+              e.stopPropagation();
+              void handleSendTip();
+            }}
+          />
+        )}
+        {!monetizationUnlocked && !isOwner && (
+          <div className="flex flex-col items-center gap-1 max-w-[72px]">
+            <div className="w-12 h-12 rounded-full bg-black/50 border border-white/20 flex items-center justify-center">
+              <Lock className="text-white/70" size={22} />
+            </div>
+            <span className="text-[9px] text-white/60 text-center font-bold leading-tight">Locked</span>
+          </div>
+        )}
         <ActionButton 
           icon={<Camera className="text-white" size={30} />} 
           label="" 
@@ -2003,6 +2203,24 @@ function VideoPost({
       {/* Bottom Content Overlay */}
       <div className="absolute bottom-12 sm:bottom-24 left-6 right-20 z-10">
         <div className="flex flex-col gap-3">
+          {monetizationUnlocked && monetization && (
+            <div className="rounded-xl border border-emerald-500/30 bg-black/50 px-3 py-2 backdrop-blur-md max-w-sm space-y-1.5">
+              <p className="text-emerald-300 text-[10px] font-black uppercase tracking-wider">Earnings (boost cap)</p>
+              <div className="h-2 w-full rounded-full bg-white/10 overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-teal-400 transition-all"
+                  style={{
+                    width: `${Math.round((monetization.boostProgress || 0) * 100)}%`,
+                  }}
+                />
+              </div>
+              <p className="text-white/90 text-[10px] font-mono">
+                Boost: ${(monetization.boostEarningsCents / 100).toFixed(2)} / $
+                {(monetization.maxBoostEarningsCents / 100).toFixed(2)} · Organic: $
+                {(Number(monetization.organicEarningsCents) / 100).toFixed(2)}
+              </p>
+            </div>
+          )}
           {/* Product Integration */}
           <div className="flex items-center gap-3">
             <div className="w-12 h-12 rounded-full border-2 border-white/20 overflow-hidden shadow-xl bg-white/10 flex items-center justify-center">
@@ -2036,36 +2254,86 @@ function VideoPost({
         </div>
       </div>
 
+      {/* Timed monetization promo (locked reels only; mutually exclusive with earnings card above) */}
+      <AnimatePresence>
+        {monetizationPromoVisible && !monetizationUnlocked && urlOk && !videoFailed && (
+          <motion.button
+            key={`monetization-promo-${String(video?.id ?? '')}`}
+            type="button"
+            initial={{ opacity: 0, y: 18 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 10 }}
+            transition={{ duration: 0.38, ease: [0.22, 1, 0.36, 1] }}
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              navigate(user ? '/profile' : '/login');
+            }}
+            className={cn(
+              'absolute left-1/2 z-[25] max-w-sm -translate-x-1/2 pointer-events-auto cursor-pointer select-none',
+              'bottom-[6.75rem] sm:bottom-[8.25rem]',
+              'rounded-xl border border-[#D97706] bg-black px-3.5 py-2.5 text-left shadow-lg shadow-black/40',
+              'backdrop-blur-sm transition-transform active:scale-[0.99] hover:brightness-110'
+            )}
+            aria-label="Open profile to boost and earn"
+          >
+            <p className="text-white text-xs font-black tracking-tight">🔒 Monetization locked</p>
+            <p className="text-gray-300 text-[11px] font-medium mt-0.5">🚀 Boost to earn</p>
+          </motion.button>
+        )}
+      </AnimatePresence>
+
       {/* Tablet Gift Selection Row */}
-      <div id="gift-selection-row" className="hidden lg:flex absolute bottom-6 left-6 right-6 h-16 bg-black/40 backdrop-blur-xl border border-white/10 rounded-2xl items-center justify-between px-6 z-10">
-        <div className="flex items-center gap-8 overflow-x-auto no-scrollbar">
-          {REEL_GIFTS.map((gift) => (
-            <button
-              key={gift.id}
-              type="button"
-              onClick={() => handleSelectGift(gift)}
-              className="flex flex-col items-center gap-1 group"
-            >
-              <span className="text-2xl group-hover:scale-125 transition-transform">{gift.icon}</span>
-              <div className="flex items-center gap-1 text-yellow-500 text-[9px] font-black">
-                <Coins size={10} />
-                {gift.price}
+      <div
+        id="gift-selection-row"
+        className="hidden lg:flex absolute bottom-6 left-6 right-6 min-h-16 bg-black/40 backdrop-blur-xl border border-white/10 rounded-2xl items-center justify-between px-6 py-2 z-10"
+      >
+        {canGiftOrTip ? (
+          <>
+            <div className="flex items-center gap-8 overflow-x-auto no-scrollbar">
+              {REEL_GIFTS.map((gift) => (
+                <button
+                  key={gift.id}
+                  type="button"
+                  onClick={() => handleSelectGift(gift)}
+                  className="flex flex-col items-center gap-1 group"
+                >
+                  <span className="text-2xl group-hover:scale-125 transition-transform">{gift.icon}</span>
+                  <div className="flex items-center gap-1 text-yellow-500 text-[9px] font-black">
+                    <Coins size={10} />
+                    {gift.price}
+                  </div>
+                </button>
+              ))}
+              <div className="flex flex-col items-center gap-1">
+                <span className="text-[10px] font-black text-white/40 uppercase tracking-widest">Tip {TIP_COINS}c</span>
               </div>
-            </button>
-          ))}
-          <div className="flex flex-col items-center gap-1">
-            <span className="text-[10px] font-black text-white/40 uppercase tracking-widest">50 Coins</span>
+            </div>
+            <div className="flex items-center gap-4 shrink-0">
+              <div className="flex items-center gap-2">
+                <Coins size={18} className="text-yellow-500" />
+                <span className="text-white font-black text-sm">{Number(profile?.coins ?? 0)}</span>
+              </div>
+              <button
+                type="button"
+                className="bg-white/10 p-2 rounded-full text-white hover:bg-white/20 transition-colors"
+                aria-label="Add coins"
+                onClick={() => navigate('/wallet')}
+              >
+                <Plus size={18} />
+              </button>
+            </div>
+          </>
+        ) : (
+          <div className="flex w-full items-center justify-center gap-2 py-2 text-white/70 text-sm font-semibold">
+            <Lock size={16} />
+            <span>
+              {isOwner
+                ? 'Boost from your profile to unlock gifts & tips.'
+                : '🔒 Monetization locked — creator must boost to enable gifts.'}
+            </span>
           </div>
-        </div>
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-2">
-            <Coins size={18} className="text-yellow-500" />
-            <span className="text-white font-black text-sm">824</span>
-          </div>
-          <button className="bg-white/10 p-2 rounded-full text-white hover:bg-white/20 transition-colors">
-            <Plus size={18} />
-          </button>
-        </div>
+        )}
       </div>
 
       {/* Floating Hearts Overlay */}
@@ -2112,6 +2380,7 @@ function VideoPost({
           }
         }}
       />
+
     </div>
   );
 }
@@ -2173,7 +2442,7 @@ function SuggestedReels({ videos, onSelect }: { videos: any[]; onSelect: (id: st
               <span className="text-white text-[8px] font-bold">@{video.user.username}</span>
             </div>
             <div className="absolute bottom-2 right-2 flex items-center gap-1">
-              <Zap size={8} className="text-white" />
+              <Heart size={8} className="text-white fill-white/30" />
               <span className="text-white text-[8px] font-bold">{(video.likes / 100).toFixed(1)}K</span>
             </div>
           </button>
@@ -2221,38 +2490,8 @@ function CommentsSection({
       if (!video?.id) return;
       const postId = String(video.id);
       try {
-        const { data, error } = await supabase
-          .from('comments')
-          .select('id, post_id, user_id, content, created_at')
-          .eq('post_id', postId)
-          .order('created_at', { ascending: true });
-        if (error) throw error;
-
-        const userIds = Array.from(new Set((data || []).map((c: any) => c.user_id).filter(Boolean)));
-        let profilesMap: Record<string, any> = {};
-        if (userIds.length > 0) {
-          const { data: profilesData, error: profilesErr } = await supabase
-            .from('profiles')
-            .select('id, username, avatar_url')
-            .in('id', userIds);
-          if (profilesErr) {
-            console.error('Failed to fetch comment profiles:', profilesErr);
-          } else {
-            profilesMap = (profilesData || []).reduce((acc: any, p: any) => {
-              acc[String(p.id)] = p;
-              return acc;
-            }, {});
-          }
-        }
-
-        setComments((data || []).map((c: any) => ({
-          id: c.id,
-          user: resolveProfileUsername(profilesMap[String(c.user_id)]?.username),
-          text: c.content,
-          avatar: profilesMap[String(c.user_id)]?.avatar_url || '',
-          time: c.created_at ? new Date(c.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'now',
-          likes: '0',
-        })));
+        const rows = await fetchCommentsWithProfiles(supabase, postId);
+        setComments(rows.map((r) => ({ ...r, likes: '0' })));
       } catch (err) {
         console.error('Failed to fetch reel(post) comments:', err);
       }
@@ -2281,7 +2520,7 @@ function CommentsSection({
     console.log('[ReelsPage] comment submit', { postId, userId, text });
     setNewComment('');
     try {
-      const commentRes = await fetch(apiUrl('/api/feed/post-comment'), {
+      const commentRes = await fetchFeedApiSafe(apiUrl('/api/feed/post-comment'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -2291,13 +2530,13 @@ function CommentsSection({
         })
       });
       let inserted: any = null;
-      if (commentRes.ok) {
+      if (commentRes && commentRes.ok) {
         const payload = await commentRes.json().catch(() => ({}));
         inserted = payload?.comment ?? null;
       }
 
       // Fallback: direct supabase insert + non-fatal notifications (same pattern as Home).
-      if (!inserted && !commentRes.ok) {
+      if (!inserted && (!commentRes || !commentRes.ok)) {
         const { data: ins, error } = await supabase
           .from('comments')
           .insert({
@@ -2349,37 +2588,8 @@ function CommentsSection({
         ]);
       }
 
-      // Refresh comments list.
-      const { data: freshData, error: freshErr } = await supabase
-        .from('comments')
-        .select('id, post_id, user_id, content, created_at')
-        .eq('post_id', postId)
-        .order('created_at', { ascending: true });
-      if (freshErr) throw freshErr;
-
-      const freshUserIds = Array.from(new Set((freshData || []).map((c: any) => c.user_id).filter(Boolean)));
-      let freshProfilesMap: Record<string, any> = {};
-      if (freshUserIds.length > 0) {
-        const { data: freshProfilesData, error: freshProfilesErr } = await supabase
-          .from('profiles')
-          .select('id, username, avatar_url')
-          .in('id', freshUserIds);
-        if (!freshProfilesErr) {
-          freshProfilesMap = (freshProfilesData || []).reduce((acc: any, p: any) => {
-            acc[String(p.id)] = p;
-            return acc;
-          }, {});
-        }
-      }
-
-      setComments((freshData || []).map((c: any) => ({
-        id: c.id,
-        user: resolveProfileUsername(freshProfilesMap[String(c.user_id)]?.username),
-        text: c.content,
-        avatar: freshProfilesMap[String(c.user_id)]?.avatar_url || '',
-        time: c.created_at ? new Date(c.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'now',
-        likes: '0',
-      })));
+      const freshRows = await fetchCommentsWithProfiles(supabase, postId);
+      setComments(freshRows.map((r) => ({ ...r, likes: '0' })));
 
       const { count, error: countErr } = await supabase
         .from('comments')
@@ -2462,93 +2672,6 @@ function CommentsSection({
         </form>
       </div>
     </div>
-  );
-}
-
-function BoostModal({ onClose, video }: { onClose: () => void; video: any }) {
-  const [isBoosting, setIsBoosting] = useState(false);
-  const [success, setSuccess] = useState(false);
-
-  const handleBoost = () => {
-    setIsBoosting(true);
-    // Simulate API call
-    setTimeout(() => {
-      setIsBoosting(false);
-      setSuccess(true);
-      setTimeout(() => {
-        onClose();
-      }, 2000);
-    }, 1500);
-  };
-
-  return (
-    <motion.div 
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-md flex items-center justify-center p-4"
-    >
-      <motion.div 
-        initial={{ scale: 0.9, opacity: 0 }}
-        animate={{ scale: 1, opacity: 1 }}
-        exit={{ scale: 0.9, opacity: 0 }}
-        className="bg-gray-900 w-full max-w-sm rounded-3xl overflow-hidden border border-white/10 shadow-2xl p-6 text-center"
-      >
-        {!success ? (
-          <>
-            <div className="w-20 h-20 bg-indigo-600/20 rounded-full flex items-center justify-center mx-auto mb-6">
-              <Zap size={40} className="text-indigo-500" />
-            </div>
-            <h3 className="text-xl font-bold text-white mb-2">Boost this Reel?</h3>
-            <p className="text-gray-400 text-sm mb-8">
-              Reach up to 5,000 more people and increase your visibility in the feed.
-            </p>
-            
-            <div className="bg-white/5 rounded-2xl p-4 mb-8 flex items-center justify-between border border-white/5">
-              <div className="flex items-center gap-2">
-                <Coins className="text-yellow-500" size={20} />
-                <span className="text-white font-bold">Cost</span>
-              </div>
-              <span className="text-yellow-500 font-black text-lg">500 Coins</span>
-            </div>
-
-            <div className="flex gap-3">
-              <button 
-                onClick={onClose}
-                className="flex-1 px-6 py-3 rounded-xl font-bold text-gray-400 hover:text-white transition-colors"
-              >
-                Cancel
-              </button>
-              <button 
-                disabled={isBoosting}
-                onClick={handleBoost}
-                className="flex-1 bg-indigo-600 text-white px-6 py-3 rounded-xl font-bold shadow-lg shadow-indigo-500/20 flex items-center justify-center gap-2"
-              >
-                {isBoosting ? (
-                  <div className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin" />
-                ) : (
-                  'Confirm'
-                )}
-              </button>
-            </div>
-          </>
-        ) : (
-          <motion.div 
-            initial={{ scale: 0.5, opacity: 0 }}
-            animate={{ scale: 1, opacity: 1 }}
-            className="py-8"
-          >
-            <div className="w-20 h-20 bg-green-500/20 rounded-full flex items-center justify-center mx-auto mb-6">
-              <div className="text-green-500 text-4xl">✓</div>
-            </div>
-            <h3 className="text-xl font-bold text-white mb-2">Reel Boosted!</h3>
-            <p className="text-gray-400 text-sm">
-              Your reel is now being promoted to more users.
-            </p>
-          </motion.div>
-        )}
-      </motion.div>
-    </motion.div>
   );
 }
 

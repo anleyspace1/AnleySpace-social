@@ -75,6 +75,7 @@ import ResetPasswordPage from './pages/ResetPasswordPage';
 import Sidebar from './components/Sidebar';
 import BottomNav from './components/BottomNav';
 import CallManager from './components/CallManager';
+import MonetizationRealtimeBridge from './components/MonetizationRealtimeBridge';
 
 import { supabase } from './lib/supabase';
 import { BuyCoinsMenu } from './components/BuyCoinsMenu';
@@ -437,6 +438,7 @@ function AppContent() {
       )}
     >
       <CallManager />
+      <MonetizationRealtimeBridge />
       {!isReels && !isCreateReel && <Header darkMode={darkMode} setDarkMode={setDarkMode} />}
       
       <div

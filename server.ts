@@ -2339,6 +2339,323 @@ async function startServer() {
     res.json(txs);
   });
 
+  /** JWT from Authorization: Bearer — for monetization gift/boost (anon key + user session). */
+  async function getBearerUserId(req: Request): Promise<string | null> {
+    const authHeader = req.headers.authorization;
+    const token =
+      typeof authHeader === 'string' && authHeader.startsWith('Bearer ')
+        ? authHeader.slice(7).trim()
+        : '';
+    if (!token || !supabase) return null;
+    const { data: { user } } = await supabase.auth.getUser(token);
+    return user?.id ? String(user.id) : null;
+  }
+
+  /** 1 coin = $0.01; prices in coins; max boost-tracked creator earnings in USD cents. */
+  const MONETIZATION_TIER_DEF = {
+    basic: { priceCoins: 200, maxBoostEarningsCents: 760 },
+    growth: { priceCoins: 500, maxBoostEarningsCents: 1900 },
+    pro: { priceCoins: 1000, maxBoostEarningsCents: 3800 },
+    viral: { priceCoins: 2500, maxBoostEarningsCents: 9500 },
+    mega: { priceCoins: 5000, maxBoostEarningsCents: 19000 },
+  } as const;
+
+  app.get("/api/monetization/post/:postId", async (req, res) => {
+    try {
+      const postId = String(req.params.postId || "").trim();
+      if (!postId) return res.status(400).json({ ok: false, error: "Missing post id" });
+      if (!supabaseAdmin) {
+        return res.status(503).json({ ok: false, error: "Server misconfigured (service role)" });
+      }
+      const { data: row, error } = await supabaseAdmin
+        .from("post_monetization")
+        .select(
+          "post_id, creator_id, tier, price_coins, max_boost_earnings_cents, boost_earnings_cents, organic_earnings_cents, expires_at, created_at"
+        )
+        .eq("post_id", postId)
+        .maybeSingle();
+      if (error) {
+        console.error("[monetization] GET post_monetization", JSON.stringify(error));
+        return res.status(500).json({ ok: false, error: error.message || "Query failed" });
+      }
+      if (!row) {
+        return res.json({
+          ok: true,
+          unlocked: false,
+          monetizationLocked: true,
+          tier: null,
+          expiresAt: null,
+          boostEarningsCents: 0,
+          maxBoostEarningsCents: 0,
+          organicEarningsCents: 0,
+          boostProgress: 0,
+        });
+      }
+      const expiresAt = row.expires_at ? new Date(String(row.expires_at)).getTime() : 0;
+      const now = Date.now();
+      const unlocked = expiresAt > now;
+      const maxC = Number(row.max_boost_earnings_cents) || 0;
+      const boostC = Number(row.boost_earnings_cents) || 0;
+      const organicC = Number(row.organic_earnings_cents) || 0;
+      const boostProgress = maxC > 0 ? Math.min(1, boostC / maxC) : 0;
+      return res.json({
+        ok: true,
+        unlocked,
+        monetizationLocked: !unlocked,
+        tier: row.tier,
+        expiresAt: row.expires_at,
+        boostEarningsCents: boostC,
+        maxBoostEarningsCents: maxC,
+        organicEarningsCents: organicC,
+        boostProgress,
+        creatorId: row.creator_id,
+      });
+    } catch (e: any) {
+      console.error("[monetization] GET /post/:postId", e);
+      return res.status(500).json({ ok: false, error: e?.message || "Failed" });
+    }
+  });
+
+  app.post("/api/monetization/boost", async (req, res) => {
+    try {
+      const userId = await getBearerUserId(req);
+      if (!userId) return res.status(401).json({ ok: false, error: "Unauthorized" });
+      if (!supabaseAdmin) {
+        return res.status(503).json({ ok: false, error: "Server misconfigured (service role)" });
+      }
+      const postId = String(req.body?.postId || req.body?.post_id || "").trim();
+      const tierRaw = String(req.body?.tier || "basic").toLowerCase().trim();
+      const tier = tierRaw in MONETIZATION_TIER_DEF ? (tierRaw as keyof typeof MONETIZATION_TIER_DEF) : null;
+      if (!postId || !tier) {
+        return res.status(400).json({ ok: false, error: "Missing postId or invalid tier" });
+      }
+      const def = MONETIZATION_TIER_DEF[tier];
+      const { data: postRow, error: postErr } = await supabaseAdmin
+        .from("posts")
+        .select("id, user_id")
+        .eq("id", postId)
+        .maybeSingle();
+      if (postErr || !postRow) {
+        console.error("[monetization] boost post fetch", postErr);
+        return res.status(404).json({ ok: false, error: "Post not found" });
+      }
+      const creatorId = String((postRow as { user_id?: string }).user_id || "").trim();
+      if (!creatorId || creatorId !== userId) {
+        return res.status(403).json({ ok: false, error: "Only the post owner can activate monetization boost" });
+      }
+      const { data: prof, error: profErr } = await supabaseAdmin
+        .from("profiles")
+        .select("coins")
+        .eq("id", userId)
+        .maybeSingle();
+      if (profErr) {
+        console.error("[monetization] boost profile", JSON.stringify(profErr));
+        return res.status(500).json({ ok: false, error: profErr.message });
+      }
+      const cur = Number((prof as { coins?: number })?.coins) || 0;
+      if (cur < def.priceCoins) {
+        return res.status(400).json({ ok: false, error: `Need at least ${def.priceCoins} coins for ${tier} boost` });
+      }
+      const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+      const { error: deductErr } = await supabaseAdmin
+        .from("profiles")
+        .update({ coins: cur - def.priceCoins })
+        .eq("id", userId);
+      if (deductErr) {
+        console.error("[monetization] boost deduct", JSON.stringify(deductErr));
+        return res.status(500).json({ ok: false, error: deductErr.message || "Could not deduct coins" });
+      }
+      const { error: upsertErr } = await supabaseAdmin.from("post_monetization").upsert(
+        {
+          post_id: postId,
+          creator_id: creatorId,
+          tier,
+          price_coins: def.priceCoins,
+          max_boost_earnings_cents: def.maxBoostEarningsCents,
+          boost_earnings_cents: 0,
+          organic_earnings_cents: 0,
+          expires_at: expiresAt,
+        },
+        { onConflict: "post_id" }
+      );
+      if (upsertErr) {
+        console.error("[monetization] boost upsert post_monetization", JSON.stringify(upsertErr));
+        await supabaseAdmin.from("profiles").update({ coins: cur }).eq("id", userId);
+        return res.status(500).json({ ok: false, error: upsertErr.message || "Failed to save boost" });
+      }
+      const { error: boostInsErr } = await supabaseAdmin.from("post_boosts").insert({
+        post_id: postId,
+        user_id: userId,
+        boost_amount: def.priceCoins,
+      });
+      if (boostInsErr) {
+        console.warn("[monetization] post_boosts insert (non-fatal)", JSON.stringify(boostInsErr));
+      }
+      console.log("[monetization] boost OK", { postId, tier, userId, expiresAt });
+      return res.json({ ok: true, tier, expiresAt, priceCoins: def.priceCoins });
+    } catch (e: any) {
+      console.error("[monetization] POST /boost", e);
+      return res.status(500).json({ ok: false, error: e?.message || "Boost failed" });
+    }
+  });
+
+  app.post("/api/monetization/gift", async (req, res) => {
+    try {
+      const senderId = await getBearerUserId(req);
+      if (!senderId) return res.status(401).json({ ok: false, error: "Unauthorized" });
+      if (!supabaseAdmin) {
+        return res.status(503).json({ ok: false, error: "Server misconfigured (service role)" });
+      }
+      const postId = String(req.body?.postId || req.body?.post_id || "").trim();
+      const coins = Math.floor(Number(req.body?.coins));
+      if (!postId || !Number.isFinite(coins) || coins < 1) {
+        return res.status(400).json({ ok: false, error: "Invalid postId or coins" });
+      }
+      const { data: postRow, error: postErr } = await supabaseAdmin
+        .from("posts")
+        .select("id, user_id")
+        .eq("id", postId)
+        .maybeSingle();
+      if (postErr || !postRow) {
+        return res.status(404).json({ ok: false, error: "Post not found" });
+      }
+      const creatorId = String((postRow as { user_id?: string }).user_id || "").trim();
+      if (!creatorId) return res.status(400).json({ ok: false, error: "Post has no owner" });
+      if (senderId === creatorId) {
+        return res.status(400).json({ ok: false, error: "Cannot gift your own content" });
+      }
+      const { data: monRow, error: monErr } = await supabaseAdmin
+        .from("post_monetization")
+        .select("expires_at, max_boost_earnings_cents, boost_earnings_cents, organic_earnings_cents")
+        .eq("post_id", postId)
+        .maybeSingle();
+      if (monErr) {
+        console.error("[monetization] gift mon fetch", JSON.stringify(monErr));
+        return res.status(500).json({ ok: false, error: monErr.message });
+      }
+      if (!monRow) {
+        return res.status(400).json({ ok: false, error: "Monetization locked — boost required first" });
+      }
+      const exp = monRow.expires_at ? new Date(String(monRow.expires_at)).getTime() : 0;
+      if (!(exp > Date.now())) {
+        return res.status(400).json({ ok: false, error: "Monetization expired — boost again" });
+      }
+      const { data: sProf, error: sErr } = await supabaseAdmin
+        .from("profiles")
+        .select("coins, trust_score")
+        .eq("id", senderId)
+        .maybeSingle();
+      if (sErr || !sProf) {
+        return res.status(500).json({ ok: false, error: sErr?.message || "Sender profile missing" });
+      }
+      const senderCoins = Number((sProf as { coins?: number }).coins) || 0;
+      if (senderCoins < coins) {
+        return res.status(400).json({ ok: false, error: "Not enough coins" });
+      }
+      let creatorCoins = Math.floor(coins * 0.6);
+      let platformCoins = Math.floor(coins * 0.3);
+      let poolCoins = Math.floor(coins * 0.1);
+      const splitSum = creatorCoins + platformCoins + poolCoins;
+      if (splitSum < coins) creatorCoins += coins - splitSum;
+      const creatorShareCents = Math.floor(coins * 0.6);
+      const maxB = Number(monRow.max_boost_earnings_cents) || 0;
+      let boostEarned = Number(monRow.boost_earnings_cents) || 0;
+      const remaining = Math.max(0, maxB - boostEarned);
+      const toBoost = Math.min(remaining, creatorShareCents);
+      const toOrganic = Math.max(0, creatorShareCents - toBoost);
+      const pointsToSender = Math.floor(coins * 0.5);
+      const delayDays = 7 + Math.floor(Math.random() * 4);
+      const availableAt = new Date(Date.now() + delayDays * 24 * 60 * 60 * 1000).toISOString();
+      const { error: deductErr } = await supabaseAdmin
+        .from("profiles")
+        .update({ coins: senderCoins - coins })
+        .eq("id", senderId);
+      if (deductErr) {
+        console.error("[monetization] gift deduct sender", JSON.stringify(deductErr));
+        return res.status(500).json({ ok: false, error: deductErr.message });
+      }
+      const { data: cProf, error: cErr } = await supabaseAdmin
+        .from("profiles")
+        .select("coins")
+        .eq("id", creatorId)
+        .maybeSingle();
+      if (cErr || !cProf) {
+        await supabaseAdmin.from("profiles").update({ coins: senderCoins }).eq("id", senderId);
+        return res.status(500).json({ ok: false, error: "Creator profile missing" });
+      }
+      const cCur = Number((cProf as { coins?: number }).coins) || 0;
+      const { error: addCreatorErr } = await supabaseAdmin
+        .from("profiles")
+        .update({ coins: cCur + creatorCoins })
+        .eq("id", creatorId);
+      if (addCreatorErr) {
+        await supabaseAdmin.from("profiles").update({ coins: senderCoins }).eq("id", senderId);
+        console.error("[monetization] gift credit creator", JSON.stringify(addCreatorErr));
+        return res.status(500).json({ ok: false, error: addCreatorErr.message });
+      }
+      const { data: poolRow } = await supabaseAdmin
+        .from("influencer_pool_balance")
+        .select("balance_coins")
+        .eq("id", "default")
+        .maybeSingle();
+      const poolBal = Number((poolRow as { balance_coins?: number })?.balance_coins) || 0;
+      await supabaseAdmin
+        .from("influencer_pool_balance")
+        .upsert({ id: "default", balance_coins: poolBal + poolCoins }, { onConflict: "id" });
+      const { data: sendProf } = await supabaseAdmin
+        .from("profiles")
+        .select("gift_points")
+        .eq("id", senderId)
+        .maybeSingle();
+      const prevPts = Number((sendProf as { gift_points?: number })?.gift_points) || 0;
+      await supabaseAdmin
+        .from("profiles")
+        .update({ gift_points: prevPts + pointsToSender })
+        .eq("id", senderId);
+      await supabaseAdmin.from("post_monetization").update({
+        boost_earnings_cents: boostEarned + toBoost,
+        organic_earnings_cents: (Number(monRow.organic_earnings_cents) || 0) + toOrganic,
+      }).eq("post_id", postId);
+      const { error: giftInsErr } = await supabaseAdmin.from("gift_transactions").insert({
+        post_id: postId,
+        sender_id: senderId,
+        creator_id: creatorId,
+        coins,
+        creator_coins: creatorCoins,
+        platform_coins: platformCoins,
+        pool_coins: poolCoins,
+        points_to_sender: pointsToSender,
+        boost_cents_applied: toBoost,
+        organic_cents_applied: toOrganic,
+        status: "completed",
+        available_at: availableAt,
+      });
+      if (giftInsErr) {
+        console.error("[monetization] gift_transactions insert", JSON.stringify(giftInsErr));
+      }
+      console.log("[monetization] gift OK", {
+        postId,
+        coins,
+        creatorCoins,
+        toBoost,
+        toOrganic,
+        pointsToSender,
+      });
+      return res.json({
+        ok: true,
+        creatorCoins,
+        platformCoins,
+        poolCoins,
+        pointsToSender,
+        boostCentsApplied: toBoost,
+        organicCentsApplied: toOrganic,
+      });
+    } catch (e: any) {
+      console.error("[monetization] POST /gift", e);
+      return res.status(500).json({ ok: false, error: e?.message || "Gift failed" });
+    }
+  });
+
   async function getAdminAuth(req: Request): Promise<{ ok: true; userId: string; email: string } | { ok: false; error: string; status: number }> {
     const authHeader = req.headers.authorization;
     const token =

@@ -81,7 +81,14 @@ export async function boostMarketplaceProduct(productId: string, days: number) {
     return { ok: false as const, error: deductErr };
   }
 
-  if (newBalance == null) {
+  const deductOk =
+    typeof newBalance === 'boolean'
+      ? newBalance
+      : typeof newBalance === 'number'
+        ? Number.isFinite(newBalance) && newBalance >= 0
+        : false;
+
+  if (!deductOk) {
     const { data: rowAfter, error: rowErr } = await supabase
       .from('user_wallets')
       .select('user_id')

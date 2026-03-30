@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef, type FormEvent } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Settings, 
@@ -28,19 +28,26 @@ import { NavLink, useParams, useNavigate, useSearchParams } from 'react-router-d
 import { MOCK_USER } from '../constants';
 import { cn } from '../lib/utils';
 import { Post, Video } from '../types';
-import { apiUrl } from '../lib/apiOrigin';
+import { apiUrl, fetchFeedApiSafe } from '../lib/apiOrigin';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import ShareModal from '../components/ShareModal';
+import { ProfileMonetizationCard } from '../components/ProfileMonetizationCard';
 import StoryEditor from '../components/StoryEditor';
 import { ResponsiveImage } from '../components/ResponsiveImage';
 import { isValidVideoUrl } from '../lib/videoUrl';
 import { ProfileHeaderSkeleton } from '../components/LoadingSkeletons';
+import { fetchCommentsWithProfiles, type CommentForDisplay } from '../lib/postComments';
+
+function feedApiResponseIsJson(res: Response): boolean {
+  const ct = res.headers.get('content-type') || '';
+  return ct.includes('application/json');
+}
 
 export default function ProfilePage() {
   const { id: profileIdParam } = useParams();
   const navigate = useNavigate();
-  const { user, profile: myProfile } = useAuth();
+  const { user, profile: myProfile, refreshProfile } = useAuth();
   const [searchParams] = useSearchParams();
   
   const [userProfile, setUserProfile] = useState<any>(null);
@@ -134,18 +141,19 @@ export default function ProfilePage() {
 
       const nameForPosts = (ownerUsername ?? userProfile?.username ?? '').trim();
 
-      const formattedPosts: Post[] = data.map(p => ({
-        id: p.id,
-        image: p.image_url,
+      const formattedPosts: Post[] = data.map((p: any) => ({
+        id: String(p.id),
+        image: p.image_url || undefined,
+        videoUrl: p.video_url ? String(p.video_url) : undefined,
         user: { 
-          username: nameForPosts || userProfile?.username || '', 
+          username: nameForPosts || userProfile?.username || 'user', 
           avatar: userProfile?.avatar || '' 
         },
-        caption: p.content,
-        likes: p.likes_count,
-        comments: p.comments_count,
-        shares: p.shares_count,
-        timestamp: new Date(p.created_at).toLocaleDateString()
+        caption: p.content ?? '',
+        likes: Number(p.likes_count) || 0,
+        comments: Number(p.comments_count) || 0,
+        shares: Number(p.shares_count) || 0,
+        timestamp: p.created_at ? new Date(p.created_at).toLocaleDateString() : ''
       }));
       setUserPosts(formattedPosts);
     } catch (err) {
@@ -811,6 +819,29 @@ export default function ProfilePage() {
               <ProfileLink to="/analytics" icon={<BarChart3 className="text-emerald-500" />} label="Posts & Views" />
             </div>
           )}
+
+          {isOwnProfile && user?.id && (
+            <ProfileMonetizationCard
+              className="mt-5"
+              videoItems={userVideos.map((v) => ({
+                id: v.id,
+                label: (v.caption || 'Reel').slice(0, 48) || 'Reel',
+                thumb: v.thumbnail,
+              }))}
+              postItems={userPosts
+                .filter((p) => {
+                  const vu = p.videoUrl;
+                  if (vu && isValidVideoUrl(String(vu).trim())) return false;
+                  return true;
+                })
+                .map((p) => ({
+                  id: p.id,
+                  label: (p.caption || 'Post').slice(0, 48) || 'Post',
+                  thumb: p.image,
+                }))}
+              onBoostComplete={() => void refreshProfile()}
+            />
+          )}
         </div>
       </div>
 
@@ -845,7 +876,7 @@ export default function ProfilePage() {
               className="aspect-square bg-gray-100 dark:bg-gray-900 rounded-lg overflow-hidden relative group cursor-pointer"
             >
               <ResponsiveImage 
-                src={post.image} 
+                src={post.image || 'https://picsum.photos/seed/post/400/400'} 
                 alt="" 
                 width={400}
                 height={400}
@@ -853,8 +884,8 @@ export default function ProfilePage() {
               />
               <div className="absolute inset-0 bg-black/20 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
                 <div className="flex items-center gap-4 text-white font-bold">
-                  <div className="flex items-center gap-1"><Heart size={18} fill="white" /> {post.likes >= 1000 ? `${(post.likes / 1000).toFixed(1)}K` : post.likes}</div>
-                  <div className="flex items-center gap-1"><MessageCircle size={18} fill="white" /> {post.comments}</div>
+                <div className="flex items-center gap-1"><Heart size={18} fill="white" /> {(Number(post.likes) || 0) >= 1000 ? `${((Number(post.likes) || 0) / 1000).toFixed(1)}K` : Number(post.likes) || 0}</div>
+                <div className="flex items-center gap-1"><MessageCircle size={18} fill="white" /> {Number(post.comments) || 0}</div>
                 </div>
               </div>
             </div>
@@ -1118,8 +1149,109 @@ function Tab({ icon, label, active, onClick }: { icon: React.ReactNode; label: s
 }
 
 function PostDetailModal({ post, onClose }: { post: Post; onClose: () => void }) {
+  const { user, profile } = useAuth();
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
   const [isStoryEditorOpen, setIsStoryEditorOpen] = useState(false);
+  const [comments, setComments] = useState<CommentForDisplay[]>([]);
+  const [loadingComments, setLoadingComments] = useState(true);
+  const [newComment, setNewComment] = useState('');
+  const commentRequestInFlightRef = useRef(false);
+
+  const username = post.user?.username?.trim() || 'user';
+  const avatar = post.user?.avatar?.trim() || `https://picsum.photos/seed/${post.id}/100/100`;
+  const imageSrc =
+    post.image?.trim() ||
+    (post.videoUrl && isValidVideoUrl(String(post.videoUrl)) ? String(post.videoUrl) : '') ||
+    'https://picsum.photos/seed/post/800/800';
+  const likes = Number(post.likes ?? 0);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoadingComments(true);
+      try {
+        const rows = await fetchCommentsWithProfiles(supabase, String(post.id));
+        if (!cancelled) setComments(rows);
+      } catch (e) {
+        console.error('[PostDetailModal] fetch comments', e);
+      } finally {
+        if (!cancelled) setLoadingComments(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [post.id]);
+
+  const handleAddComment = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!user) {
+      alert('Please sign in to comment.');
+      return;
+    }
+    if (!newComment.trim()) return;
+    if (commentRequestInFlightRef.current) return;
+    commentRequestInFlightRef.current = true;
+    const commentText = newComment.trim();
+    setNewComment('');
+    const jsonHeaders = { 'Content-Type': 'application/json' } as const;
+    try {
+      const commentPayload = JSON.stringify({
+        userId: user.id,
+        postId: post.id,
+        content: commentText,
+      });
+      const apiRes = await fetchFeedApiSafe(apiUrl('/api/feed/post-comment'), {
+        method: 'POST',
+        headers: jsonHeaders,
+        body: commentPayload,
+      });
+
+      let data: { id: string; user_id: string; content: string; created_at?: string } | null = null;
+      if (apiRes && apiRes.ok && feedApiResponseIsJson(apiRes)) {
+        const payload = await apiRes.json().catch(() => null);
+        data = payload?.comment ?? null;
+      }
+
+      if (!data) {
+        const { data: ins, error } = await supabase
+          .from('comments')
+          .insert({
+            post_id: post.id,
+            user_id: user.id,
+            content: commentText,
+          })
+          .select('id, user_id, content, created_at')
+          .single();
+        if (error) throw error;
+        data = ins;
+        try {
+          await fetch(apiUrl('/api/notifications/from-feed-comment'), {
+            method: 'POST',
+            headers: jsonHeaders,
+            body: JSON.stringify({
+              userId: user.id,
+              postId: post.id,
+              commentId: ins.id,
+            }),
+          });
+        } catch {
+          /* non-fatal */
+        }
+      }
+
+      if (!data) throw new Error('Comment was not saved.');
+
+      const rows = await fetchCommentsWithProfiles(supabase, String(post.id));
+      setComments(rows);
+    } catch (err) {
+      console.error('[PostDetailModal] comment', err);
+      setNewComment(commentText);
+      alert(err instanceof Error ? err.message : 'Could not add comment. Please try again.');
+    } finally {
+      commentRequestInFlightRef.current = false;
+    }
+  };
 
   return (
     <div className="fixed inset-0 z-[120] flex items-center justify-center p-0 md:p-4">
@@ -1145,7 +1277,7 @@ function PostDetailModal({ post, onClose }: { post: Post; onClose: () => void })
 
         {/* Image Section */}
         <div className="flex-1 bg-black flex items-center justify-center relative group">
-          <img src={post.image} alt="" className="max-w-full max-h-full object-contain" />
+          <img src={imageSrc} alt="" className="max-w-full max-h-full object-contain" />
           <button className="absolute top-4 right-4 p-2 bg-black/40 text-white rounded-full opacity-0 group-hover:opacity-100 transition-opacity">
             <Maximize2 size={20} />
           </button>
@@ -1155,10 +1287,10 @@ function PostDetailModal({ post, onClose }: { post: Post; onClose: () => void })
         <div className="w-full md:w-96 flex flex-col bg-white dark:bg-black border-l border-gray-100 dark:border-gray-800">
           <div className="p-4 border-b border-gray-100 dark:border-gray-800 flex items-center justify-between">
             <div className="flex items-center gap-3">
-              <img src={post.user.avatar} alt="" className="w-10 h-10 rounded-full border border-gray-100 dark:border-gray-800" />
+              <img src={avatar} alt="" className="w-10 h-10 rounded-full border border-gray-100 dark:border-gray-800" />
               <div>
-                <h4 className="font-bold text-sm">@{post.user.username}</h4>
-                <p className="text-[10px] text-gray-500">{post.timestamp}</p>
+                <h4 className="font-bold text-sm">@{username}</h4>
+                <p className="text-[10px] text-gray-500">{post.timestamp || ''}</p>
               </div>
             </div>
             <button className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-full">
@@ -1168,65 +1300,94 @@ function PostDetailModal({ post, onClose }: { post: Post; onClose: () => void })
 
           <div className="flex-1 overflow-y-auto p-4 space-y-6">
             <div className="flex gap-3">
-              <img src={post.user.avatar} alt="" className="w-8 h-8 rounded-full" />
+              <img src={avatar} alt="" className="w-8 h-8 rounded-full" />
               <div className="flex-1">
                 <p className="text-sm">
-                  <span className="font-bold mr-2">@{post.user.username}</span>
-                  {post.caption}
+                  <span className="font-bold mr-2">@{username}</span>
+                  {post.caption ?? ''}
                 </p>
               </div>
             </div>
 
-            {/* Mock Comments */}
             <div className="space-y-4">
-              <div className="flex gap-3">
-                <img src="https://picsum.photos/seed/u1/100/100" alt="" className="w-8 h-8 rounded-full" />
-                <div className="flex-1">
-                  <p className="text-sm">
-                    <span className="font-bold mr-2">@travel_fan</span>
-                    This looks absolutely amazing! Where is this? 😍
-                  </p>
-                  <span className="text-[10px] text-gray-400 mt-1">1h ago • Reply</span>
-                </div>
-              </div>
-              <div className="flex gap-3">
-                <img src="https://picsum.photos/seed/u2/100/100" alt="" className="w-8 h-8 rounded-full" />
-                <div className="flex-1">
-                  <p className="text-sm">
-                    <span className="font-bold mr-2">@nature_lover</span>
-                    The lighting is perfect! Great shot.
-                  </p>
-                  <span className="text-[10px] text-gray-400 mt-1">45m ago • Reply</span>
-                </div>
-              </div>
+              {loadingComments ? (
+                <p className="text-xs text-gray-500 dark:text-gray-400 py-2">Loading comments…</p>
+              ) : comments.length > 0 ? (
+                comments.map((c) => (
+                  <div key={c.id} className="flex gap-3">
+                    {c.avatar ? (
+                      <ResponsiveImage
+                        src={c.avatar}
+                        alt=""
+                        width={40}
+                        height={40}
+                        className="w-8 h-8 rounded-full object-cover shrink-0"
+                        loading="lazy"
+                      />
+                    ) : (
+                      <div
+                        className="w-8 h-8 rounded-full bg-gray-200 dark:bg-gray-700 shrink-0"
+                        aria-hidden
+                      />
+                    )}
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm text-gray-900 dark:text-gray-100">
+                        <span className="font-bold mr-2">@{c.user}</span>
+                        <span className="font-normal">{c.text}</span>
+                      </p>
+                      <span className="text-[10px] text-gray-400 mt-1 block">{c.time}</span>
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <p className="text-xs text-gray-500 dark:text-gray-400 py-2">No comments yet.</p>
+              )}
             </div>
           </div>
 
           <div className="p-4 border-t border-gray-100 dark:border-gray-800 space-y-4">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-4">
-                <button className="hover:scale-110 transition-transform"><Heart size={24} /></button>
-                <button className="hover:scale-110 transition-transform"><MessageCircle size={24} /></button>
-                <button 
+                <button type="button" className="hover:scale-110 transition-transform">
+                  <Heart size={24} />
+                </button>
+                <button type="button" className="hover:scale-110 transition-transform">
+                  <MessageCircle size={24} />
+                </button>
+                <button
+                  type="button"
                   onClick={() => setIsShareModalOpen(true)}
                   className="hover:scale-110 transition-transform"
                 >
                   <Send size={24} />
                 </button>
               </div>
-              <button className="hover:scale-110 transition-transform"><Bookmark size={24} /></button>
+              <button type="button" className="hover:scale-110 transition-transform">
+                <Bookmark size={24} />
+              </button>
             </div>
             <div>
-              <p className="font-bold text-sm">{post.likes.toLocaleString()} likes</p>
+              <p className="font-bold text-sm">{likes.toLocaleString()} likes</p>
+              <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5">
+                {comments.length} {comments.length === 1 ? 'comment' : 'comments'}
+              </p>
             </div>
-            <div className="flex items-center gap-2">
-              <input 
-                type="text" 
-                placeholder="Add a comment..." 
-                className="flex-1 bg-transparent border-none focus:ring-0 text-sm py-2"
+            <form onSubmit={handleAddComment} className="flex items-center gap-2">
+              <input
+                type="text"
+                value={newComment}
+                onChange={(e) => setNewComment(e.target.value)}
+                placeholder="Add a comment..."
+                className="flex-1 bg-transparent border-none focus:ring-0 text-sm py-2 text-gray-900 dark:text-gray-100 placeholder:text-gray-400"
               />
-              <button className="text-indigo-600 font-bold text-sm">Post</button>
-            </div>
+              <button
+                type="submit"
+                disabled={!newComment.trim() || !user}
+                className="text-indigo-600 dark:text-indigo-400 font-bold text-sm disabled:opacity-40"
+              >
+                Post
+              </button>
+            </form>
           </div>
         </div>
       </motion.div>
@@ -1238,17 +1399,17 @@ function PostDetailModal({ post, onClose }: { post: Post; onClose: () => void })
           setIsShareModalOpen(false);
           setIsStoryEditorOpen(true);
         }}
-        postUrl={`${window.location.origin}/post/${post.id}`}
+        postUrl={`${window.location.origin}/post/${encodeURIComponent(String(post.id))}`}
       />
 
       <StoryEditor 
         isOpen={isStoryEditorOpen}
         onClose={() => setIsStoryEditorOpen(false)}
         content={{
-          image: post.image,
+          image: imageSrc,
           user: {
-            username: post.user.username || 'user',
-            avatar: post.user.avatar || ''
+            username,
+            avatar
           }
         }}
       />
@@ -1300,8 +1461,8 @@ function VideoPlayerModal({ video, onClose }: { video: Video; onClose: () => voi
           <X size={24} />
         </button>
         <div className="absolute bottom-20 left-4 right-4 text-white pointer-events-none">
-          <h4 className="font-bold mb-1">@{video.user.username}</h4>
-          <p className="text-sm line-clamp-2 opacity-80">{video.caption}</p>
+          <h4 className="font-bold mb-1">@{video.user?.username?.trim() || 'user'}</h4>
+          <p className="text-sm line-clamp-2 opacity-80">{video.caption ?? ''}</p>
         </div>
       </motion.div>
     </div>

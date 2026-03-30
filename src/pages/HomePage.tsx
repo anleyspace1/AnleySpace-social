@@ -33,7 +33,7 @@ import {
 } from 'lucide-react';
 import { useNavigate, useSearchParams, useLocation } from 'react-router-dom';
 import { cn } from '../lib/utils';
-import { apiUrl } from '../lib/apiOrigin';
+import { apiUrl, fetchFeedApiSafe } from '../lib/apiOrigin';
 import { fetchActiveStories, filterActiveStories } from '../lib/activeStories';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
@@ -52,6 +52,7 @@ import {
 import { isPlaceholderUsername } from '../lib/realDataGuards';
 import { getViews } from '../lib/postViews';
 import { hasRecordedViewThisSession, markPostViewRecordedSession } from '../lib/postViewTracking';
+import { fetchCommentsWithProfiles, resolveProfileUsername } from '../lib/postComments';
 
 /** Home feed: white cards on #F5F6FA (see App layout when path is `/`). */
 const homeCard =
@@ -59,12 +60,6 @@ const homeCard =
 
 const exploreGlassCard =
   'bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl shadow-lg shadow-black/20 hover:scale-[1.02] transition-all duration-300 hover:shadow-xl hover:shadow-indigo-500/20';
-
-const resolveProfileUsername = (username?: string | null) => {
-  const value = (username || '').trim();
-  if (!value) return 'User';
-  return value;
-};
 
 /** Feed routes use Express; static hosts (e.g. Vercel SPA) may return 200 HTML — must not treat as JSON. */
 function feedApiResponseIsJson(res: Response): boolean {
@@ -2087,39 +2082,7 @@ function PostItem({
   const fetchComments = async () => {
     setLoadingComments(true);
     try {
-      const { data, error } = await supabase
-        .from('comments')
-        .select('id, post_id, user_id, content, created_at')
-        .eq('post_id', post.id)
-        .order('created_at', { ascending: true });
-
-      if (error) throw error;
-
-      const userIds = Array.from(new Set((data || []).map((c: any) => c.user_id).filter(Boolean)));
-      let profilesMap: Record<string, any> = {};
-      if (userIds.length > 0) {
-        const { data: profilesData, error: profilesError } = await supabase
-          .from('profiles')
-          .select('id, username, avatar_url')
-          .in('id', userIds);
-        if (profilesError) {
-          console.error('Error fetching comment profiles:', profilesError);
-        } else {
-          profilesMap = (profilesData || []).reduce((acc: any, p: any) => {
-            acc[p.id] = p;
-            return acc;
-          }, {});
-        }
-      }
-
-      const formattedComments = (data || []).map((c: any) => ({
-        id: c.id,
-        user: resolveProfileUsername(profilesMap[c.user_id]?.username),
-        text: c.content,
-        avatar: profilesMap[c.user_id]?.avatar_url || '',
-        time: new Date(c.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      }));
-
+      const formattedComments = await fetchCommentsWithProfiles(supabase, String(post.id));
       setComments(formattedComments);
     } catch (err) {
       console.error('Error fetching comments:', err);
@@ -2151,14 +2114,14 @@ function PostItem({
     const likePayload = JSON.stringify({ userId: user.id, postId: post.id });
 
     try {
-      const apiRes = await fetch(apiUrl('/api/feed/post-like'), {
+      const apiRes = await fetchFeedApiSafe(apiUrl('/api/feed/post-like'), {
         method: 'POST',
         headers: jsonHeaders,
         body: likePayload,
       });
 
       let handledByApi = false;
-      if (apiRes.ok && feedApiResponseIsJson(apiRes)) {
+      if (apiRes && apiRes.ok && feedApiResponseIsJson(apiRes)) {
         const data = await apiRes.json().catch((e) => {
           console.error('[PostItem] like API JSON parse failed', e);
           return null;
@@ -2168,7 +2131,7 @@ function PostItem({
         }
         if (typeof data?.liked === 'boolean') setIsLiked(data.liked);
         if (typeof data?.likesCount === 'number') setLikesCount(data.likesCount);
-      } else if (apiRes.ok && !feedApiResponseIsJson(apiRes)) {
+      } else if (apiRes && apiRes.ok && !feedApiResponseIsJson(apiRes)) {
         console.warn(
           '[PostItem] like API returned non-JSON (likely SPA on static host). Using Supabase for like/unlike.'
         );
@@ -2262,7 +2225,7 @@ function PostItem({
         postId: post.id,
         content: commentText,
       });
-      const apiRes = await fetch(apiUrl('/api/feed/post-comment'), {
+      const apiRes = await fetchFeedApiSafe(apiUrl('/api/feed/post-comment'), {
         method: 'POST',
         headers: jsonHeaders,
         body: commentPayload,
@@ -2270,13 +2233,13 @@ function PostItem({
 
       let data: { id: string; user_id: string; content: string; created_at?: string } | null = null;
 
-      if (apiRes.ok && feedApiResponseIsJson(apiRes)) {
+      if (apiRes && apiRes.ok && feedApiResponseIsJson(apiRes)) {
         const payload = await apiRes.json().catch((e) => {
           console.error('[PostItem] comment API JSON parse failed', e);
           return null;
         });
         data = payload?.comment ?? null;
-      } else if (apiRes.ok && !feedApiResponseIsJson(apiRes)) {
+      } else if (apiRes && apiRes.ok && !feedApiResponseIsJson(apiRes)) {
         console.warn(
           '[PostItem] comment API returned non-JSON (likely SPA on static host). Inserting comment via Supabase.'
         );
