@@ -99,12 +99,23 @@ export default function StoryEditor({ isOpen, onClose, onPublished, content }: S
         }),
       });
 
+      const responseBody = await response.json().catch(() => null);
+      console.log('[StoryEditor] /api/stories response:', {
+        status: response.status,
+        ok: response.ok,
+        body: responseBody,
+      });
+
       if (response.ok) {
         alert('Published to your story!');
         if (onPublished) onPublished();
         onClose();
       } else {
-        throw new Error('Failed to publish story');
+        const serverMessage =
+          (responseBody && typeof responseBody === 'object' && 'error' in responseBody
+            ? String((responseBody as any).error || '')
+            : '') || 'Failed to publish story';
+        throw new Error(serverMessage);
       }
     } catch (err) {
       console.error('Publish story error:', err);

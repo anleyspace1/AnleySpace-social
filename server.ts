@@ -67,6 +67,7 @@ if (supabaseServiceUrl && supabaseServiceKey) {
 
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY?.trim();
 const stripeWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET?.trim();
+const adminEmail = (process.env.ADMIN_EMAIL || 'your@email.com').trim().toLowerCase();
 const stripeClient: Stripe | null =
   stripeSecretKey && stripeSecretKey.length > 0 ? new Stripe(stripeSecretKey) : null;
 if (!stripeClient) {
@@ -908,23 +909,36 @@ async function startServer() {
           INSERT INTO stories (id, user_id, username, avatar, image_url, media_url, media_type, created_at, expires_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(id, user_id, username, avatar, mediaUrl, mediaUrl, mediaType, createdAtIso, expiresAtIso);
+        const supabaseStoryPayload = {
+          id,
+          user_id,
+          media_url: mediaUrl,
+          type: mediaType,
+          created_at: createdAtIso,
+        };
         const { data: insertedRow, error: storyUpsertError } = await supabaseAdmin
           .from('stories')
-          .upsert({
-            id,
-            user_id,
-            username,
-            avatar,
-            image_url: mediaUrl,
-            media_url: mediaUrl,
-            media_type: mediaType,
-            created_at: createdAtIso,
-            expires_at: expiresAtIso,
-          })
+          .upsert(supabaseStoryPayload)
           .select();
         if (storyUpsertError) {
-          console.error('SUPABASE UPSERT FAILED:', storyUpsertError);
-          logToFile(`SERVER: SUPABASE UPSERT FAILED: ${storyUpsertError.message}`);
+          console.error('SUPABASE UPSERT FAILED (L1 stories):', {
+            code: storyUpsertError.code,
+            message: storyUpsertError.message,
+            details: (storyUpsertError as any).details,
+            hint: (storyUpsertError as any).hint,
+            payload: supabaseStoryPayload,
+            usingServiceRole: !!supabaseServiceKey,
+          });
+          logToFile(
+            `SERVER: SUPABASE UPSERT FAILED (L1 stories): ${JSON.stringify({
+              code: storyUpsertError.code,
+              message: storyUpsertError.message,
+              details: (storyUpsertError as any).details,
+              hint: (storyUpsertError as any).hint,
+              payload: supabaseStoryPayload,
+              usingServiceRole: !!supabaseServiceKey,
+            })}`
+          );
           try {
             db.prepare('DELETE FROM stories WHERE id = ?').run(id);
           } catch {
@@ -1172,23 +1186,36 @@ async function startServer() {
         INSERT INTO stories (id, user_id, username, avatar, image_url, media_url, media_type, created_at, expires_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(id, jsonUserId, jsonUsername, jsonAvatar, mediaUrl, mediaUrl, mediaType, createdAtIso, expiresAtIso);
+      const jsonSupabaseStoryPayload = {
+        id,
+        user_id: jsonUserId,
+        media_url: mediaUrl,
+        type: mediaType,
+        created_at: createdAtIso,
+      };
       const { data: jsonInsertedRow, error: jsonStoryUpsertError } = await supabaseAdmin
         .from('stories')
-        .upsert({
-          id,
-          user_id: jsonUserId,
-          username: jsonUsername,
-          avatar: jsonAvatar,
-          image_url: mediaUrl,
-          media_url: mediaUrl,
-          media_type: mediaType,
-          created_at: createdAtIso,
-          expires_at: expiresAtIso,
-        })
+        .upsert(jsonSupabaseStoryPayload)
         .select();
       if (jsonStoryUpsertError) {
-        console.error('SUPABASE UPSERT FAILED:', jsonStoryUpsertError);
-        logToFile(`SERVER: SUPABASE UPSERT FAILED: ${jsonStoryUpsertError.message}`);
+        console.error('SUPABASE UPSERT FAILED (L2 stories):', {
+          code: jsonStoryUpsertError.code,
+          message: jsonStoryUpsertError.message,
+          details: (jsonStoryUpsertError as any).details,
+          hint: (jsonStoryUpsertError as any).hint,
+          payload: jsonSupabaseStoryPayload,
+          usingServiceRole: !!supabaseServiceKey,
+        });
+        logToFile(
+          `SERVER: SUPABASE UPSERT FAILED (L2 stories): ${JSON.stringify({
+            code: jsonStoryUpsertError.code,
+            message: jsonStoryUpsertError.message,
+            details: (jsonStoryUpsertError as any).details,
+            hint: (jsonStoryUpsertError as any).hint,
+            payload: jsonSupabaseStoryPayload,
+            usingServiceRole: !!supabaseServiceKey,
+          })}`
+        );
         try {
           db.prepare('DELETE FROM stories WHERE id = ?').run(id);
         } catch {
@@ -2310,6 +2337,118 @@ async function startServer() {
   app.get("/api/transactions/:userId", (req, res) => {
     const txs = db.prepare('SELECT * FROM transactions WHERE user_id = ? ORDER BY timestamp DESC').all(req.params.userId);
     res.json(txs);
+  });
+
+  async function getAdminAuth(req: Request): Promise<{ ok: true; userId: string; email: string } | { ok: false; error: string; status: number }> {
+    const authHeader = req.headers.authorization;
+    const token =
+      typeof authHeader === 'string' && authHeader.startsWith('Bearer ')
+        ? authHeader.slice(7).trim()
+        : '';
+    if (!token) return { ok: false, error: 'Missing auth token', status: 401 };
+    if (!supabase) return { ok: false, error: 'Supabase not configured', status: 503 };
+    const authUserResp = await supabase.auth.getUser(token);
+    const authUser = authUserResp?.data?.user || null;
+    const email = String(authUser?.email || '').trim().toLowerCase();
+    if (!authUser?.id) return { ok: false, error: 'Unauthorized', status: 401 };
+    if (!email || email !== adminEmail) return { ok: false, error: 'Forbidden', status: 403 };
+    return { ok: true, userId: String(authUser.id), email };
+  }
+
+  app.get("/api/admin/withdraw-requests", async (req, res) => {
+    try {
+      const adminCheck = await getAdminAuth(req);
+      if (!adminCheck.ok) return res.status(adminCheck.status).json({ error: adminCheck.error });
+      if (!supabaseAdmin) return res.status(503).json({ error: "SUPABASE_SERVICE_ROLE_KEY not configured on server" });
+
+      const { data, error } = await supabaseAdmin
+        .from('withdraw_requests')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (error) return res.status(500).json({ error: error.message || 'Failed to load withdraw requests' });
+      res.json(data || []);
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Failed to load withdraw requests' });
+    }
+  });
+
+  app.post("/api/admin/withdraw-requests/:id/approve", async (req, res) => {
+    try {
+      const adminCheck = await getAdminAuth(req);
+      if (!adminCheck.ok) return res.status(adminCheck.status).json({ error: adminCheck.error });
+      if (!supabaseAdmin) return res.status(503).json({ error: "SUPABASE_SERVICE_ROLE_KEY not configured on server" });
+
+      const id = String(req.params.id || '').trim();
+      if (!id) return res.status(400).json({ error: 'Missing request id' });
+
+      const { data: row, error: selErr } = await supabaseAdmin
+        .from('withdraw_requests')
+        .select('id, status')
+        .eq('id', id)
+        .maybeSingle();
+      if (selErr) return res.status(500).json({ error: selErr.message || 'Failed to load request' });
+      if (!row) return res.status(404).json({ error: 'Withdraw request not found' });
+      if (row.status !== 'pending') return res.status(400).json({ error: 'Request already processed' });
+
+      const { error: upErr } = await supabaseAdmin
+        .from('withdraw_requests')
+        .update({ status: 'approved' })
+        .eq('id', id)
+        .eq('status', 'pending');
+      if (upErr) return res.status(500).json({ error: upErr.message || 'Failed to approve request' });
+
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Failed to approve request' });
+    }
+  });
+
+  app.post("/api/admin/withdraw-requests/:id/reject", async (req, res) => {
+    try {
+      const adminCheck = await getAdminAuth(req);
+      if (!adminCheck.ok) return res.status(adminCheck.status).json({ error: adminCheck.error });
+      if (!supabaseAdmin) return res.status(503).json({ error: "SUPABASE_SERVICE_ROLE_KEY not configured on server" });
+
+      const id = String(req.params.id || '').trim();
+      if (!id) return res.status(400).json({ error: 'Missing request id' });
+
+      const { data: row, error: selErr } = await supabaseAdmin
+        .from('withdraw_requests')
+        .select('id, user_id, coins, status')
+        .eq('id', id)
+        .maybeSingle();
+      if (selErr) return res.status(500).json({ error: selErr.message || 'Failed to load request' });
+      if (!row) return res.status(404).json({ error: 'Withdraw request not found' });
+      if (row.status !== 'pending') return res.status(400).json({ error: 'Request already processed' });
+
+      const { error: rejectErr } = await supabaseAdmin
+        .from('withdraw_requests')
+        .update({ status: 'rejected' })
+        .eq('id', id)
+        .eq('status', 'pending');
+      if (rejectErr) return res.status(500).json({ error: rejectErr.message || 'Failed to reject request' });
+
+      const refundCoins = Number(row.coins) || 0;
+      if (refundCoins > 0) {
+        const { data: profileRow, error: profileSelErr } = await supabaseAdmin
+          .from('profiles')
+          .select('coins')
+          .eq('id', row.user_id)
+          .maybeSingle();
+        if (profileSelErr) return res.status(500).json({ error: profileSelErr.message || 'Failed to load user profile' });
+        const currentCoins = Number(profileRow?.coins) || 0;
+        const { error: profileUpErr } = await supabaseAdmin
+          .from('profiles')
+          .update({ coins: currentCoins + refundCoins })
+          .eq('id', row.user_id);
+        if (profileUpErr) return res.status(500).json({ error: profileUpErr.message || 'Failed to refund user coins' });
+      }
+
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Failed to reject request' });
+    }
   });
 
   // Live Streaming Endpoints

@@ -8,6 +8,7 @@ import {
   ShoppingBag, 
   Wallet,
   Bookmark,
+  Shield,
   ChevronRight,
   Bell,
   Moon,
@@ -38,6 +39,7 @@ export default function Sidebar({
   const { user, signOut } = useAuth();
   const groupNotif = useGroupNotificationsOptional();
   const groupUnread = groupNotif?.unreadCount ?? 0;
+  const isAdmin = user?.email === 'anleyspace@gmail.com';
   const [displayUser, setDisplayUser] = useState({
     displayName: 'User',
     username: 'user',
@@ -134,6 +136,9 @@ export default function Sidebar({
           <SidebarLink to="/assets" icon={<Wallet size={20} />} label="Assets" onClick={onClose} navAppearance={navAppearance} />
           <SidebarLink to="/notifications" icon={<Bell size={20} />} label="Notifications" onClick={onClose} navAppearance={navAppearance} />
           <SidebarLink to="/saved" icon={<Bookmark size={20} />} label="Saved" onClick={onClose} navAppearance={navAppearance} />
+          {isAdmin && (
+            <SidebarLink to="/admin/dashboard" icon={<Shield size={20} />} label="Admin" onClick={onClose} navAppearance={navAppearance} />
+          )}
         </nav>
       </div>
 

@@ -444,39 +444,42 @@ function Stories() {
       '';
 
     try {
-      const ext = resolveStorageExtension(file);
-      const filePath = storiesStoragePath(user.id, ext);
+      // Route all story media uploads through backend /api/stories multipart path.
+      // This keeps storage + DB insert atomic with server-side service role.
+      const form = new FormData();
+      form.append('file', file);
+      form.append('user_id', user.id);
+      form.append('username', username);
+      form.append('avatar', avatar || '');
 
-      // Reuse the same upload flow used by working post upload.
-      const { error: uploadError } = await supabase.storage.from('posts').upload(filePath, file, {
-        contentType: storageUploadContentType(file),
+      console.log('[StoryUpload] calling API /api/stories (multipart)', {
+        name: file.name,
+        type: file.type,
+        size: file.size,
+        user_id: user.id,
       });
-      if (uploadError) {
-        if (uploadError.message.includes('Bucket not found')) {
-          throw new Error('Storage bucket "posts" not found. Create a public "posts" bucket in Supabase.');
-        }
-        throw uploadError;
+
+      const response = await fetch(apiUrl('/api/stories'), {
+        method: 'POST',
+        body: form,
+      });
+
+      const body = await response.json().catch(() => null);
+      console.log('[StoryUpload] /api/stories response', {
+        status: response.status,
+        ok: response.ok,
+        body,
+      });
+
+      if (!response.ok) {
+        const serverMessage =
+          (body && typeof body === 'object' && 'error' in body && typeof (body as any).error === 'string'
+            ? (body as any).error
+            : '') || 'Failed to upload story media.';
+        throw new Error(serverMessage);
       }
 
-      const { data: { publicUrl } } = supabase.storage.from('posts').getPublicUrl(filePath);
-      const mediaType = file.type.startsWith('video/') ? 'video' : 'image';
-      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-
-      const { data: insertedStory, error: insertError } = await supabase
-        .from('stories')
-        .insert({
-          user_id: user.id,
-          username,
-          avatar,
-          media_url: publicUrl,
-          image_url: publicUrl,
-          media_type: mediaType,
-          expires_at: expiresAt,
-        })
-        .select('id, user_id, media_url, media_type, created_at, expires_at, username, avatar')
-        .single();
-      if (insertError) throw insertError;
-
+      const insertedStory = body && typeof body === 'object' ? (body as any) : null;
       if (insertedStory?.id && insertedStory?.media_url) {
         const optimistic = {
           id: insertedStory.id,
@@ -485,9 +488,10 @@ function Stories() {
           avatar: insertedStory.avatar || avatar,
           image_url: insertedStory.media_url,
           media_url: insertedStory.media_url,
-          media_type: insertedStory.media_type || mediaType,
+          media_type: insertedStory.media_type || (file.type.startsWith('video/') ? 'video' : 'image'),
           created_at: insertedStory.created_at || new Date().toISOString(),
-          expires_at: insertedStory.expires_at || expiresAt,
+          expires_at:
+            insertedStory.expires_at || new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
           user: insertedStory.username || username,
         };
         setRealStories((prev) => {

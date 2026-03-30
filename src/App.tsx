@@ -36,6 +36,8 @@ import MessagesPage from './pages/MessagesPage';
 import ProfilePage from './pages/ProfilePage';
 import ProductDetailPage from './pages/ProductDetailPage';
 import WalletPage from './pages/WalletPage';
+import AdminWithdrawPage from './pages/AdminWithdrawPage';
+import AdminDashboardPage from './pages/AdminDashboardPage';
 import InviteEarnPage from './pages/InviteEarnPage';
 import LivePage from './pages/LivePage';
 import ReelsPage from './pages/ReelsPage';
@@ -500,6 +502,8 @@ function AppContent() {
                 <Route path="/profile/:id" element={<ProtectedRoute><ProfilePage /></ProtectedRoute>} />
                 <Route path="/profile/edit" element={<ProtectedRoute><EditProfilePage /></ProtectedRoute>} />
                 <Route path="/wallet" element={<ProtectedRoute><WalletPage /></ProtectedRoute>} />
+                <Route path="/admin/withdraws" element={<ProtectedRoute><AdminWithdrawPage /></ProtectedRoute>} />
+                <Route path="/admin/dashboard" element={<ProtectedRoute><AdminDashboardPage /></ProtectedRoute>} />
                 <Route path="/invite" element={<ProtectedRoute><InviteEarnPage /></ProtectedRoute>} />
                 <Route path="/live" element={<ProtectedRoute><LivePage /></ProtectedRoute>} />
                 <Route path="/gifts" element={<ProtectedRoute><GiftsPage /></ProtectedRoute>} />

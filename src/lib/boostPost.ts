@@ -8,8 +8,9 @@ export async function boostPostAction(postId: string, userId: string): Promise<{
   if (!isSupabaseConfigured || !postId || !userId) {
     return { ok: false, message: 'Unavailable' };
   }
-  const okDeduct = await deductCoins(userId, BOOST_COST);
-  if (!okDeduct) {
+  try {
+    await deductCoins(userId, BOOST_COST);
+  } catch {
     return { ok: false, message: 'Not enough coins (50 required).' };
   }
   const { error } = await supabase.from('post_boosts').insert({

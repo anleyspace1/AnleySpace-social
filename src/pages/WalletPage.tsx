@@ -25,6 +25,11 @@ import { useAuth } from '../contexts/AuthContext';
 import { apiUrl } from '../lib/apiOrigin';
 import { BuyCoinsMenu } from '../components/BuyCoinsMenu';
 import { useBuyCoins } from '../hooks/useBuyCoins';
+import { supabase, isSupabaseConfigured } from '../lib/supabase';
+import { deductCoins } from '../lib/coinsWallet';
+
+const MIN_WITHDRAW = 1000;
+const COIN_TO_USD_RATE = 0.01;
 
 export default function WalletPage() {
   const { user } = useAuth();
@@ -103,19 +108,79 @@ export default function WalletPage() {
     alert(`Successfully exchanged ${coins} coins for $${currency.toFixed(2)}`);
   };
 
-  const handleWithdraw = (amount: number, method: string) => {
-    if (amount > usdBalance) return;
-    setUsdBalance(prev => prev - amount);
-    const newTx: Transaction = {
-      id: `t${Date.now()}`,
-      type: 'withdraw',
-      amount: amount,
-      description: `USD Withdrawal to ${method === 'bank' ? 'Bank Account' : 'PayPal'}`,
-      timestamp: 'Just now',
-      status: 'pending'
-    };
-    setTransactions([newTx, ...transactions]);
-    setIsWithdrawModalOpen(false);
+  const handleWithdraw = async (amount: number, method: string, paymentDetails: string) => {
+    if (!user) {
+      alert('Please sign in to withdraw.');
+      return;
+    }
+
+    const coins = Math.floor(amount);
+    const minUsd = (MIN_WITHDRAW * COIN_TO_USD_RATE).toFixed(0);
+
+    if (coins < MIN_WITHDRAW) {
+      alert(`Minimum withdraw is ${MIN_WITHDRAW} coins ($${minUsd})`);
+      return;
+    }
+
+    if (coins <= 0 || !Number.isFinite(coins)) {
+      alert('Enter a valid withdraw amount.');
+      return;
+    }
+
+    if (coins > balance) {
+      alert('Insufficient coin balance.');
+      return;
+    }
+
+    if (!paymentDetails.trim()) {
+      alert('Payment details are required.');
+      return;
+    }
+
+    if (!isSupabaseConfigured) {
+      alert('Supabase is not configured.');
+      return;
+    }
+
+    const paymentMethod = method;
+    const { error } = await supabase.rpc('process_withdraw', {
+      p_user_id: user.id,
+      p_coins: coins,
+      p_method: paymentMethod,
+      p_details: paymentDetails
+    });
+
+    if (!error) {
+      alert('Withdraw request submitted');
+      window.location.reload();
+      return;
+    }
+
+    console.error('RPC FAILED:', error);
+
+    // Only fallback if RPC truly fails
+    try {
+      const { data, error: insertError } = await supabase
+        .from('withdraw_requests')
+        .insert({
+          user_id: user.id,
+          coins,
+          payment_method: paymentMethod,
+          payment_details: paymentDetails
+        })
+        .select()
+        .single();
+
+      if (insertError) throw insertError;
+
+      await deductCoins(user.id, coins);
+
+      alert('Withdraw request submitted');
+      window.location.reload();
+    } catch (err) {
+      console.error('FALLBACK FAILED:', err);
+      alert('Withdraw failed, please try again');
+    }
   };
 
   return (
@@ -306,7 +371,7 @@ export default function WalletPage() {
       <AnimatePresence>
         {isWithdrawModalOpen && (
           <WithdrawModal 
-            usdBalance={usdBalance}
+            coinsBalance={balance}
             onClose={() => setIsWithdrawModalOpen(false)} 
             onConfirm={handleWithdraw} 
           />
@@ -341,9 +406,18 @@ export default function WalletPage() {
   );
 }
 
-function WithdrawModal({ usdBalance, onClose, onConfirm }: { usdBalance: number; onClose: () => void; onConfirm: (amount: number, method: string) => void }) {
+function WithdrawModal({
+  coinsBalance,
+  onClose,
+  onConfirm,
+}: {
+  coinsBalance: number;
+  onClose: () => void;
+  onConfirm: (amount: number, method: string, paymentDetails: string) => void;
+}) {
   const [amount, setAmount] = useState<string>('');
   const [method, setMethod] = useState<'bank' | 'paypal'>('bank');
+  const [paymentDetails, setPaymentDetails] = useState<string>('');
 
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
@@ -371,29 +445,33 @@ function WithdrawModal({ usdBalance, onClose, onConfirm }: { usdBalance: number;
           <div className="bg-indigo-50 dark:bg-indigo-900/20 p-4 rounded-2xl border border-indigo-100 dark:border-indigo-800/50">
             <div className="flex items-center justify-between">
               <span className="text-sm text-indigo-600 dark:text-indigo-400 font-bold">Available Balance</span>
-              <span className="text-lg font-black text-indigo-600 dark:text-indigo-400">${usdBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+              <span className="text-lg font-black text-indigo-600 dark:text-indigo-400">{coinsBalance.toLocaleString()} coins</span>
             </div>
+            <p className="text-[10px] mt-2 font-bold text-indigo-600 dark:text-indigo-400">
+              Minimum withdraw: {MIN_WITHDRAW} coins ($10)
+            </p>
           </div>
 
           <div>
-            <label className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2 block">Withdraw Amount (USD)</label>
+            <label className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2 block">Withdraw Amount (Coins)</label>
             <div className="relative">
               <Banknote className="absolute left-4 top-1/2 -translate-y-1/2 text-green-500" size={20} />
               <input 
                 type="number" 
                 value={amount}
                 onChange={(e) => setAmount(e.target.value)}
-                placeholder="0.00"
+                step={1}
+                placeholder="0"
                 className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl py-4 pl-12 pr-4 focus:ring-2 focus:ring-indigo-500 transition-all font-bold"
               />
               <button 
-                onClick={() => setAmount(usdBalance.toFixed(2))}
+                onClick={() => setAmount(Math.floor(coinsBalance).toString())}
                 className="absolute right-4 top-1/2 -translate-y-1/2 text-xs font-bold text-indigo-600 hover:underline"
               >
                 Max
               </button>
             </div>
-            {parseFloat(amount) > usdBalance && (
+            {Number(amount) > coinsBalance && (
               <p className="text-red-500 text-[10px] mt-1 font-bold flex items-center gap-1">
                 <AlertCircle size={10} />
                 Insufficient balance
@@ -427,11 +505,29 @@ function WithdrawModal({ usdBalance, onClose, onConfirm }: { usdBalance: number;
             </div>
           </div>
 
+          <div>
+            <label className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2 block">
+              Payment Details
+            </label>
+            <input
+              type="text"
+              value={paymentDetails}
+              onChange={(e) => setPaymentDetails(e.target.value)}
+              placeholder={method === 'bank' ? 'Bank account / routing number' : 'PayPal email / username'}
+              className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl py-4 px-4 focus:ring-2 focus:ring-indigo-500 transition-all font-bold"
+            />
+          </div>
+
           <motion.button 
             whileHover={{ scale: 1.02 }}
             whileTap={{ scale: 0.98 }}
-            disabled={!amount || parseFloat(amount) <= 0 || parseFloat(amount) > usdBalance}
-            onClick={() => onConfirm(parseFloat(amount), method)}
+            disabled={
+              !amount ||
+              Number(amount) < MIN_WITHDRAW ||
+              Number(amount) > coinsBalance ||
+              !paymentDetails.trim()
+            }
+            onClick={() => onConfirm(parseInt(amount, 10), method, paymentDetails)}
             className="w-full bg-indigo-600 disabled:bg-gray-300 dark:disabled:bg-gray-800 text-white py-4 rounded-2xl font-bold shadow-lg shadow-indigo-500/20 transition-all"
           >
             Withdraw Now
