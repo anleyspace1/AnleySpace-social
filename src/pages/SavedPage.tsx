@@ -21,14 +21,13 @@ export type SavedListItem = {
   priceCoins?: number;
 };
 
-function isValidSavedMediaUrl(url: string | null | undefined): boolean {
+/** True if URL can be used as image/video src (real user content from DB or storage). */
+function isUsableMediaUrl(url: string | null | undefined): boolean {
   const u = (url || '').trim();
   if (!u) return false;
-  const lower = u.toLowerCase();
-  if (lower.includes('localhost') || lower.includes('127.0.0.1')) return false;
-  if (!u.startsWith('https://')) return false;
-  if (lower.includes('picsum.photos') || lower.includes('placehold')) return false;
-  return true;
+  if (u.startsWith('//') || u.startsWith('http://') || u.startsWith('https://')) return true;
+  if (u.startsWith('/') && u.length > 1) return true;
+  return false;
 }
 
 /** Normalize UUID / id strings for Map lookup (trim + lowercase). */
@@ -78,19 +77,27 @@ export default function SavedPage() {
       try {
         const { data: saveRows, error: saveErr } = await supabase
           .from('saved_posts')
-          .select('post_id')
-          .eq('user_id', user.id);
+          .select('post_id, created_at')
+          .eq('user_id', user.id)
+          .order('created_at', { ascending: false });
 
         if (saveErr) throw saveErr;
-        const postIds = (saveRows || []).map((r: { post_id: string }) => r.post_id).filter(Boolean);
+        const orderedRows = (saveRows || []) as { post_id: string; created_at?: string }[];
+        const postIds = orderedRows.map((r) => r.post_id).filter(Boolean);
 
         if (postIds.length > 0) {
-          const { data: postsData, error: postsErr } = await supabase
-            .from('posts')
-            .select('*')
-            .in('id', postIds);
+          const postsDataChunks: any[] = [];
+          for (let i = 0; i < postIds.length; i += SUPABASE_IN_CHUNK) {
+            const chunk = postIds.slice(i, i + SUPABASE_IN_CHUNK);
+            const { data: chunkData, error: postsErr } = await supabase
+              .from('posts')
+              .select('*')
+              .in('id', chunk);
+            if (postsErr) throw postsErr;
+            if (chunkData?.length) postsDataChunks.push(...chunkData);
+          }
+          const postsData = postsDataChunks;
 
-          if (postsErr) throw postsErr;
           const byId = new Map((postsData || []).map((p: any) => [p.id, p]));
           const ordered = postIds.map((id) => byId.get(id)).filter(Boolean) as any[];
 
@@ -111,8 +118,8 @@ export default function SavedPage() {
           for (const p of ordered) {
             const videoUrl = String(p.video_url || '').trim();
             const imageUrl = String(p.image_url || '').trim();
-            const hasVideo = isValidSavedMediaUrl(videoUrl);
-            const hasImage = isValidSavedMediaUrl(imageUrl);
+            const hasVideo = isUsableMediaUrl(videoUrl);
+            const hasImage = isUsableMediaUrl(imageUrl);
             if (!hasVideo && !hasImage) continue;
 
             const author = profById[p.user_id];
@@ -125,7 +132,7 @@ export default function SavedPage() {
               type,
               title: title.slice(0, 120),
               user: username,
-              image: hasImage ? imageUrl : videoUrl,
+              image: hasImage ? imageUrl : hasVideo ? videoUrl : '',
               videoUrl: hasVideo ? videoUrl : undefined,
             });
           }
@@ -148,10 +155,7 @@ export default function SavedPage() {
         ];
 
         if (productIds.length > 0) {
-          console.log('[SavedPage] saved marketplace productIds', productIds);
-
           const mRows = await fetchMarketplaceRowsInChunks(productIds);
-          console.log('[SavedPage] marketplaceRows', mRows);
 
           const marketplaceById = new Map(
             mRows.map((r) => [normProductId(r.id as string), r])
@@ -213,7 +217,6 @@ export default function SavedPage() {
         console.warn('[SavedPage] saved_marketplace', smErr);
       }
 
-      console.log('SAVED ITEMS:', items);
       setSavedItems(items);
     } catch (err) {
       console.error('[SavedPage] fetch error', err);
@@ -226,6 +229,23 @@ export default function SavedPage() {
   useEffect(() => {
     void fetchSavedItems();
   }, [fetchSavedItems]);
+
+  useEffect(() => {
+    if (!user?.id) return;
+    const channel = supabase
+      .channel(`saved_posts_feed_${user.id}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'saved_posts', filter: `user_id=eq.${user.id}` },
+        () => {
+          void fetchSavedItems();
+        }
+      )
+      .subscribe();
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [user?.id, fetchSavedItems]);
 
   const filtered = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -324,6 +344,11 @@ export default function SavedPage() {
                   item={item}
                   onRemove={() => handleRemove(item)}
                   onOpenProduct={item.type === 'product' ? () => navigate(`/marketplace/product/${item.id}`) : undefined}
+                  onOpenPost={
+                    item.type !== 'product' && item.id && String(item.id).trim()
+                      ? () => navigate(`/post/${encodeURIComponent(String(item.id).trim())}`)
+                      : undefined
+                  }
                 />
               ))}
             </div>
@@ -334,7 +359,7 @@ export default function SavedPage() {
               <p className="text-sm mt-1 max-w-sm">
                 {activeTab === 'products'
                   ? 'Save products from Marketplace with the heart on each listing.'
-                  : 'Save posts from your feed to see them here.'}
+                  : "You haven't saved anything yet. Tap the bookmark on a post to save it here."}
               </p>
             </div>
           )}
@@ -383,10 +408,12 @@ function SavedCard({
   item,
   onRemove,
   onOpenProduct,
+  onOpenPost,
 }: {
   item: SavedListItem;
   onRemove: () => void;
   onOpenProduct?: () => void;
+  onOpenPost?: () => void;
 }) {
   const isVideoThumb = item.type === 'video' && item.videoUrl && (!item.image || item.image === item.videoUrl);
 
@@ -449,22 +476,22 @@ function SavedCard({
 
   return (
     <div
-      role={onOpenProduct ? 'button' : undefined}
-      tabIndex={onOpenProduct ? 0 : undefined}
-      onClick={onOpenProduct}
+      role={onOpenPost || onOpenProduct ? 'button' : undefined}
+      tabIndex={onOpenPost || onOpenProduct ? 0 : undefined}
+      onClick={onOpenPost || onOpenProduct}
       onKeyDown={
-        onOpenProduct
+        onOpenPost || onOpenProduct
           ? (e) => {
               if (e.key === 'Enter' || e.key === ' ') {
                 e.preventDefault();
-                onOpenProduct();
+                (onOpenPost || onOpenProduct)?.();
               }
             }
           : undefined
       }
       className={cn(
         'bg-white dark:bg-gray-900 rounded-2xl border border-gray-100 dark:border-gray-800 overflow-hidden shadow-sm group',
-        onOpenProduct && 'cursor-pointer'
+        (onOpenPost || onOpenProduct) && 'cursor-pointer'
       )}
     >
       <div className="aspect-video relative bg-gray-900">

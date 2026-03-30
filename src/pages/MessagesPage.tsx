@@ -1414,20 +1414,20 @@ export default function MessagesPage() {
   };
 
   return (
-    <div className="flex min-h-0 h-[calc(100vh-56px-72px)] sm:h-[calc(100vh-64px)] lg:h-[calc(100vh-4rem)] max-h-[calc(100vh-56px-72px)] sm:max-h-[calc(100vh-64px)] lg:max-h-[calc(100vh-4rem)] bg-gray-50 dark:bg-black relative overflow-hidden items-stretch">
+    <div className="flex min-h-0 h-[calc(100vh-56px-72px)] sm:h-[calc(100vh-64px)] lg:h-[calc(100vh-4rem)] max-h-[calc(100vh-56px-72px)] sm:max-h-[calc(100vh-64px)] lg:max-h-[calc(100vh-4rem)] bg-gray-50 dark:bg-black text-gray-900 dark:text-gray-100 relative overflow-hidden items-stretch">
       {/* Chat List — fills row height; list scrolls inside (scrollbar hidden via no-scrollbar) */}
       <div className={cn(
         "w-full md:w-80 md:max-w-[20rem] shrink-0 border-r border-gray-200 dark:border-gray-800 flex flex-col min-h-0 self-stretch overflow-hidden bg-white dark:bg-black",
         selectedChat && "hidden md:flex"
       )}>
         <div className="shrink-0 p-3 sm:p-4 border-b border-gray-200 dark:border-gray-800">
-          <h1 className="text-xl sm:text-2xl font-bold mb-3 sm:mb-4">Messages</h1>
+          <h1 className="text-xl sm:text-2xl font-bold mb-3 sm:mb-4 text-gray-900 dark:text-gray-100">Messages</h1>
           <div className="relative">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={16} />
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 dark:text-gray-400 pointer-events-none" size={16} />
             <input 
               type="text" 
               placeholder="Search chats..." 
-              className="w-full bg-gray-100 dark:bg-gray-900 border-none rounded-xl py-1.5 sm:py-2 pl-9 sm:pl-10 pr-4 focus:ring-2 focus:ring-indigo-500 text-sm"
+              className="w-full bg-white dark:bg-gray-800 !text-gray-900 dark:!text-gray-100 placeholder:!text-gray-500 dark:placeholder:!text-gray-400 caret-gray-900 dark:caret-white border border-gray-300 dark:border-gray-600 rounded-full pl-9 sm:pl-10 pr-4 py-1.5 sm:py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all"
             />
           </div>
         </div>
@@ -1457,7 +1457,7 @@ export default function MessagesPage() {
               <div className="flex-1 text-left">
                 <div className="flex items-center justify-between mb-0.5 sm:mb-1 gap-1">
                   <div className="flex items-center gap-1.5 min-w-0 flex-1">
-                    <span className="font-bold text-sm sm:text-base truncate">{chat.user.displayName}</span>
+                    <span className="font-semibold text-sm sm:text-base truncate text-gray-900 dark:text-gray-100">{chat.user.displayName}</span>
                     {chat.product_id ? (
                       <span className="shrink-0 text-[9px] sm:text-[10px] font-semibold text-indigo-500 bg-indigo-500/15 dark:bg-indigo-500/20 px-1.5 py-0.5 rounded">
                         Marketplace
@@ -1466,7 +1466,7 @@ export default function MessagesPage() {
                   </div>
                   <span className="text-[10px] sm:text-xs text-gray-500 shrink-0">{chat.timestamp}</span>
                 </div>
-                <p className="text-xs sm:text-sm text-gray-500 truncate">{chat.lastMessage}</p>
+                <p className="text-xs sm:text-sm text-gray-700 dark:text-gray-300 truncate">{chat.lastMessage}</p>
               </div>
               {chat.unreadCount > 0 && (
                 <div className="w-4 h-4 sm:w-5 sm:h-5 bg-indigo-600 text-white text-[8px] sm:text-[10px] font-bold rounded-full flex items-center justify-center">
@@ -1500,7 +1500,7 @@ export default function MessagesPage() {
                 </div>
                 <div>
                   <div className="flex items-center gap-2 flex-wrap">
-                    <h3 className="font-bold leading-none text-sm sm:text-base">{selectedChat.user.displayName}</h3>
+                    <h3 className="font-bold leading-none text-sm sm:text-base text-gray-900 dark:text-gray-100">{selectedChat.user.displayName}</h3>
                     {selectedChat.product_id ? (
                       <span className="text-[9px] sm:text-[10px] font-semibold text-indigo-500 bg-indigo-500/15 dark:bg-indigo-500/20 px-1.5 py-0.5 rounded">
                         Marketplace
@@ -1557,7 +1557,7 @@ export default function MessagesPage() {
                   className="w-14 h-14 rounded-lg object-cover border border-gray-100 dark:border-gray-800 bg-gray-100 dark:bg-gray-900"
                 />
                 <div className="flex flex-col min-w-0 flex-1">
-                  <span className="font-semibold text-sm text-gray-900 dark:text-white truncate">
+                  <span className="font-semibold text-sm text-gray-900 dark:text-gray-100 truncate">
                     {headerMarketplaceProduct.title || 'Listing'}
                   </span>
                   <span className="text-xs text-gray-500 dark:text-gray-400">
@@ -1850,7 +1850,11 @@ export default function MessagesPage() {
                     onChange={(e) => setMessage(e.target.value)}
                     onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
                     placeholder="Message..." 
-                    className="flex-1 bg-transparent border-none focus:ring-0 py-1.5 sm:py-2 text-sm text-gray-900 dark:text-gray-100 placeholder:text-gray-500"
+                    className="chat-message-input flex-1 min-w-0 w-full bg-white dark:bg-gray-100 !text-gray-900 placeholder:!text-gray-500 dark:placeholder:!text-gray-500 caret-gray-900 border border-gray-300 dark:border-gray-400 rounded-xl px-4 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm"
+                    style={{
+                      color: '#111827',
+                      WebkitTextFillColor: '#111827',
+                    }}
                   />
                   <button 
                     onClick={handleSendMessage}
@@ -1870,8 +1874,8 @@ export default function MessagesPage() {
             <div className="w-20 h-20 bg-indigo-100 dark:bg-indigo-900/30 rounded-full flex items-center justify-center text-indigo-600 mx-auto mb-4">
               <MessageCircle size={40} />
             </div>
-            <h2 className="text-xl font-bold mb-2">Your Messages</h2>
-            <p className="text-gray-500">Select a chat to start messaging</p>
+            <h2 className="text-xl font-bold mb-2 text-gray-900 dark:text-gray-100">Your Messages</h2>
+            <p className="text-gray-600 dark:text-gray-400">Select a chat to start messaging</p>
           </div>
         )}
       </div>

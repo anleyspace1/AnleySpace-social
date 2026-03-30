@@ -631,19 +631,38 @@ interface GroupCardProps {
 
 function GroupCard({ group, joined, onJoin }: GroupCardProps) {
   const navigate = useNavigate();
+  const groupId = resolveGroupUuid(group) || String(group?.id ?? '').trim();
+
+  const goToGroupDetail = () => {
+    if (!groupId) return;
+    navigate(`/groups/${encodeURIComponent(groupId)}`);
+  };
 
   return (
     <div 
-      onClick={() => joined && navigate(`/groups/${group.id}/chat`)}
+      role="button"
+      tabIndex={groupId ? 0 : -1}
+      onClick={goToGroupDetail}
+      onKeyDown={(e) => {
+        if (!groupId) return;
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          goToGroupDetail();
+        }
+      }}
       className={cn(
         "bg-white dark:bg-gray-900 rounded-none lg:rounded-2xl border-b lg:border border-gray-100 dark:border-gray-800 overflow-hidden shadow-sm group",
-        joined && "cursor-pointer hover:border-indigo-500 transition-colors"
+        groupId && "cursor-pointer hover:border-indigo-500 transition-colors"
       )}
     >
       <div className="h-32 relative">
         <img src={group.image} alt="" className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" />
         <div className="absolute top-2 right-2">
-          <button className="p-1.5 bg-black/50 text-white rounded-full backdrop-blur-sm">
+          <button
+            type="button"
+            onClick={(e) => e.stopPropagation()}
+            className="p-1.5 bg-black/50 text-white rounded-full backdrop-blur-sm"
+          >
             <MoreHorizontal size={16} />
           </button>
         </div>
@@ -666,10 +685,12 @@ function GroupCard({ group, joined, onJoin }: GroupCardProps) {
           <span>{group.members || '0'} members</span>
         </div>
         <button 
+          type="button"
           onClick={(e) => {
             e.stopPropagation();
             if (joined) {
-              navigate(`/groups/${group.id}`);
+              const id = resolveGroupUuid(group) || String(group?.id ?? '').trim();
+              if (id) navigate(`/groups/${encodeURIComponent(id)}`);
             } else if (onJoin) {
               onJoin();
             }

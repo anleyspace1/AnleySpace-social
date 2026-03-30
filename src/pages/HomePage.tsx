@@ -50,6 +50,8 @@ import {
   storiesStoragePath,
 } from '../lib/storageUpload';
 import { isPlaceholderUsername } from '../lib/realDataGuards';
+import { getViews } from '../lib/postViews';
+import { hasRecordedViewThisSession, markPostViewRecordedSession } from '../lib/postViewTracking';
 
 /** Home feed: white cards on #F5F6FA (see App layout when path is `/`). */
 const homeCard =
@@ -1492,14 +1494,37 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
     };
   }, [loading, refreshKey, user?.id]);
 
-  // Subscribe to real-time updates once
+  // Realtime: merge row updates (e.g. view_count) without refetch; other events refetch.
   useEffect(() => {
     const channel = supabase
-      .channel('public:posts')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'posts' }, () => {
-        console.log('[Home] realtime posts change -> fetchPosts()');
-        fetchPosts();
-      })
+      .channel('posts')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'posts' },
+        (payload) => {
+          if (payload.eventType === 'UPDATE' && payload.new && typeof payload.new === 'object' && 'id' in payload.new) {
+            const id = (payload.new as { id: string }).id;
+            setPosts((prev) =>
+              prev.map((p) =>
+                p.id === id
+                  ? {
+                      ...p,
+                      ...payload.new,
+                      likes_count: p.likes_count,
+                      comments_count: p.comments_count,
+                      profiles: p.profiles,
+                      username: p.username,
+                      avatar_url: p.avatar_url,
+                    }
+                  : p
+              )
+            );
+            return;
+          }
+          console.log('[Home] realtime posts change -> fetchPosts()');
+          fetchPosts();
+        }
+      )
       .subscribe();
 
     return () => {
@@ -1553,6 +1578,15 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
               onPostUpdated={(postId, newContent) => {
                 setPosts((prev) =>
                   prev.map((p) => (p.id === postId ? { ...p, content: newContent } : p))
+                );
+              }}
+              onPostViewRecorded={(postId) => {
+                setPosts((prev) =>
+                  prev.map((p) =>
+                    p.id === postId
+                      ? { ...p, view_count: getViews(p) + 1, views: getViews(p) + 1 }
+                      : p
+                  )
                 );
               }}
               userStoriesMap={userStoriesMap}
@@ -1738,12 +1772,15 @@ function PostItem({
   index = 0,
   onDelete,
   onPostUpdated,
+  onPostViewRecorded,
   userStoriesMap = {},
 }: {
   post: any;
   index?: number;
   onDelete: () => void;
   onPostUpdated?: (postId: string, newContent: string) => void;
+  /** Optimistic feed update when a video view is counted (once per session per post). */
+  onPostViewRecorded?: (postId: string) => void;
   userStoriesMap?: Record<string, any[]>;
   key?: React.Key;
 }) {
@@ -1767,6 +1804,7 @@ function PostItem({
 
   // Video player ref for intersection observer
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const hasVideoViewCountedRef = useRef(false);
   const [isTouchDevice, setIsTouchDevice] = useState(false);
   const [isMuted, setIsMuted] = useState(true);
 
@@ -1829,6 +1867,10 @@ function PostItem({
     setFeedVideoError(false);
     setIsReady(false);
   }, [post.id, videoUrl]);
+
+  useEffect(() => {
+    hasVideoViewCountedRef.current = false;
+  }, [post.id]);
 
   useEffect(() => {
     const mq = window.matchMedia('(pointer: coarse)');
@@ -1899,6 +1941,27 @@ function PostItem({
       const entry = entries[0];
       if (entry.isIntersecting) {
         void node.play().catch(() => {});
+        const pid = post?.id != null ? String(post.id) : '';
+        if (
+          pid &&
+          !hasVideoViewCountedRef.current &&
+          !hasRecordedViewThisSession(pid)
+        ) {
+          hasVideoViewCountedRef.current = true;
+          markPostViewRecordedSession(pid);
+          const next = getViews(post) + 1;
+          onPostViewRecorded?.(pid);
+          void supabase
+            .from('posts')
+            .update({ view_count: next })
+            .eq('id', pid)
+            .then(async ({ error }) => {
+              if (error) {
+                const { error: e2 } = await supabase.from('posts').update({ views: next }).eq('id', pid);
+                if (e2) console.warn('[PostItem] views/view_count update', e2);
+              }
+            });
+        }
       } else {
         node.pause();
       }
@@ -1912,7 +1975,7 @@ function PostItem({
     return () => {
       observer.disconnect();
     };
-  }, [canPlayVideo, feedVideoError, videoUrl, videoRef]);
+  }, [canPlayVideo, feedVideoError, videoUrl, videoRef, post, onPostViewRecorded]);
 
   // Kick off autoplay after mount / src change (ref may attach next frame; muted comes from <video muted> + touch sync)
   useEffect(() => {
@@ -2713,6 +2776,7 @@ function PostItem({
             <span className="text-xs text-gray-400">{formatCount(likesCount)}</span>
           </div>
           <div className="flex items-center gap-4 text-xs text-gray-400">
+            {canPlayVideo && <span>{formatCount(getViews(post))} views</span>}
             <button onClick={() => setShowComments(!showComments)} className="hover:underline">
               {formatCount(commentsCount)} comments
             </button>
@@ -3378,16 +3442,105 @@ function TrendingSection() {
 function SuggestedGroups() {
   const navigate = useNavigate();
   const location = useLocation();
+  const { user } = useAuth();
   const [joined, setJoined] = useState<Record<string, boolean>>({});
+  const [groups, setGroups] = useState<
+    { id: string; name: string; imageUrl?: string; initial: string }[]
+  >([]);
+  const [loadingSuggested, setLoadingSuggested] = useState(true);
 
-  const groups: { id: string; name: string; icon: string }[] = [];
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoadingSuggested(true);
+      const { data, error } = await supabase
+        .from('groups')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(10);
+
+      if (cancelled) return;
+
+      if (error) {
+        console.warn('[SuggestedGroups] groups select:', error);
+        setGroups([]);
+        setLoadingSuggested(false);
+        return;
+      }
+
+      console.log('Suggested groups:', data);
+
+      let rows = Array.isArray(data) ? [...data] : [];
+      const uid = user?.id ? String(user.id).trim() : '';
+
+      if (uid && rows.length > 0) {
+        const { data: mems, error: memErr } = await supabase
+          .from('group_members')
+          .select('group_id')
+          .eq('user_id', uid);
+
+        if (!memErr && Array.isArray(mems)) {
+          const joinedIds = new Set(
+            mems.map((m: { group_id?: string }) => String(m.group_id))
+          );
+          const beforeCount = rows.length;
+          const filtered = rows.filter(
+            (g: { id?: string }) => g?.id && !joinedIds.has(String(g.id))
+          );
+          if (filtered.length === 0 && beforeCount > 0) {
+            // Membership filter removed everything — keep full list so suggestions still appear
+          } else {
+            rows = filtered;
+          }
+        }
+      }
+
+      if (cancelled) return;
+
+      setGroups(
+        rows.map((g: { id?: string; name?: string; image?: string | null }) => {
+          const name = String(g?.name || 'Untitled Group').trim() || 'Untitled Group';
+          const img =
+            typeof g?.image === 'string' && g.image.trim() ? g.image.trim() : undefined;
+          return {
+            id: String(g.id),
+            name,
+            imageUrl: img,
+            initial: name.charAt(0).toUpperCase() || 'G',
+          };
+        })
+      );
+      setLoadingSuggested(false);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id]);
 
   const handleJoin = (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
     setJoined(prev => ({ ...prev, [id]: !prev[id] }));
   };
 
+  const goToGroup = (id: string) => {
+    const gid = String(id ?? '').trim();
+    if (!gid) return;
+    navigate(`/groups/${encodeURIComponent(gid)}`);
+  };
+
   const isHomeFeed = location.pathname === '/';
+
+  if (loadingSuggested) {
+    return (
+      <div className={cn(isHomeFeed ? homeCard : exploreGlassCard, 'p-5')}>
+        <h3 className={cn('font-bold text-sm mb-2', isHomeFeed ? 'text-gray-900' : 'text-white')}>
+          Suggested Groups
+        </h3>
+        <p className={cn('text-xs', isHomeFeed ? 'text-gray-500' : 'text-white/60')}>Loading…</p>
+      </div>
+    );
+  }
 
   if (!groups.length) {
     return (
@@ -3405,12 +3558,29 @@ function SuggestedGroups() {
         {groups.map(group => (
           <div
             key={group.id}
-            onClick={() => navigate(`/groups/${group.id}`)}
+            role="button"
+            tabIndex={0}
+            onClick={() => goToGroup(group.id)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                goToGroup(group.id);
+              }
+            }}
             className="flex items-center justify-between cursor-pointer group"
           >
             <div className="flex items-center gap-3">
-              <div className="w-10 h-10 bg-gray-100 dark:bg-gray-800 rounded-xl flex items-center justify-center group-hover:scale-110 transition-transform">
-                {group.icon}
+              <div className="w-10 h-10 bg-gray-100 dark:bg-gray-800 rounded-xl flex items-center justify-center overflow-hidden group-hover:scale-110 transition-transform shrink-0">
+                {group.imageUrl ? (
+                  <img
+                    src={group.imageUrl}
+                    alt=""
+                    className="w-full h-full object-cover"
+                    referrerPolicy="no-referrer"
+                  />
+                ) : (
+                  <span className="text-sm font-bold text-gray-600 dark:text-gray-300">{group.initial}</span>
+                )}
               </div>
               <span
                 className={cn(

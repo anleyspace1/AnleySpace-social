@@ -26,6 +26,20 @@ import { fetchMarketplaceTableRowsAsApiProducts, mapMarketplaceRowsToProducts } 
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import { ResponsiveImage } from '../components/ResponsiveImage';
+import { isValidVideoUrl } from '../lib/videoUrl';
+import { isPlaceholderUsername } from '../lib/realDataGuards';
+import {
+  getViews,
+  getViralScore,
+  getHoursSince,
+} from '../lib/postViews';
+import { getPersonalizedScore } from '../lib/personalizedRanking';
+import { maybeRewardViralPost } from '../lib/viralRewards';
+import { boostPostAction, BOOST_COST } from '../lib/boostPost';
+
+/** Match Reels viral rules for labels + engagement boost. */
+const VIRAL_THRESHOLD = 50;
+const MIN_VIEWS = 100;
 
 const resolveProfileUsername = (username?: string | null) => {
   const value = (username || '').trim();
@@ -121,6 +135,125 @@ const CATEGORIES = [
   { id: 'food', name: 'Food', icon: <Pizza size={24} />, color: 'bg-yellow-500/20 text-yellow-400' },
 ];
 
+function ExploreVideoPostCard({
+  post,
+  navigate,
+}: {
+  post: any;
+  navigate: ReturnType<typeof useNavigate>;
+}) {
+  const { user, profile, refreshProfile } = useAuth();
+  const thumb = typeof post.image_url === 'string' ? post.image_url.trim() : '';
+  const videoUrl = String(post.video_url || '').trim();
+  const open = () =>
+    navigate(`/reels/${post.id}`, {
+      state: {
+        videoId: post.id,
+        selectedReelId: post.id,
+        videoUrl,
+      },
+    });
+  return (
+    <div onClick={open} className="group cursor-pointer">
+      <div className="relative mb-2 aspect-[9/16] overflow-hidden rounded-xl bg-[#1a1c26]">
+        {thumb && isValidVideoUrl(thumb) ? (
+          <img
+            src={thumb}
+            alt=""
+            className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-105"
+            referrerPolicy="no-referrer"
+          />
+        ) : isValidVideoUrl(videoUrl) ? (
+          <video
+            src={`${videoUrl}#t=0.1`}
+            className="h-full w-full object-cover"
+            muted
+            playsInline
+            preload="metadata"
+            aria-hidden
+          />
+        ) : (
+          <div className="flex h-full w-full items-center justify-center bg-[#252836]">
+            <User size={24} className="text-gray-600" />
+          </div>
+        )}
+        {post.isViral && (
+          <div className="absolute left-2 top-2 rounded-full bg-orange-500 px-2 py-0.5 text-[9px] font-black text-white shadow-md">
+            🔥 Viral
+          </div>
+        )}
+      </div>
+      <p className="truncate px-0.5 text-[11px] font-bold text-gray-300">@{post.username}</p>
+      <p className="truncate px-0.5 text-[9px] text-gray-500">{getViews(post).toLocaleString()} views</p>
+      <button
+        type="button"
+        className="mt-1 w-full rounded-lg bg-amber-600/90 px-2 py-1 text-[10px] font-bold text-white hover:bg-amber-500"
+        onClick={(e) => {
+          e.stopPropagation();
+          if (!user?.id) {
+            alert('Sign in to boost posts.');
+            return;
+          }
+          const bal = Number(profile?.coins) || 0;
+          if (bal < BOOST_COST) {
+            alert(`You need at least ${BOOST_COST} coins to boost.`);
+            return;
+          }
+          void boostPostAction(String(post.id), user.id).then((res) => {
+            if (res.ok) void refreshProfile();
+            else alert(res.message || 'Boost failed');
+          });
+        }}
+      >
+        Boost ({BOOST_COST} coins)
+      </button>
+    </div>
+  );
+}
+
+function ExploreDiscoverySection({
+  title,
+  emoji,
+  posts,
+  navigate,
+  emptyMessage,
+}: {
+  title: string;
+  emoji: string;
+  posts: any[];
+  navigate: ReturnType<typeof useNavigate>;
+  emptyMessage: string;
+}) {
+  return (
+    <section className="mb-10">
+      <div className="mb-4 flex items-center justify-between px-4">
+        <h2 className="flex items-center gap-2 text-sm font-black uppercase tracking-wider">
+          <span className="text-base" aria-hidden>
+            {emoji}
+          </span>
+          {title}
+        </h2>
+        <button
+          type="button"
+          onClick={() => navigate('/reels')}
+          className="flex items-center gap-1 text-xs font-bold text-gray-500 transition-colors hover:text-white"
+        >
+          See All <ChevronRight size={14} />
+        </button>
+      </div>
+      {posts.length === 0 ? (
+        <div className="mx-4 rounded-2xl bg-[#1a1c26] px-4 py-10 text-center text-sm text-gray-500">{emptyMessage}</div>
+      ) : (
+        <div className="grid grid-cols-2 gap-3 px-4 md:grid-cols-3 lg:grid-cols-4">
+          {posts.map((post) => (
+            <ExploreVideoPostCard key={post.id} post={post} navigate={navigate} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 export default function ExplorePage() {
   const [searchParams] = useSearchParams();
   const initialQuery = searchParams.get('q') || '';
@@ -138,6 +271,101 @@ export default function ExplorePage() {
   const [exploreProducts, setExploreProducts] = useState<ExploreProductRow[]>([]);
   const [suggestedCreators, setSuggestedCreators] = useState<ExploreCreatorRow[]>([]);
   const [liveStreams, setLiveStreams] = useState<ExploreLiveRow[]>([]);
+  /** Video posts enriched for discovery sections (separate from marketplace/live fetch). */
+  const [exploreVideoPosts, setExploreVideoPosts] = useState<any[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const { data: rows, error } = await supabase
+          .from('posts')
+          .select('*')
+          .not('video_url', 'is', null)
+          .order('created_at', { ascending: false })
+          .limit(100);
+        if (cancelled) return;
+        if (error) {
+          console.error('[Explore] posts fetch error:', error);
+          setExploreVideoPosts([]);
+          return;
+        }
+        console.log('[Explore] fetched posts:', rows);
+        const base = (rows || []).filter((p: any) => {
+          const cat = typeof p?.category === 'string' ? p.category.trim().toLowerCase() : '';
+          return !cat.startsWith('group:');
+        });
+        const userIds = Array.from(new Set(base.map((p: any) => p.user_id).filter(Boolean)));
+        let profileMap: Record<string, { username?: string | null; avatar_url?: string | null }> = {};
+        if (userIds.length > 0) {
+          const { data: profs } = await supabase
+            .from('profiles')
+            .select('id, username, avatar_url')
+            .in('id', userIds);
+          profileMap = Object.fromEntries((profs || []).map((p: any) => [String(p.id), p]));
+        }
+        const postIds = base.map((p: any) => String(p.id)).filter(Boolean);
+        let likesByPost: Record<string, number> = {};
+        let commentsByPost: Record<string, number> = {};
+        if (postIds.length > 0) {
+          const [likesRes, commentsRes] = await Promise.all([
+            supabase.from('likes').select('post_id').in('post_id', postIds),
+            supabase.from('comments').select('post_id').in('post_id', postIds),
+          ]);
+          const { data: likeRows, error: le } = likesRes;
+          const { data: commentRows, error: ce } = commentsRes;
+          if (!le && Array.isArray(likeRows)) {
+            likeRows.forEach((row: any) => {
+              const pid = String(row.post_id);
+              likesByPost[pid] = (likesByPost[pid] || 0) + 1;
+            });
+          }
+          if (!ce && Array.isArray(commentRows)) {
+            commentRows.forEach((row: any) => {
+              const pid = String(row.post_id);
+              commentsByPost[pid] = (commentsByPost[pid] || 0) + 1;
+            });
+          }
+        }
+        const enriched = base
+          .map((r: any) => {
+            const id = String(r.id);
+            const uid = String(r.user_id ?? '').trim();
+            const uname = String(profileMap[uid]?.username ?? r.username ?? '').trim();
+            if (!uid || !uname || isPlaceholderUsername(uname)) return null;
+            const playUrl = String(r.video_url || r.url || '').trim();
+            if (!isValidVideoUrl(playUrl)) return null;
+            const views = getViews(r);
+            const viralScore = getViralScore(r);
+            const likes_count = likesByPost[id] ?? 0;
+            const comments_count = commentsByPost[id] ?? 0;
+            const isViral = views >= MIN_VIEWS && viralScore >= VIRAL_THRESHOLD;
+            return {
+              ...r,
+              id,
+              video_url: playUrl,
+              username: uname,
+              avatar_url: profileMap[uid]?.avatar_url || r.avatar || '',
+              likes_count,
+              comments_count,
+              viralScore,
+              isViral,
+            };
+          })
+          .filter(Boolean) as any[];
+        for (const p of enriched) {
+          if (p.isViral) void maybeRewardViralPost({ id: p.id, user_id: p.user_id, isViral: true });
+        }
+        if (!cancelled) setExploreVideoPosts(enriched);
+      } catch (e) {
+        console.error('[Explore] posts load failed:', e);
+        if (!cancelled) setExploreVideoPosts([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     const tag = '[Suggested Creators debug]';
@@ -465,6 +693,70 @@ export default function ExplorePage() {
     };
   }, [searchQuery, realCreators, exploreProducts, liveStreams]);
 
+  const { hotNow, viralVideos, trendingPosts, freshPosts, suggestedPosts } = useMemo(() => {
+    const posts = exploreVideoPosts;
+    const usedIds = new Set<string>();
+
+    const hotNowList = [...posts]
+      .filter((p) => getHoursSince(p.created_at) <= 2)
+      .sort((a, b) => (b.viralScore ?? 0) - (a.viralScore ?? 0))
+      .slice(0, 10);
+    hotNowList.forEach((p) => usedIds.add(String(p.id)));
+
+    const viralVideosList = posts
+      .filter((p) => {
+        const id = String(p.id);
+        if (p.isViral && !usedIds.has(id)) {
+          usedIds.add(id);
+          return true;
+        }
+        return false;
+      })
+      .slice(0, 10);
+
+    const trendingPostsList = posts
+      .filter((p) => {
+        const id = String(p.id);
+        if (p.viralScore > 30 && !usedIds.has(id)) {
+          usedIds.add(id);
+          return true;
+        }
+        return false;
+      })
+      .slice(0, 10);
+
+    const freshPostsList = posts
+      .filter((p) => {
+        const id = String(p.id);
+        if (getHoursSince(p.created_at) <= 6 && !usedIds.has(id)) {
+          usedIds.add(id);
+          return true;
+        }
+        return false;
+      })
+      .slice(0, 10);
+
+    const suggestedPostsList = [...posts]
+      .sort((a, b) => getPersonalizedScore(b) - getPersonalizedScore(a))
+      .filter((p) => {
+        const id = String(p.id);
+        if (!usedIds.has(id)) {
+          usedIds.add(id);
+          return true;
+        }
+        return false;
+      })
+      .slice(0, 10);
+
+    return {
+      hotNow: hotNowList,
+      viralVideos: viralVideosList,
+      trendingPosts: trendingPostsList,
+      freshPosts: freshPostsList,
+      suggestedPosts: suggestedPostsList,
+    };
+  }, [exploreVideoPosts]);
+
   const isSearching = searchQuery.trim().length > 0;
 
   const handleFollow = async (e: React.MouseEvent, creatorId: string) => {
@@ -677,6 +969,42 @@ export default function ExplorePage() {
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
           >
+            <ExploreDiscoverySection
+              title="Hot Right Now"
+              emoji="🔥"
+              posts={hotNow}
+              navigate={navigate}
+              emptyMessage="Nothing heating up in the last 2 hours."
+            />
+            <ExploreDiscoverySection
+              title="Viral Videos"
+              emoji="🔥"
+              posts={viralVideos}
+              navigate={navigate}
+              emptyMessage="No viral videos right now. Check back soon!"
+            />
+            <ExploreDiscoverySection
+              title="Trending Now"
+              emoji="📈"
+              posts={trendingPosts}
+              navigate={navigate}
+              emptyMessage="Nothing trending yet."
+            />
+            <ExploreDiscoverySection
+              title="New & Fresh"
+              emoji="🆕"
+              posts={freshPosts}
+              navigate={navigate}
+              emptyMessage="No new uploads in the last few hours."
+            />
+            <ExploreDiscoverySection
+              title="Suggested For You"
+              emoji="🎯"
+              posts={suggestedPosts}
+              navigate={navigate}
+              emptyMessage="No suggestions yet."
+            />
+
             {/* LIVE NOW */}
             <section className="mb-10">
               <div className="px-4 flex items-center justify-between mb-4">
@@ -733,12 +1061,12 @@ export default function ExplorePage() {
               )}
             </section>
 
-            {/* TRENDING */}
+            {/* QUICK LINKS */}
             <section className="mb-10">
               <div className="px-4 flex items-center justify-between mb-4">
                 <div className="flex items-center gap-2">
                   <Flame size={18} className="text-orange-500" />
-                  <h2 className="text-sm font-black uppercase tracking-wider">Trending</h2>
+                  <h2 className="text-sm font-black uppercase tracking-wider">Quick Links</h2>
                 </div>
                 <button 
                   onClick={() => navigate('/reels')}
@@ -812,7 +1140,9 @@ export default function ExplorePage() {
             <section className="mb-10">
               <div className="px-4 flex items-center justify-between mb-4">
                 <div className="flex items-center gap-2">
-                  <ShoppingBag size={18} className="text-blue-500" />
+                  <span className="text-base" aria-hidden>
+                    🛍️
+                  </span>
                   <h2 className="text-sm font-black uppercase tracking-wider">Popular Products</h2>
                 </div>
                 <button 
@@ -854,6 +1184,36 @@ export default function ExplorePage() {
               </div>
               )}
             </section>
+
+            {/* FEATURED (first marketplace product) */}
+            {exploreProducts[0] && (
+            <section className="px-4 mb-10">
+              <div 
+                onClick={() => navigate(`/marketplace/product/${exploreProducts[0].id}`)}
+                className="relative rounded-2xl overflow-hidden group cursor-pointer"
+              >
+                <img 
+                  src={exploreProducts[0].image} 
+                  alt={exploreProducts[0].name} 
+                  className="w-full aspect-[21/9] object-cover group-hover:scale-105 transition-transform duration-700"
+                  referrerPolicy="no-referrer"
+                />
+                <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/20 to-transparent" />
+                <div className="absolute bottom-4 left-4 right-4">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="bg-white/10 backdrop-blur-md text-[8px] font-bold px-2 py-0.5 rounded uppercase tracking-wider border border-white/10">
+                      Featured
+                    </span>
+                  </div>
+                  <h3 className="text-base font-black mb-0.5 truncate pr-4">{exploreProducts[0].name}</h3>
+                  <p className="text-[10px] text-gray-400 flex items-center gap-1">
+                    <Coins size={10} />
+                    {(exploreProducts[0].price || 0).toLocaleString()}
+                  </p>
+                </div>
+              </div>
+            </section>
+            )}
 
             {/* SUGGESTED CREATORS */}
             <section className="mb-10">
@@ -920,36 +1280,6 @@ export default function ExplorePage() {
               </div>
               )}
             </section>
-
-            {/* FEATURED (first marketplace product) */}
-            {exploreProducts[0] && (
-            <section className="px-4 mb-10">
-              <div 
-                onClick={() => navigate(`/marketplace/product/${exploreProducts[0].id}`)}
-                className="relative rounded-2xl overflow-hidden group cursor-pointer"
-              >
-                <img 
-                  src={exploreProducts[0].image} 
-                  alt={exploreProducts[0].name} 
-                  className="w-full aspect-[21/9] object-cover group-hover:scale-105 transition-transform duration-700"
-                  referrerPolicy="no-referrer"
-                />
-                <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/20 to-transparent" />
-                <div className="absolute bottom-4 left-4 right-4">
-                  <div className="flex items-center gap-2 mb-1">
-                    <span className="bg-white/10 backdrop-blur-md text-[8px] font-bold px-2 py-0.5 rounded uppercase tracking-wider border border-white/10">
-                      Featured
-                    </span>
-                  </div>
-                  <h3 className="text-base font-black mb-0.5 truncate pr-4">{exploreProducts[0].name}</h3>
-                  <p className="text-[10px] text-gray-400 flex items-center gap-1">
-                    <Coins size={10} />
-                    {(exploreProducts[0].price || 0).toLocaleString()}
-                  </p>
-                </div>
-              </div>
-            </section>
-            )}
           </motion.div>
         )}
       </AnimatePresence>

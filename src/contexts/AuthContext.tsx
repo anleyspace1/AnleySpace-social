@@ -2,6 +2,7 @@ import React, { createContext, useContext, useEffect, useState } from 'react';
 import { User } from '@supabase/supabase-js';
 import { supabase, isSupabaseConfigured, invalidateSessionCache } from '../lib/supabase';
 import { apiUrl } from '../lib/apiOrigin';
+import { loadPersonalizationFromSupabase } from '../lib/personalizedRanking';
 
 interface AuthContextType {
   user: User | null;
@@ -132,6 +133,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const currentUser = session?.user ?? null;
       setUser(currentUser);
       if (currentUser) {
+        void loadPersonalizationFromSupabase(currentUser.id);
         fetchProfile(currentUser.id);
       } else {
         setProfile(null);

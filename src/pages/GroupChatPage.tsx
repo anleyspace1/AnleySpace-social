@@ -97,8 +97,16 @@ interface GroupMessage {
   image_url?: string;
   /** Optional raw content (e.g. socket); UI prefers normalized text + media fields */
   content?: string;
+  /** From `profiles` (embed or batch); optional for socket payloads until enriched. */
+  avatar_url?: string | null;
   /** User ids who have read this message (group chat; Supabase `seen_by`). */
   seen_by?: string[];
+}
+
+function trimProfileString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const t = value.trim();
+  return t.length > 0 ? t : undefined;
 }
 
 interface GroupMember {
@@ -302,6 +310,18 @@ export default function GroupChatPage() {
         }
       } else {
         rows = Array.isArray(withProfiles.data) ? withProfiles.data : [];
+        const userIdsOk = Array.from(new Set(rows.map((r: any) => r?.user_id).filter(Boolean)));
+        if (userIdsOk.length > 0) {
+          const { data: profs, error: pErr } = await supabase
+            .from('profiles')
+            .select('id, username, avatar_url')
+            .in('id', userIdsOk as string[]);
+          if (pErr) {
+            console.warn('[GroupChat] profiles batch (with embed path):', pErr);
+          } else {
+            profileByUserId = Object.fromEntries((profs || []).map((p: any) => [String(p.id), p]));
+          }
+        }
       }
 
       console.log('fetched messages:', rows);
@@ -311,7 +331,13 @@ export default function GroupChatPage() {
         const pRow = Array.isArray(prof) ? prof[0] : prof;
         const fallbackProf = m.user_id ? profileByUserId[String(m.user_id)] : undefined;
         const username =
-          pRow?.username ?? fallbackProf?.username ?? `user_${String(m.user_id ?? '').slice(0, 8)}`;
+          trimProfileString(pRow?.username) ??
+          trimProfileString(fallbackProf?.username) ??
+          `user_${String(m.user_id ?? '').slice(0, 8)}`;
+        const avatar_url =
+          trimProfileString(pRow?.avatar_url) ??
+          trimProfileString(fallbackProf?.avatar_url) ??
+          null;
 
         const { text, image_url, audio_url } = parseGroupMessageContentForUi(m.content);
         const type = audio_url ? 'audio' : image_url ? 'image' : 'text';
@@ -322,6 +348,7 @@ export default function GroupChatPage() {
           group_id: String(m.group_id ?? currentGroupId),
           user_id: String(m.user_id ?? ''),
           username,
+          avatar_url,
           content: m.content != null ? String(m.content) : undefined,
           text,
           created_at: m.created_at || undefined,
@@ -491,6 +518,8 @@ export default function GroupChatPage() {
         const gid = String(message.group_id ?? groupId ?? '');
         if (gid) void groupNotifRef.current?.markGroupNotificationsRead(gid);
       }
+      const mid = String(message.id ?? '');
+      const uid = String(message.user_id ?? '').trim();
       setMessages((prev) => {
         if (prev.find((m) => m.id === message.id)) return prev;
         return [
@@ -501,6 +530,27 @@ export default function GroupChatPage() {
           },
         ];
       });
+      if (uid && mid) {
+        void supabase
+          .from('profiles')
+          .select('username, avatar_url')
+          .eq('id', uid)
+          .maybeSingle()
+          .then(({ data }) => {
+            if (!data) return;
+            setMessages((prev) =>
+              prev.map((m) =>
+                String(m.id) === mid
+                  ? {
+                      ...m,
+                      username: trimProfileString(data.username) ?? m.username,
+                      avatar_url: trimProfileString(data.avatar_url) ?? m.avatar_url ?? null,
+                    }
+                  : m
+              )
+            );
+          });
+      }
     });
 
     const onGroupNewNotification = (payload: {
@@ -521,7 +571,33 @@ export default function GroupChatPage() {
         ...h,
         seen_by: normalizeSeenBy((h as { seen_by?: unknown }).seen_by),
       }));
-      setMessages(withSeen);
+      const userIds = Array.from(new Set(withSeen.map((h) => h.user_id).filter(Boolean))) as string[];
+      if (userIds.length === 0) {
+        setMessages(withSeen);
+        return;
+      }
+      void supabase
+        .from('profiles')
+        .select('id, username, avatar_url')
+        .in('id', userIds)
+        .then(({ data, error }) => {
+          if (error) {
+            console.warn('[GroupChat] group_history profile enrich:', error);
+            setMessages(withSeen);
+            return;
+          }
+          const map = Object.fromEntries((data || []).map((p: { id: string; username?: string | null; avatar_url?: string | null }) => [String(p.id), p]));
+          setMessages(
+            withSeen.map((h) => {
+              const p = h.user_id ? map[String(h.user_id)] : undefined;
+              return {
+                ...h,
+                username: trimProfileString(p?.username) ?? h.username ?? 'User',
+                avatar_url: trimProfileString(p?.avatar_url) ?? h.avatar_url ?? null,
+              };
+            })
+          );
+        });
     });
 
     if (groupId) {
@@ -1269,8 +1345,11 @@ export default function GroupChatPage() {
               msg.type === 'image' || (!!imageUrl && imageUrl.startsWith('http'));
             const isVoice =
               msg.type === 'audio' || (!!audioUrl && audioUrl.startsWith('http'));
-            const username = msg.username || 'User';
-            const avatar = `https://ui-avatars.com/api/?name=${encodeURIComponent(username)}&background=random`;
+            const username =
+              trimProfileString(msg.username) ?? 'User';
+            const handleForLabel = username.replace(/^@/, '');
+            const fallbackAvatar = `https://ui-avatars.com/api/?name=${encodeURIComponent(handleForLabel)}&background=random`;
+            const profileAvatar = trimProfileString(msg.avatar_url);
 
             return (
               <motion.div
@@ -1283,14 +1362,23 @@ export default function GroupChatPage() {
                 )}
               >
                 {!isMe && (
-                  <img src={avatar} alt="" className="w-8 h-8 rounded-full object-cover flex-shrink-0" />
+                  <img
+                    src={profileAvatar ?? fallbackAvatar}
+                    alt=""
+                    className="w-8 h-8 rounded-full object-cover flex-shrink-0 bg-gray-200 dark:bg-gray-700"
+                    referrerPolicy="no-referrer"
+                    onError={(e) => {
+                      const el = e.currentTarget;
+                      if (el.src !== fallbackAvatar) el.src = fallbackAvatar;
+                    }}
+                  />
                 )}
                 <div className={cn(
                   "flex flex-col",
                   isMe ? "items-end" : "items-start"
                 )}>
                   {!isMe && (
-                    <span className="text-[10px] font-bold text-gray-500 mb-1 ml-1">@{username}</span>
+                    <span className="text-[10px] font-bold text-gray-500 mb-1 ml-1">@{handleForLabel}</span>
                   )}
                   <div className={cn(
                     "px-4 py-2 rounded-2xl text-sm shadow-sm",

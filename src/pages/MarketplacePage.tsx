@@ -604,13 +604,27 @@ export default function MarketplacePage() {
               {filteredProducts.map((product) => (
                 <motion.div 
                   key={product.id}
+                  role="button"
+                  tabIndex={0}
                   initial={{ opacity: 0, y: 20 }}
                   animate={{ opacity: 1, y: 0 }}
-                  className="bg-white dark:bg-gray-900 rounded-3xl overflow-hidden border border-gray-100 dark:border-gray-800 group flex flex-col shadow-sm hover:shadow-xl hover:border-indigo-500/30 transition-all duration-300"
+                  onClick={() => {
+                    const pid = product?.id != null ? String(product.id).trim() : '';
+                    if (!pid) return;
+                    navigate(`/marketplace/product/${encodeURIComponent(pid)}`);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      const pid = product?.id != null ? String(product.id).trim() : '';
+                      if (!pid) return;
+                      navigate(`/marketplace/product/${encodeURIComponent(pid)}`);
+                    }
+                  }}
+                  className="bg-white dark:bg-gray-900 rounded-3xl overflow-hidden border border-gray-100 dark:border-gray-800 group flex flex-col shadow-sm hover:shadow-xl hover:border-indigo-500/30 transition-all duration-300 cursor-pointer"
                 >
                   <div 
-                    className="aspect-[1/1] relative overflow-hidden cursor-pointer"
-                    onClick={() => navigate(`/marketplace/product/${product.id}`)}
+                    className="aspect-[1/1] relative overflow-hidden"
                   >
                     {product.image && !isDemoOrPlaceholderImageUrl(product.image) ? (
                     <ResponsiveImage 
@@ -652,8 +666,7 @@ export default function MarketplacePage() {
                   <div className="p-4 flex-1 flex flex-col">
                     <div className="flex flex-col mb-3">
                       <h3 
-                        className="font-bold text-base leading-tight cursor-pointer hover:text-indigo-600 transition-colors line-clamp-1 mb-1"
-                        onClick={() => navigate(`/marketplace/product/${product.id}`)}
+                        className="font-bold text-base leading-tight group-hover:text-indigo-600 transition-colors line-clamp-1 mb-1"
                       >
                         {product.title}
                       </h3>
@@ -669,7 +682,10 @@ export default function MarketplacePage() {
                     
                     <div 
                       className="flex items-center gap-1.5 text-gray-400 text-xs mb-4 cursor-pointer hover:text-indigo-600 transition-colors w-fit font-medium"
-                      onClick={() => handleLocationClick(product.location)}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleLocationClick(product.location);
+                      }}
                     >
                       <MapPin size={12} />
                       <span className="truncate">{(product.location || '').split(',')[0] || '—'}</span>
@@ -677,7 +693,9 @@ export default function MarketplacePage() {
                     
                     <div className="mt-auto">
                       <button 
-                        onClick={() => {
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
                           setSelectedProduct(product);
                           setIsBuyModalOpen(true);
                         }}
@@ -716,10 +734,24 @@ export default function MarketplacePage() {
           {reels.map((video, i) => (
             <motion.div 
               key={video.id}
+              role="button"
+              tabIndex={0}
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ delay: i * 0.05 }}
-              onClick={() => navigate(`/marketplace/product/${video.id}`)}
+              onClick={() => {
+                const vid = video?.id != null ? String(video.id).trim() : '';
+                if (!vid) return;
+                navigate(`/marketplace/product/${encodeURIComponent(vid)}`);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  const vid = video?.id != null ? String(video.id).trim() : '';
+                  if (!vid) return;
+                  navigate(`/marketplace/product/${encodeURIComponent(vid)}`);
+                }
+              }}
               className="aspect-[9/16] bg-white dark:bg-gray-900 rounded-3xl overflow-hidden group cursor-pointer relative shadow-sm hover:shadow-xl hover:border-indigo-500/30 transition-all duration-300 border border-gray-100 dark:border-gray-800"
             >
               {video.thumbnail ? (
@@ -773,10 +805,24 @@ export default function MarketplacePage() {
           {marketplacePostsGrid.map((post, i) => (
             <motion.div 
               key={post.id}
+              role="button"
+              tabIndex={0}
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ delay: i * 0.05 }}
-              onClick={() => navigate(`/marketplace/product/${post.id}`)}
+              onClick={() => {
+                const pid = post?.id != null ? String(post.id).trim() : '';
+                if (!pid) return;
+                navigate(`/marketplace/product/${encodeURIComponent(pid)}`);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  const pid = post?.id != null ? String(post.id).trim() : '';
+                  if (!pid) return;
+                  navigate(`/marketplace/product/${encodeURIComponent(pid)}`);
+                }
+              }}
               className="aspect-square bg-white dark:bg-gray-900 rounded-3xl overflow-hidden group cursor-pointer relative shadow-sm hover:shadow-xl hover:border-indigo-500/30 transition-all duration-300 border border-gray-100 dark:border-gray-800"
             >
               {post.image ? (

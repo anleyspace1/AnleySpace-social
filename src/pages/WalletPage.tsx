@@ -15,7 +15,6 @@ import {
   Clock,
   AlertCircle,
   X,
-  CreditCard,
   Banknote,
   Smartphone
 } from 'lucide-react';
@@ -24,6 +23,8 @@ import { cn } from '../lib/utils';
 import { Transaction } from '../types';
 import { useAuth } from '../contexts/AuthContext';
 import { apiUrl } from '../lib/apiOrigin';
+import { BuyCoinsMenu } from '../components/BuyCoinsMenu';
+import { useBuyCoins } from '../hooks/useBuyCoins';
 
 export default function WalletPage() {
   const { user } = useAuth();
@@ -62,26 +63,12 @@ export default function WalletPage() {
     fetchData();
   }, []);
 
-  const [isAddModalOpen, setIsAddModalOpen] = useState(false);
+  const { buyCoinsMenuOpen, toggleBuyCoinsMenu, closeBuyCoinsMenu } = useBuyCoins();
   const [isWithdrawModalOpen, setIsWithdrawModalOpen] = useState(false);
   const [isSendModalOpen, setIsSendModalOpen] = useState(false);
   const [isReceiveModalOpen, setIsReceiveModalOpen] = useState(false);
   const [isExchangeModalOpen, setIsExchangeModalOpen] = useState(false);
   const [isStatsModalOpen, setIsStatsModalOpen] = useState(false);
-
-  const handleAddCoins = (amount: number) => {
-    setBalance(prev => prev + amount);
-    const newTx: Transaction = {
-      id: `t${Date.now()}`,
-      type: 'earn',
-      amount,
-      description: 'Added Coins',
-      timestamp: 'Just now',
-      status: 'completed'
-    };
-    setTransactions([newTx, ...transactions]);
-    setIsAddModalOpen(false);
-  };
 
   const handleSendCoins = (recipient: string, amount: number) => {
     if (amount > balance) return;
@@ -132,15 +119,14 @@ export default function WalletPage() {
   };
 
   return (
-    <motion.div 
-      initial={{ opacity: 0, scale: 0.95 }}
-      animate={{ opacity: 1, scale: 1 }}
-      className="lg:max-w-4xl lg:mx-auto p-0 lg:p-8 pb-12"
-    >
-      {/* Coins Wallet Card */}
-      <div className="relative overflow-hidden bg-gradient-to-br from-indigo-600 via-purple-600 to-pink-600 rounded-none lg:rounded-[2.5rem] p-8 text-white shadow-2xl shadow-indigo-500/20 mb-6">
-        <div className="absolute top-0 right-0 w-64 h-64 bg-white/10 rounded-full -mr-32 -mt-32 blur-3xl"></div>
-        <div className="relative z-10">
+    <div className="lg:max-w-4xl lg:mx-auto p-0 lg:p-8 pb-12 overflow-visible">
+      {/* Coins Wallet Card — gradient layer clips orbs; content overflow visible for buy menu */}
+      <div className="relative rounded-none lg:rounded-[2.5rem] mb-6 text-white shadow-2xl shadow-indigo-500/20">
+        <div className="pointer-events-none absolute inset-0 overflow-hidden rounded-none lg:rounded-[2.5rem]">
+          <div className="absolute inset-0 bg-gradient-to-br from-indigo-600 via-purple-600 to-pink-600" />
+          <div className="absolute top-0 right-0 w-64 h-64 bg-white/10 rounded-full -mr-32 -mt-32 blur-3xl" />
+        </div>
+        <div className="relative z-10 overflow-visible p-8">
           <div className="flex items-center justify-between mb-8">
             <div className="flex items-center gap-2">
               <div className="w-10 h-10 bg-white/20 backdrop-blur-md rounded-xl flex items-center justify-center">
@@ -161,25 +147,28 @@ export default function WalletPage() {
             </div>
           </div>
 
-          <div className="flex gap-3">
-            <motion.button 
-              whileHover={{ scale: 1.02 }}
-              whileTap={{ scale: 0.98 }}
-              onClick={() => setIsAddModalOpen(true)}
+          <div className="relative flex gap-3 overflow-visible">
+            <button
+              type="button"
+              onClick={toggleBuyCoinsMenu}
               className="flex-1 bg-white text-indigo-600 py-3 rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-gray-100 transition-colors"
             >
               <Plus size={20} />
               Add Coins
-            </motion.button>
-            <motion.button 
-              whileHover={{ scale: 1.02 }}
-              whileTap={{ scale: 0.98 }}
+            </button>
+            <button
+              type="button"
               onClick={() => setIsExchangeModalOpen(true)}
               className="flex-1 bg-white/20 backdrop-blur-md text-white py-3 rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-white/30 transition-colors"
             >
               <RefreshCw size={20} />
               Exchange
-            </motion.button>
+            </button>
+            <BuyCoinsMenu
+              open={buyCoinsMenuOpen}
+              onClose={closeBuyCoinsMenu}
+              panelClassName="left-0 right-0 top-full mt-2 mx-auto w-80 max-w-[min(20rem,calc(100vw-1.5rem))]"
+            />
           </div>
         </div>
       </div>
@@ -209,23 +198,21 @@ export default function WalletPage() {
           </div>
 
           <div className="flex gap-3">
-            <motion.button 
-              whileHover={{ scale: 1.02 }}
-              whileTap={{ scale: 0.98 }}
+            <button
+              type="button"
               onClick={() => setIsWithdrawModalOpen(true)}
               className="flex-1 bg-white text-emerald-600 py-3 rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-gray-100 transition-colors"
             >
               <ArrowUpRight size={20} />
               Withdraw
-            </motion.button>
-            <motion.button 
-              whileHover={{ scale: 1.02 }}
-              whileTap={{ scale: 0.98 }}
+            </button>
+            <button
+              type="button"
               className="flex-1 bg-white/20 backdrop-blur-md text-white py-3 rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-white/30 transition-colors"
             >
               <History size={20} />
               Transaction History
-            </motion.button>
+            </button>
           </div>
         </div>
       </div>
@@ -317,12 +304,6 @@ export default function WalletPage() {
 
       {/* Modals */}
       <AnimatePresence>
-        {isAddModalOpen && (
-          <AddCoinsModal 
-            onClose={() => setIsAddModalOpen(false)} 
-            onConfirm={handleAddCoins} 
-          />
-        )}
         {isWithdrawModalOpen && (
           <WithdrawModal 
             usdBalance={usdBalance}
@@ -356,90 +337,6 @@ export default function WalletPage() {
           />
         )}
       </AnimatePresence>
-    </motion.div>
-  );
-}
-
-function AddCoinsModal({ onClose, onConfirm }: { onClose: () => void; onConfirm: (amount: number) => void }) {
-  const [amount, setAmount] = useState<string>('');
-  const presets = [100, 500, 1000, 5000];
-
-  return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
-      <motion.div 
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        exit={{ opacity: 0 }}
-        onClick={onClose}
-        className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-      />
-      <motion.div 
-        initial={{ scale: 0.9, opacity: 0, y: 20 }}
-        animate={{ scale: 1, opacity: 1, y: 0 }}
-        exit={{ scale: 0.9, opacity: 0, y: 20 }}
-        className="relative bg-white dark:bg-gray-900 w-full max-w-md rounded-3xl p-6 shadow-2xl border border-gray-100 dark:border-gray-800"
-      >
-        <div className="flex items-center justify-between mb-6">
-          <h3 className="text-xl font-bold">Add Coins</h3>
-          <button onClick={onClose} className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-full transition-colors">
-            <X size={20} />
-          </button>
-        </div>
-
-        <div className="space-y-6">
-          <div>
-            <label className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2 block">Select Amount</label>
-            <div className="grid grid-cols-2 gap-3">
-              {presets.map(p => (
-                <button 
-                  key={p}
-                  onClick={() => setAmount(p.toString())}
-                  className={cn(
-                    "py-3 rounded-2xl font-bold border transition-all",
-                    amount === p.toString() 
-                      ? "bg-indigo-600 border-indigo-600 text-white shadow-lg shadow-indigo-500/20" 
-                      : "bg-gray-50 dark:bg-gray-800 border-gray-100 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:border-indigo-500"
-                  )}
-                >
-                  {p} Coins
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div>
-            <label className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2 block">Custom Amount</label>
-            <div className="relative">
-              <Coins className="absolute left-4 top-1/2 -translate-y-1/2 text-yellow-500" size={20} />
-              <input 
-                type="number" 
-                value={amount}
-                onChange={(e) => setAmount(e.target.value)}
-                placeholder="Enter amount"
-                className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl py-4 pl-12 pr-4 focus:ring-2 focus:ring-indigo-500 transition-all font-bold"
-              />
-            </div>
-          </div>
-
-          <div className="space-y-3">
-            <label className="text-xs font-bold text-gray-500 uppercase tracking-wider block">Payment Method</label>
-            <div className="space-y-2">
-              <PaymentMethod icon={<CreditCard size={18} />} label="Credit Card" />
-              <PaymentMethod icon={<Smartphone size={18} />} label="Apple Pay" />
-            </div>
-          </div>
-
-          <motion.button 
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.98 }}
-            disabled={!amount || parseInt(amount) <= 0}
-            onClick={() => onConfirm(parseInt(amount))}
-            className="w-full bg-indigo-600 disabled:bg-gray-300 dark:disabled:bg-gray-800 text-white py-4 rounded-2xl font-bold shadow-lg shadow-indigo-500/20 transition-all"
-          >
-            Confirm Purchase
-          </motion.button>
-        </div>
-      </motion.div>
     </div>
   );
 }

@@ -10,6 +10,11 @@ export function hasRecordedViewThisSession(postId: string): boolean {
   return viewedPostIds.has(String(postId));
 }
 
+/** Mark this post as view-counted for the session (cross-remount dedupe with Home + Reels). */
+export function markPostViewRecordedSession(postId: string): void {
+  viewedPostIds.add(String(postId));
+}
+
 /**
  * Increments posts.views once per session per post via RPC.
  * Returns new total views, or null if skipped (already counted or RPC failed).

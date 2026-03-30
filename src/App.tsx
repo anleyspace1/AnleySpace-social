@@ -49,7 +49,7 @@ import GroupChatPage from './pages/GroupChatPage';
 import GroupDetailPage from './pages/GroupDetailPage';
 import HashtagPage from './pages/HashtagPage';
 import NotificationsPage from './pages/NotificationsPage';
-import PostRedirectPage from './pages/PostRedirectPage';
+import PostDetailPage from './pages/PostDetailPage';
 import EditProfilePage from './pages/EditProfilePage';
 import CreateReelPage from './pages/CreateReelPage';
 import StoryPage from './pages/StoryPage';
@@ -75,11 +75,12 @@ import BottomNav from './components/BottomNav';
 import CallManager from './components/CallManager';
 
 import { supabase } from './lib/supabase';
-import { buyCoins, COIN_PURCHASE_PACKAGES } from './lib/buyCoins';
+import { BuyCoinsMenu } from './components/BuyCoinsMenu';
+import { useBuyCoins } from './hooks/useBuyCoins';
 
 function Header({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (val: boolean) => void }) {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
-  const [buyCoinsOpen, setBuyCoinsOpen] = useState(false);
+  const { buyCoinsMenuOpen, toggleBuyCoinsMenu, closeBuyCoinsMenu } = useBuyCoins();
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<any[]>([]);
   const [isSearching, setIsSearching] = useState(false);
@@ -151,7 +152,7 @@ function Header({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (va
 
   return (
     <>
-      <header className="fixed top-0 left-0 right-0 h-14 sm:h-16 bg-white dark:bg-black border-b border-gray-200 dark:border-gray-800 z-50 flex items-center justify-between px-2 sm:px-4 lg:px-6">
+      <header className="fixed top-0 left-0 right-0 h-14 sm:h-16 bg-white dark:bg-black border-b border-gray-200 dark:border-gray-800 z-50 flex items-center justify-between px-2 sm:px-4 lg:px-6 text-gray-900 dark:text-white">
         <div className="flex items-center gap-1 sm:gap-2">
           <button 
             onClick={() => setIsMobileMenuOpen(true)}
@@ -169,7 +170,7 @@ function Header({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (va
 
         <div className="flex-1 mx-2 sm:mx-8 flex justify-center relative">
           <div className="relative w-full max-w-[140px] xs:max-w-[180px] sm:max-w-xl">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={14} />
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 dark:text-gray-400 pointer-events-none" size={14} />
             <input 
               type="text" 
               value={searchQuery}
@@ -179,12 +180,12 @@ function Header({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (va
               }}
               onFocus={() => setShowResults(true)}
               placeholder="Search..." 
-              className="w-full bg-gray-100 dark:bg-gray-900 border-none rounded-full py-1.5 sm:py-2 pl-8 sm:pl-10 pr-4 focus:ring-2 focus:ring-indigo-500 transition-all text-[11px] sm:text-sm"
+              className="search-input w-full bg-white dark:bg-gray-800 placeholder:!text-gray-500 dark:placeholder:!text-gray-400 border border-gray-300 dark:border-gray-600 rounded-full pl-9 sm:pl-10 pr-4 py-1.5 sm:py-2 text-[11px] sm:text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all"
             />
             {searchQuery && (
               <button 
                 onClick={() => setSearchQuery('')}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200"
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-600 hover:text-gray-800 dark:text-gray-400 dark:hover:text-gray-200"
               >
                 <X size={12} />
               </button>
@@ -205,7 +206,7 @@ function Header({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (va
                     className="absolute top-full left-0 right-0 mt-2 bg-white dark:bg-[#1a1c26] rounded-2xl shadow-2xl border border-gray-100 dark:border-gray-800 overflow-hidden z-[60]"
                   >
                     {isSearching ? (
-                      <div className="p-4 text-center text-gray-500 text-xs">Searching...</div>
+                      <div className="p-4 text-center text-gray-600 dark:text-gray-300 text-xs">Searching...</div>
                     ) : searchResults.length > 0 ? (
                       <div className="p-2">
                         {searchResults.map((result) => (
@@ -226,8 +227,8 @@ function Header({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (va
                               alt="" 
                             />
                             <div className="flex-1 min-w-0">
-                              <p className="text-sm font-bold truncate">@{result.username || `user_${String(result.id).slice(0, 6)}`}</p>
-                              <p className="text-[10px] text-gray-500 truncate">{result.display_name || 'User'}</p>
+                              <p className="text-sm font-bold truncate text-gray-900 dark:text-gray-100">@{result.username || `user_${String(result.id).slice(0, 6)}`}</p>
+                              <p className="text-[10px] text-gray-500 dark:text-gray-400 truncate">{result.display_name || 'User'}</p>
                             </div>
                           </button>
                         ))}
@@ -242,7 +243,7 @@ function Header({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (va
                         </button>
                       </div>
                     ) : (
-                      <div className="p-4 text-center text-gray-500 text-xs">No users found</div>
+                      <div className="p-4 text-center text-gray-600 dark:text-gray-300 text-xs">No users found</div>
                     )}
                   </motion.div>
                 </>
@@ -288,43 +289,18 @@ function Header({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (va
             <div className="relative">
               <button
                 type="button"
-                onClick={() => setBuyCoinsOpen((o) => !o)}
+                onClick={toggleBuyCoinsMenu}
                 className="flex items-center gap-1 text-indigo-600 dark:text-indigo-400 px-2 sm:px-3 py-1.5 rounded-full font-bold hover:bg-indigo-50 dark:hover:bg-indigo-950/40 transition-colors text-[10px] sm:text-sm"
                 title="Buy coins"
               >
                 <Wallet size={14} className="sm:size-[18px]" />
                 <span className="hidden sm:inline">Buy coins</span>
               </button>
-              {buyCoinsOpen && (
-                <>
-                  <button
-                    type="button"
-                    aria-label="Close buy coins menu"
-                    className="fixed inset-0 z-[55] cursor-default bg-transparent"
-                    onClick={() => setBuyCoinsOpen(false)}
-                  />
-                  <div className="absolute right-0 top-full mt-1 z-[56] w-52 rounded-xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-[#1a1c26] shadow-xl py-2 px-1">
-                    <p className="px-2 pb-1 text-[10px] font-bold uppercase tracking-wide text-gray-500">Buy coins</p>
-                    {COIN_PURCHASE_PACKAGES.map(({ coins, label, priceUsd }) => (
-                      <button
-                        key={coins}
-                        type="button"
-                        className="w-full text-left px-2 py-2 rounded-lg text-sm hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors flex justify-between gap-2"
-                        onClick={() => {
-                          void buyCoins(coins).catch((err: unknown) => {
-                            const msg = err instanceof Error ? err.message : 'Could not start checkout';
-                            window.alert(msg);
-                          });
-                          setBuyCoinsOpen(false);
-                        }}
-                      >
-                        <span className="font-semibold">{label}</span>
-                        <span className="text-indigo-600 dark:text-indigo-400 font-bold">{priceUsd}</span>
-                      </button>
-                    ))}
-                  </div>
-                </>
-              )}
+              <BuyCoinsMenu
+                open={buyCoinsMenuOpen}
+                onClose={closeBuyCoinsMenu}
+                panelClassName="right-0 top-full mt-2 w-80 max-w-[min(20rem,calc(100vw-1.5rem))]"
+              />
             </div>
           )}
 
@@ -356,7 +332,7 @@ function Header({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (va
               initial={{ x: '-100%' }}
               animate={{ x: 0 }}
               exit={{ x: '-100%' }}
-              className="absolute left-0 top-0 bottom-0 w-72 bg-white dark:bg-black p-6 shadow-2xl overflow-y-auto"
+              className="absolute left-0 top-0 bottom-0 w-72 bg-white dark:bg-black p-6 shadow-2xl overflow-y-auto text-gray-900 dark:text-white"
             >
               <div className="flex items-center justify-between mb-8">
                 <div className="flex items-center gap-2">
@@ -534,7 +510,7 @@ function AppContent() {
                 <Route path="/hashtag/:tag" element={<ProtectedRoute><HashtagPage /></ProtectedRoute>} />
                 <Route path="/story/:id" element={<ProtectedRoute><StoryPage /></ProtectedRoute>} />
                 <Route path="/notifications" element={<ProtectedRoute><NotificationsPage /></ProtectedRoute>} />
-                <Route path="/post/:id" element={<ProtectedRoute><PostRedirectPage /></ProtectedRoute>} />
+                <Route path="/post/:id" element={<ProtectedRoute><PostDetailPage /></ProtectedRoute>} />
               </Routes>
             </AnimatePresence>
           </main>

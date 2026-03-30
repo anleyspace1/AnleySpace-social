@@ -203,8 +203,9 @@ export default function ProfilePage() {
       console.log('[Profile] fetchSavedPosts start', user.id);
       const { data: saveRows, error: saveErr } = await supabase
         .from('saved_posts')
-        .select('post_id')
-        .eq('user_id', user.id);
+        .select('post_id, created_at')
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: false });
 
       if (saveErr) throw saveErr;
       const ids = (saveRows || []).map((r: { post_id: string }) => r.post_id).filter(Boolean);
@@ -745,7 +746,7 @@ export default function ProfilePage() {
                 {displayUser.displayName}
                 {(isOwnProfile ? isVerified : displayUser.isVerified) && <Verified size={20} className="text-indigo-500 fill-indigo-500/20" />}
               </h1>
-              <p className="text-gray-500 font-medium">@{displayUser.username}</p>
+              <p className="text-gray-300 font-medium">@{displayUser.username}</p>
             </div>
             <div className="flex items-center justify-center gap-2">
               {isOwnProfile && !isVerified && (
@@ -772,7 +773,7 @@ export default function ProfilePage() {
                   </button>
                   <button 
                     onClick={handleOpenMessage}
-                    className="bg-gray-100 dark:bg-gray-900 px-6 py-2 rounded-xl font-bold hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors flex items-center gap-2"
+                    className="bg-white/15 backdrop-blur-md border border-white/20 text-white px-6 py-2 rounded-xl font-bold hover:bg-white/25 transition-colors flex items-center gap-2"
                   >
                     <MessageCircle size={18} />
                     Message
@@ -782,11 +783,11 @@ export default function ProfilePage() {
                 <>
                   <button 
                     onClick={() => navigate('/profile/edit')}
-                    className="bg-gray-100 dark:bg-gray-900 px-6 py-2 rounded-xl font-bold hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"
+                    className="bg-white/15 backdrop-blur-md border border-white/20 text-white px-6 py-2 rounded-xl font-bold hover:bg-white/25 transition-colors"
                   >
                     Edit Profile
                   </button>
-                  <button className="bg-gray-100 dark:bg-gray-900 p-2 rounded-xl hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors">
+                  <button type="button" className="bg-white/15 backdrop-blur-md border border-white/20 text-white p-2 rounded-xl hover:bg-white/25 transition-colors">
                     <Settings size={20} />
                   </button>
                 </>
@@ -800,7 +801,7 @@ export default function ProfilePage() {
             <Stat label="Following" value={followingCount} onClick={() => setIsFollowingModalOpen(true)} />
           </div>
 
-          <p className="text-gray-600 dark:text-gray-400 mb-6">{displayUser.bio}</p>
+          <p className="text-gray-300 mb-6">{displayUser.bio}</p>
 
           {isOwnProfile && (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -970,7 +971,7 @@ function Stat({ label, value, icon, onClick }: { label: string; value: number; i
         {icon}
         {value >= 1000 ? `${(value / 1000).toFixed(1)}K` : value}
       </div>
-      <span className="text-sm text-gray-500">{label}</span>
+      <span className="text-sm text-gray-300">{label}</span>
     </button>
   );
 }
@@ -1078,24 +1079,24 @@ function ProfileLink({ to, icon, label, badge }: { to: string; icon: React.React
   return (
     <NavLink 
       to={to} 
-      className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-900 rounded-2xl hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors border border-gray-100 dark:border-gray-800"
+      className="flex items-center justify-between p-3 bg-white/15 backdrop-blur-md rounded-2xl hover:bg-white/25 transition-colors border border-white/20"
     >
       <div className="flex items-center gap-3">
-        <div className="w-10 h-10 rounded-xl bg-white dark:bg-black flex items-center justify-center shadow-sm">
+        <div className="w-10 h-10 rounded-xl bg-white/10 flex items-center justify-center border border-white/10">
           {icon}
         </div>
-        <span className="font-bold text-sm">{label}</span>
+        <span className="font-bold text-sm text-white">{label}</span>
       </div>
       <div className="flex items-center gap-2">
         {badge && (
           <span className={cn(
             "text-[10px] font-bold px-2 py-0.5 rounded-full",
-            badge.includes('+') ? "bg-indigo-100 text-indigo-600 dark:bg-indigo-900/40 dark:text-indigo-400" : "bg-yellow-100 text-yellow-600 dark:bg-yellow-900/40 dark:text-yellow-400"
+            badge.includes('+') ? "bg-indigo-500/25 text-indigo-200 border border-indigo-400/30" : "bg-yellow-500/20 text-yellow-200 border border-yellow-400/25"
           )}>
             {badge}
           </span>
         )}
-        <ChevronRight size={16} className="text-gray-400" />
+        <ChevronRight size={16} className="text-white/70" />
       </div>
     </NavLink>
   );

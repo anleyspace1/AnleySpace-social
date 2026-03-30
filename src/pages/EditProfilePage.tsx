@@ -8,6 +8,9 @@ import { useAuth } from '../contexts/AuthContext';
 import { cn } from '../lib/utils';
 import { apiUrl } from '../lib/apiOrigin';
 
+const inputClass =
+  'w-full bg-white dark:bg-gray-800 !text-gray-900 dark:!text-gray-100 placeholder:!text-gray-500 dark:placeholder:!text-gray-400 caret-gray-900 dark:caret-white border border-gray-200 dark:border-gray-700 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-indigo-500 transition duration-200';
+
 // Helper function to create the cropped image
 const getCroppedImg = async (imageSrc: string, pixelCrop: Area): Promise<string> => {
   const image = await new Promise<HTMLImageElement>((resolve, reject) => {
@@ -160,7 +163,7 @@ export default function EditProfilePage() {
     <motion.div 
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
-      className="max-w-2xl mx-auto p-4 lg:p-8 pb-12"
+      className="max-w-2xl mx-auto p-4 lg:p-8 pb-12 text-gray-900 dark:text-gray-100"
     >
       <div className="flex items-center justify-between mb-8">
         <button 
@@ -220,7 +223,7 @@ export default function EditProfilePage() {
               type="text" 
               value={formData.displayName}
               onChange={(e) => setFormData(prev => ({ ...prev, displayName: e.target.value }))}
-              className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl py-3 px-4 focus:ring-2 focus:ring-indigo-500 transition-all"
+              className={inputClass}
               placeholder="Your display name"
             />
           </div>
@@ -228,12 +231,12 @@ export default function EditProfilePage() {
           <div>
             <label className="block text-sm font-bold text-gray-700 dark:text-gray-300 mb-2">Username</label>
             <div className="relative">
-              <span className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-400 font-bold">@</span>
+              <span className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-600 dark:text-gray-400 font-bold pointer-events-none">@</span>
               <input 
                 type="text" 
                 value={formData.username}
                 onChange={(e) => setFormData(prev => ({ ...prev, username: (e.target.value || '').toLowerCase().replace(/\s/g, '_') }))}
-                className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl py-3 pl-8 pr-4 focus:ring-2 focus:ring-indigo-500 transition-all"
+                className={cn(inputClass, 'pl-8 pr-4')}
                 placeholder="username"
               />
             </div>
@@ -245,7 +248,7 @@ export default function EditProfilePage() {
               value={formData.bio}
               onChange={(e) => setFormData(prev => ({ ...prev, bio: e.target.value }))}
               rows={4}
-              className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl py-3 px-4 focus:ring-2 focus:ring-indigo-500 transition-all resize-none"
+              className={cn(inputClass, 'resize-none')}
               placeholder="Tell us about yourself..."
             />
           </div>

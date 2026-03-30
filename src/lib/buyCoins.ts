@@ -1,4 +1,5 @@
 import { supabase } from './supabase';
+import { apiUrl } from './apiOrigin';
 
 export type CoinsPackage = 100 | 250 | 700;
 
@@ -18,19 +19,23 @@ export async function buyCoins(coins: CoinsPackage): Promise<void> {
     headers.Authorization = `Bearer ${token}`;
   }
 
-  const res = await fetch('/api/create-checkout-session', {
+  const pkgRow = COIN_PURCHASE_PACKAGES.find((p) => p.coins === coins);
+  console.log('Buying coins:', { coins, price: pkgRow?.priceUsd });
+
+  const res = await fetch(apiUrl('/api/create-checkout-session'), {
     method: 'POST',
     headers,
     body: JSON.stringify({ coinsPackage: coins }),
   });
 
   const data = (await res.json().catch(() => ({}))) as { url?: string; error?: string };
+  console.log('Checkout response:', data);
 
   if (!res.ok) {
     throw new Error(typeof data.error === 'string' ? data.error : 'Checkout failed');
   }
 
-  if (typeof data.url === 'string' && data.url) {
+  if (data.url) {
     window.location.href = data.url;
     return;
   }

@@ -46,12 +46,22 @@ import StoryEditor from '../components/StoryEditor';
 import { ResponsiveImage } from '../components/ResponsiveImage';
 import { isValidVideoUrl } from '../lib/videoUrl';
 import { isPlaceholderUsername } from '../lib/realDataGuards';
+import { getViews, getViralScore } from '../lib/postViews';
+import { getPersonalizedScore, trackWatchTime, updateInterest } from '../lib/personalizedRanking';
+import { maybeRewardViralPost } from '../lib/viralRewards';
+import { boostPostAction, BOOST_COST } from '../lib/boostPost';
+import { hasRecordedViewThisSession, markPostViewRecordedSession } from '../lib/postViewTracking';
 import { ReelsFeedSkeleton } from '../components/LoadingSkeletons';
 import {
   feedStoragePath,
   resolveStorageExtension,
   storageUploadContentType,
 } from '../lib/storageUpload';
+
+/** Views per hour above this = show “Viral” badge and sort higher. */
+const VIRAL_THRESHOLD = 50;
+/** Minimum total views before a post can be marked viral. */
+const MIN_VIEWS = 100;
 
 const resolveProfileUsername = (username?: string | null) => {
   const value = (username || '').trim();
@@ -180,10 +190,14 @@ export default function ReelsPage() {
 
         const { data: reelsRows, error: reelsError } = await supabase
           .from('posts')
-          .select('id, user_id, content, video_url, image_url, created_at, category')
+          .select('*')
           .not('video_url', 'is', null)
           .order('created_at', { ascending: false });
-        if (reelsError) throw reelsError;
+        if (reelsError) {
+          console.error('[Reels] fetch error:', reelsError);
+          throw reelsError;
+        }
+        console.log('[Reels] fetched posts:', reelsRows);
         let reels = Array.isArray(reelsRows) ? reelsRows : [];
         if (selectedPost?.id != null) {
           const selectedPostId = String(selectedPost.id);
@@ -193,7 +207,23 @@ export default function ReelsPage() {
           }
         }
 
-        const userIds = Array.from(new Set(reels.map((r: any) => r.user_id).filter(Boolean)));
+        const reelsWithViral = reels.map((post: any) => {
+          const views = getViews(post);
+          const score = getViralScore(post);
+          return {
+            ...post,
+            isViral: views >= MIN_VIEWS && score >= VIRAL_THRESHOLD,
+            viralScore: score,
+          };
+        });
+
+        for (const r of reelsWithViral) {
+          if (r.isViral) {
+            void maybeRewardViralPost({ id: r.id, user_id: r.user_id, isViral: true });
+          }
+        }
+
+        const userIds = Array.from(new Set(reelsWithViral.map((r: any) => r.user_id).filter(Boolean)));
         let profileMap: Record<string, { username?: string | null; avatar_url?: string | null }> = {};
         if (userIds.length > 0) {
           const { data: profiles } = await supabase
@@ -204,7 +234,7 @@ export default function ReelsPage() {
         }
 
         // Match Home feed behavior: compute likes/comments counts from likes/comments tables.
-        const postIds = reels.map((r: any) => String(r.id)).filter(Boolean);
+        const postIds = reelsWithViral.map((r: any) => String(r.id)).filter(Boolean);
         let likesByPost: Record<string, number> = {};
         let commentsByPost: Record<string, number> = {};
         if (postIds.length > 0) {
@@ -228,7 +258,19 @@ export default function ReelsPage() {
           }
         }
 
-        const list = reels
+        const enrichedForRank = reelsWithViral.map((r: any) => {
+          const id = String(r.id);
+          return {
+            ...r,
+            likes_count: likesByPost[id] ?? r.likes_count ?? 0,
+            comments_count: commentsByPost[id] ?? r.comments_count ?? 0,
+          };
+        });
+        const ranked = [...enrichedForRank].sort(
+          (a: any, b: any) => getPersonalizedScore(b) - getPersonalizedScore(a)
+        );
+
+        const list = ranked
           // Mirror Home feed "no group:* posts" behavior
           .filter((r: any) => {
             const cat = typeof r?.category === 'string' ? r.category.trim().toLowerCase() : '';
@@ -253,13 +295,18 @@ export default function ReelsPage() {
               caption: String(r.content || r.caption || ''),
               likes: likesByPost[id] ?? 0,
               comments: commentsByPost[id] ?? 0,
-              views: typeof r.views === 'number' ? r.views : 0,
+              views: getViews(r),
               shares: typeof r.shares === 'number' ? r.shares : 0,
               saves: typeof r.saves === 'number' ? r.saves : 0,
               coins: typeof r.coins === 'number' ? r.coins : 0,
               sound: r.sound_title ? { title: r.sound_title, artist: r.sound_artist } : null,
               isLive: false,
               liked: likedIds.has(id),
+              isViral: !!r.isViral,
+              viralScore: typeof r.viralScore === 'number' ? r.viralScore : 0,
+              created_at: r.created_at ?? null,
+              category: r.category ?? null,
+              post_user_id: uid,
             };
           })
           .filter((v: any): v is NonNullable<typeof v> => v != null && !!v.url);
@@ -282,6 +329,60 @@ export default function ReelsPage() {
 
     void fetchReels();
   }, [isSelectedMode, params.id, selectedVideoId, selectedVideoUrl, location.key]);
+
+  useEffect(() => {
+    const channel = supabase
+      .channel('posts-updates-reels')
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'posts' },
+        (payload) => {
+          const row = payload.new as Record<string, unknown> | null;
+          const rawId = row?.id;
+          const id = rawId != null ? String(rawId) : '';
+          if (!id) return;
+          setVideos((prev) =>
+            prev.map((v) => {
+              if (String(v.id) !== id) return v;
+              const merged = { ...v, ...row };
+              const viewsVal = getViews(merged as { view_count?: unknown; views?: unknown });
+              const viralScore = getViralScore({
+                view_count: (merged as { view_count?: unknown }).view_count,
+                views: viewsVal,
+                created_at: (merged as { created_at?: string | null }).created_at ?? null,
+              });
+              const isViralNow = viewsVal >= MIN_VIEWS && viralScore >= VIRAL_THRESHOLD;
+              const ownerId = String(
+                (merged as { user_id?: unknown }).user_id ?? (v as { post_user_id?: string }).post_user_id ?? ''
+              ).trim();
+              if (isViralNow && ownerId) {
+                void maybeRewardViralPost({ id, user_id: ownerId, isViral: true });
+              }
+              return {
+                ...merged,
+                likes: typeof v.likes === 'number' ? v.likes : 0,
+                comments: typeof v.comments === 'number' ? v.comments : 0,
+                liked: v.liked,
+                user: v.user,
+                url: v.url,
+                videoUrl: v.videoUrl,
+                thumbnail: v.thumbnail,
+                caption: v.caption,
+                sound: v.sound,
+                views: viewsVal,
+                isViral: isViralNow,
+                viralScore,
+                post_user_id: ownerId || (v as { post_user_id?: string }).post_user_id,
+              };
+            })
+          );
+        }
+      )
+      .subscribe();
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, []);
 
   useEffect(() => {
     const state = location.state as any;
@@ -1207,7 +1308,7 @@ function VideoPost({
   key?: React.Key;
 }) {
   const navigate = useNavigate();
-  const { user } = useAuth();
+  const { user, profile, refreshProfile } = useAuth();
   const [isPlaying, setIsPlaying] = useState(false);
   const [isLiked, setIsLiked] = useState(!!video?.liked);
   const [isSaved, setIsSaved] = useState(false);
@@ -1223,6 +1324,8 @@ function VideoPost({
   const videoRef = useRef<HTMLVideoElement>(null);
   const blurVideoRef = useRef<HTMLVideoElement>(null);
   const soundIconTimerRef = useRef<number | null>(null);
+  const hasReelViewCountedRef = useRef(false);
+  const watchStartRef = useRef<number | null>(null);
 
   const REEL_GIFTS = [
     { id: 'g1', icon: '🎁', price: 500 },
@@ -1239,6 +1342,35 @@ function VideoPost({
   const thumbStr = String((video as any).thumbnail || '').trim();
   const thumbOk = isValidVideoUrl(thumbStr);
   const posterForPlayer = thumbOk ? thumbStr : urlOk ? `${playUrl}#t=0.1` : undefined;
+
+  const flushMainVideoWatchSegment = useCallback(() => {
+    if (watchStartRef.current != null) {
+      const seconds = (Date.now() - watchStartRef.current) / 1000;
+      if (video?.id != null && seconds > 0) {
+        trackWatchTime(String(video.id), seconds);
+      }
+      watchStartRef.current = null;
+    }
+  }, [video?.id]);
+
+  const handleMainVideoPlay = useCallback(() => {
+    watchStartRef.current = Date.now();
+    updateInterest({
+      video_url: playUrl || undefined,
+      image_url: thumbStr || undefined,
+      category: (video as any)?.category,
+    });
+  }, [playUrl, thumbStr, video]);
+
+  const handleMainVideoPauseOrEnd = useCallback(() => {
+    flushMainVideoWatchSegment();
+  }, [flushMainVideoWatchSegment]);
+
+  useEffect(() => {
+    return () => {
+      flushMainVideoWatchSegment();
+    };
+  }, [video?.id, flushMainVideoWatchSegment]);
 
   const handleLike = async () => {
     const reelId = video?.id != null ? String(video.id) : null;
@@ -1367,6 +1499,58 @@ function VideoPost({
     setIsLiked(!!video?.liked);
   }, [video?.liked, video?.id]);
 
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!user?.id || video?.id == null) {
+        setIsSaved(false);
+        return;
+      }
+      const { data, error } = await supabase
+        .from('saved_posts')
+        .select('id')
+        .eq('post_id', String(video.id))
+        .eq('user_id', user.id)
+        .maybeSingle();
+      if (cancelled) return;
+      if (error) setIsSaved(false);
+      else setIsSaved(!!data);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [video?.id, user?.id]);
+
+  const handleSaveToggle = async () => {
+    const reelId = video?.id != null ? String(video.id) : null;
+    if (!user?.id) {
+      alert('Please sign in to save posts.');
+      return;
+    }
+    if (!reelId) return;
+    const userId = user.id;
+    const wasSaved = isSaved;
+    setIsSaved(!wasSaved);
+    try {
+      if (wasSaved) {
+        const { error } = await supabase
+          .from('saved_posts')
+          .delete()
+          .eq('post_id', reelId)
+          .eq('user_id', userId);
+        if (error) throw error;
+      } else {
+        const { error } = await supabase
+          .from('saved_posts')
+          .insert({ post_id: reelId, user_id: userId });
+        if (error) throw error;
+      }
+    } catch (e) {
+      console.error('[ReelsPage] saved_posts toggle', e);
+      setIsSaved(wasSaved);
+    }
+  };
+
   const handleSelectGift = (gift: { id: string }) => {
     setSelectedGiftId(gift?.id ?? null);
     console.log('[ReelsPage] gift select', { reelId: video?.id != null ? String(video.id) : null, giftId: gift?.id });
@@ -1492,6 +1676,10 @@ function VideoPost({
   }, [video?.id]);
 
   useEffect(() => {
+    hasReelViewCountedRef.current = false;
+  }, [video?.id]);
+
+  useEffect(() => {
     return () => {
       if (soundIconTimerRef.current) {
         window.clearTimeout(soundIconTimerRef.current);
@@ -1541,18 +1729,27 @@ function VideoPost({
               b.currentTime = 0;
               void b.play().catch(() => {});
             }
-            fetch(apiUrl(`/api/reels/${video.id}/view`), {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ userId: user?.id })
-            })
-              .then(r => r.ok ? r.json() : null)
-              .then(data => {
-                if (data && typeof data.views === 'number') {
-                  onCountsChange(video.id, { views: data.views });
-                }
-              })
-              .catch(() => {});
+            const reelId = video?.id != null ? String(video.id) : '';
+            if (
+              reelId &&
+              !hasReelViewCountedRef.current &&
+              !hasRecordedViewThisSession(reelId)
+            ) {
+              hasReelViewCountedRef.current = true;
+              markPostViewRecordedSession(reelId);
+              const next = getViews(video) + 1;
+              onCountsChange(reelId, { views: next });
+              void supabase
+                .from('posts')
+                .update({ view_count: next })
+                .eq('id', reelId)
+                .then(async ({ error }) => {
+                  if (error) {
+                    const { error: e2 } = await supabase.from('posts').update({ views: next }).eq('id', reelId);
+                    if (e2) console.warn('[Reels VideoPost] views/view_count update', e2);
+                  }
+                });
+            }
           } else {
             const v = videoRef.current;
             const b = blurVideoRef.current;
@@ -1581,12 +1778,17 @@ function VideoPost({
 
     if (videoRef.current) observer.observe(videoRef.current);
     return () => observer.disconnect();
-  }, [onActive, onCountsChange, user?.id, video.id, urlOk, videoFailed]);
+  }, [onActive, onCountsChange, video, urlOk, videoFailed]);
 
   const desktopMuted = !hasUserInteracted;
 
   return (
     <div className="relative w-full h-screen overflow-hidden bg-black group">
+      {video.isViral && (
+        <div className="pointer-events-none absolute top-2 left-2 z-30 bg-orange-500 text-white text-xs px-2 py-1 rounded-full font-bold shadow-lg">
+          🔥 Viral
+        </div>
+      )}
       {urlOk && !videoFailed ? (
         <>
           {thumbOk && (
@@ -1631,6 +1833,9 @@ function VideoPost({
               preload="metadata"
               onLoadedData={() => setIsReady(true)}
               onError={() => setVideoFailed(true)}
+              onPlay={handleMainVideoPlay}
+              onPause={handleMainVideoPauseOrEnd}
+              onEnded={handleMainVideoPauseOrEnd}
               onClick={handleVideoSurfaceTap}
               style={{
                 opacity: isReady ? 1 : 0,
@@ -1733,7 +1938,7 @@ function VideoPost({
             <div className="w-1.5 h-1.5 bg-white rounded-full animate-pulse" />
             LIVE
           </div>
-          <span className="text-white text-[10px] font-bold drop-shadow-md">{video.views || video.viewerCount || 0} views</span>
+          <span className="text-white text-[10px] font-bold drop-shadow-md">{getViews(video)} views</span>
         </div>
       )}
 
@@ -1755,9 +1960,29 @@ function VideoPost({
           onClick={() => setIsShareModalOpen(true)}
         />
         <ActionButton 
+          icon={<Zap className="text-amber-400" size={30} />} 
+          label="Boost" 
+          onClick={(e) => {
+            e.stopPropagation();
+            if (!user?.id) {
+              alert('Sign in to boost posts.');
+              return;
+            }
+            const bal = Number(profile?.coins) || 0;
+            if (bal < BOOST_COST) {
+              alert(`You need at least ${BOOST_COST} coins to boost.`);
+              return;
+            }
+            void boostPostAction(String(video.id), user.id).then((res) => {
+              if (res.ok) void refreshProfile();
+              else alert(res.message || 'Boost failed');
+            });
+          }}
+        />
+        <ActionButton 
           icon={<Bookmark className={cn("transition-all duration-300", isSaved ? "text-white fill-white" : "text-white")} size={30} />} 
           label="" 
-          onClick={() => setIsSaved(!isSaved)}
+          onClick={() => void handleSaveToggle()}
         />
         <ActionButton 
           icon={<Gift className="text-orange-400" size={30} />} 
@@ -2327,7 +2552,17 @@ function BoostModal({ onClose, video }: { onClose: () => void; video: any }) {
   );
 }
 
-function ActionButton({ icon, label, onClick, active }: { icon: React.ReactNode; label: string | number; onClick?: () => void; active?: boolean }) {
+function ActionButton({
+  icon,
+  label,
+  onClick,
+  active,
+}: {
+  icon: React.ReactNode;
+  label: string | number;
+  onClick?: (e: React.MouseEvent) => void;
+  active?: boolean;
+}) {
   return (
     <div className="flex flex-col items-center gap-1">
       <motion.button 

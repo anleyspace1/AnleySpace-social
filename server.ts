@@ -1034,10 +1034,14 @@ async function startServer() {
   app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
   app.post('/api/create-checkout-session', async (req, res) => {
+    console.log('API HIT');
     try {
-      if (!stripeClient) {
+      const stripeKeyPresent = !!(process.env.STRIPE_SECRET_KEY && String(process.env.STRIPE_SECRET_KEY).trim());
+      if (!stripeKeyPresent || !stripeClient) {
+        console.error('STRIPE_SECRET_KEY missing — cannot create checkout session');
         return res.status(503).json({ error: 'Stripe not configured' });
       }
+
       const userId = await getAuthUserIdFromJwtHeader(req);
       if (!userId) {
         return res.status(401).json({ error: 'Unauthorized' });
@@ -1057,34 +1061,50 @@ async function startServer() {
         '';
       const base = baseRaw.replace(/\/$/, '') || 'http://localhost:5173';
 
-      const checkoutSession = await stripeClient.checkout.sessions.create({
-        mode: 'payment',
-        line_items: [
-          {
-            price_data: {
-              currency: 'usd',
-              product_data: { name: `${pkgKey} AnleySpace coins` },
-              unit_amount: pkg.cents,
+      try {
+        const session = await stripeClient.checkout.sessions.create({
+          mode: 'payment',
+          line_items: [
+            {
+              price_data: {
+                currency: 'usd',
+                product_data: { name: `${pkgKey} AnleySpace coins` },
+                unit_amount: pkg.cents,
+              },
+              quantity: 1,
             },
-            quantity: 1,
+          ],
+          success_url: `${base}/wallet?purchase=success`,
+          cancel_url: `${base}/wallet?purchase=cancel`,
+          metadata: {
+            user_id: userId,
+            coins: String(pkgKey),
           },
-        ],
-        success_url: `${base}/wallet?purchase=success`,
-        cancel_url: `${base}/wallet?purchase=cancel`,
-        metadata: {
-          user_id: userId,
-          coins: String(pkgKey),
-        },
-      });
-
-      if (!checkoutSession.url) {
-        return res.status(500).json({ error: 'No checkout URL' });
+        });
+        console.log('Stripe session created:', session.id);
+        if (!session.url) {
+          return res.status(500).json({ error: 'No checkout URL from Stripe' });
+        }
+        return res.status(200).json({ url: session.url });
+      } catch (err: unknown) {
+        console.error('Stripe error:', err);
+        const message =
+          err instanceof Stripe.errors.StripeError
+            ? err.message
+            : err instanceof Error
+              ? err.message
+              : typeof err === 'object' &&
+                  err !== null &&
+                  'message' in err &&
+                  typeof (err as { message: unknown }).message === 'string'
+                ? (err as { message: string }).message
+                : 'Checkout failed';
+        return res.status(500).json({ error: message });
       }
-
-      return res.json({ url: checkoutSession.url });
-    } catch (e) {
-      console.error('[create-checkout-session]', e);
-      return res.status(500).json({ error: 'Checkout failed' });
+    } catch (e: unknown) {
+      console.error('[create-checkout-session] unexpected:', e);
+      const message = e instanceof Error ? e.message : 'Checkout failed';
+      return res.status(500).json({ error: message });
     }
   });
 

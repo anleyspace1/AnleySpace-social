@@ -13,25 +13,6 @@
   body {
     @apply bg-white text-gray-900 dark:bg-black dark:text-white transition-colors duration-200;
   }
-
-  /* Global input readability: visible typed text, placeholder, and caret */
-  input,
-  textarea {
-    color: rgb(17 24 39) !important; /* text-gray-900 */
-    caret-color: rgb(17 24 39) !important; /* caret-gray-900 */
-  }
-
-  .dark input,
-  .dark textarea {
-    color: rgb(255 255 255) !important; /* dark:text-white */
-    caret-color: rgb(255 255 255) !important; /* dark:caret-white */
-  }
-
-  input::placeholder,
-  textarea::placeholder {
-    color: rgb(156 163 175) !important; /* placeholder-gray-400 */
-    opacity: 1 !important;
-  }
 }
 
 /* Custom scrollbar for a cleaner look */
@@ -92,4 +73,71 @@
 
 .home-feed-scroll::-webkit-scrollbar-thumb:hover {
   background: rgba(15, 23, 42, 0.22);
+}
+
+/*
+ * Global input/textarea visibility — UNLAYERED + #root so this wins over Tailwind utilities
+ * and route-level text-white on the gradient shell.
+ */
+#root input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="hidden"]):not([type="range"]):not([type="color"]):not([type="image"]),
+#root textarea {
+  color: #111827 !important;
+  -webkit-text-fill-color: #111827 !important;
+  caret-color: #111827 !important;
+}
+
+.dark #root input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="hidden"]):not([type="range"]):not([type="color"]):not([type="image"]),
+.dark #root textarea {
+  color: #ffffff !important;
+  -webkit-text-fill-color: #ffffff !important;
+  caret-color: #ffffff !important;
+}
+
+#root input::placeholder,
+#root textarea::placeholder {
+  color: #6b7280 !important;
+  -webkit-text-fill-color: #6b7280 !important;
+  opacity: 1 !important;
+}
+
+.dark #root input::placeholder,
+.dark #root textarea::placeholder {
+  color: #9ca3af !important;
+  -webkit-text-fill-color: #9ca3af !important;
+  opacity: 1 !important;
+}
+
+/* Light composer bar under html.dark — keep dark ink on white/gray-100 field */
+#root input.chat-message-input[type="text"],
+.dark #root input.chat-message-input[type="text"] {
+  color: #111827 !important;
+  -webkit-text-fill-color: #111827 !important;
+  caret-color: #111827 !important;
+}
+
+#root input.chat-message-input[type="text"]:-webkit-autofill,
+#root input.chat-message-input[type="text"]:-webkit-autofill:hover,
+#root input.chat-message-input[type="text"]:-webkit-autofill:focus,
+.dark #root input.chat-message-input[type="text"]:-webkit-autofill,
+.dark #root input.chat-message-input[type="text"]:-webkit-autofill:hover,
+.dark #root input.chat-message-input[type="text"]:-webkit-autofill:focus {
+  -webkit-text-fill-color: #111827 !important;
+}
+
+#root input[type="search"]:-webkit-autofill,
+#root input[type="search"]:-webkit-autofill:hover,
+#root input[type="search"]:-webkit-autofill:focus,
+#root input.search-input[type="text"]:-webkit-autofill,
+#root input.search-input[type="text"]:-webkit-autofill:hover,
+#root input.search-input[type="text"]:-webkit-autofill:focus {
+  -webkit-text-fill-color: #111827 !important;
+}
+
+.dark #root input[type="search"]:-webkit-autofill,
+.dark #root input[type="search"]:-webkit-autofill:hover,
+.dark #root input[type="search"]:-webkit-autofill:focus,
+.dark #root input.search-input[type="text"]:-webkit-autofill,
+.dark #root input.search-input[type="text"]:-webkit-autofill:hover,
+.dark #root input.search-input[type="text"]:-webkit-autofill:focus {
+  -webkit-text-fill-color: #ffffff !important;
 }

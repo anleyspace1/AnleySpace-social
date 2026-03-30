@@ -65,6 +65,29 @@ function resolveProductGalleryThumbUrls(product: any): string[] {
   return unique.slice(0, 4);
 }
 
+type SellerProfileExtra = { username: string; avatar_url: string };
+type ReviewStats = { count: number; average: number };
+
+/** Optional table: if missing in DB, returns zeros without throwing. */
+async function fetchMarketplaceReviewStats(productId: string): Promise<ReviewStats> {
+  if (!productId?.trim()) return { count: 0, average: 0 };
+  try {
+    const { data, error } = await supabase
+      .from('marketplace_reviews')
+      .select('rating')
+      .eq('product_id', productId);
+    if (error || !data?.length) return { count: 0, average: 0 };
+    const ratings = (data as { rating?: unknown }[])
+      .map((r) => Number(r.rating))
+      .filter((n) => Number.isFinite(n) && n >= 1 && n <= 5);
+    if (!ratings.length) return { count: 0, average: 0 };
+    const sum = ratings.reduce((a, b) => a + b, 0);
+    return { count: ratings.length, average: sum / ratings.length };
+  } catch {
+    return { count: 0, average: 0 };
+  }
+}
+
 export default function ProductDetailPage() {
   const { id } = useParams();
   console.log("ProductDetailPage mounted", { routeParamId: id });
@@ -79,11 +102,20 @@ export default function ProductDetailPage() {
   const [liked, setLiked] = useState(false);
   const [likeCount, setLikeCount] = useState<number | null>(null);
   const [walletBalance, setWalletBalance] = useState<number | null>(null);
+  const [sellerProfileExtra, setSellerProfileExtra] = useState<SellerProfileExtra | null>(null);
+  const [reviewStats, setReviewStats] = useState<ReviewStats>({ count: 0, average: 0 });
+  const [sellerAvatarFailed, setSellerAvatarFailed] = useState(false);
   /** Lowercase listing id — one increment per successful load for that listing. */
   const viewIncrementedKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     viewIncrementedKeyRef.current = null;
+  }, [id]);
+
+  useEffect(() => {
+    setSellerProfileExtra(null);
+    setReviewStats({ count: 0, average: 0 });
+    setSellerAvatarFailed(false);
   }, [id]);
 
   useEffect(() => {
@@ -152,6 +184,45 @@ export default function ProductDetailPage() {
       cancelled = true;
     };
   }, [user?.id, product?.user_id]);
+
+  useEffect(() => {
+    const pid = product?.id != null ? String(product.id).trim() : '';
+    const sellerUid = String(product?.user_id || product?.seller?.id || '').trim();
+    if (!pid) {
+      setSellerProfileExtra(null);
+      setReviewStats({ count: 0, average: 0 });
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      if (isSupabaseConfigured && sellerUid) {
+        const { data: prof, error } = await supabase
+          .from('profiles')
+          .select('username, avatar_url')
+          .eq('id', sellerUid)
+          .maybeSingle();
+        if (cancelled) return;
+        if (!error && prof && typeof prof === 'object') {
+          const u = String((prof as { username?: string }).username ?? '').trim();
+          const av = String((prof as { avatar_url?: string }).avatar_url ?? '').trim();
+          setSellerProfileExtra({ username: u, avatar_url: av });
+        } else {
+          setSellerProfileExtra(null);
+        }
+      } else {
+        setSellerProfileExtra(null);
+      }
+      const stats = await fetchMarketplaceReviewStats(pid);
+      if (!cancelled) setReviewStats(stats);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [product?.id, product?.user_id, product?.seller?.id]);
+
+  useEffect(() => {
+    setSellerAvatarFailed(false);
+  }, [sellerProfileExtra?.avatar_url, product?.seller?.avatar, id]);
 
   useEffect(() => {
     console.log('[VIEW EFFECT TRIGGER]', {
@@ -367,13 +438,10 @@ export default function ProductDetailPage() {
 
   const handleGoToSellerProfile = () => {
     if (!product) return;
-
-    const p = product as Product & { username?: string; user?: { username?: string } };
-    const username = p.username || p.user?.username || p.seller?.username;
-
-    if (!username) return;
-
-    navigate(`/profile/${username}`);
+    const sellerUid = String(product.user_id || product.seller?.id || '').trim();
+    if (sellerUid) {
+      navigate(`/profile/${encodeURIComponent(sellerUid)}`);
+    }
   };
 
   if (loading) {
@@ -395,6 +463,66 @@ export default function ProductDetailPage() {
   }
 
   const mainImageUrl = productImagePublicUrl(product.image);
+
+  const sellerUid = String(product.user_id || product.seller?.id || '').trim();
+  const sellerUsernameRaw = String(
+    sellerProfileExtra?.username || product.seller?.username || ''
+  ).trim();
+  const sellerDisplayHandle =
+    sellerUsernameRaw.length > 0 ? `@${sellerUsernameRaw}` : 'Unknown seller';
+  const sellerAvatarUrl = String(
+    sellerProfileExtra?.avatar_url || product.seller?.avatar || ''
+  ).trim();
+  const canOpenSellerProfile = sellerUid.length > 0;
+  const filledStarCount =
+    reviewStats.count > 0
+      ? Math.min(5, Math.max(0, Math.round(reviewStats.average)))
+      : 0;
+  const reviewCountLabel =
+    reviewStats.count === 1 ? '(1 review)' : `(${reviewStats.count} reviews)`;
+
+  const sellerHeaderInner = (
+    <>
+      <div className="w-12 h-12 rounded-full overflow-hidden border border-gray-100 dark:border-gray-800 bg-gray-200 dark:bg-gray-700 flex items-center justify-center text-sm font-bold text-gray-600 dark:text-gray-300 shrink-0">
+        {sellerAvatarUrl && !sellerAvatarFailed ? (
+          <img
+            src={sellerAvatarUrl}
+            alt=""
+            className="w-full h-full object-cover"
+            onError={() => setSellerAvatarFailed(true)}
+            referrerPolicy="no-referrer"
+          />
+        ) : (
+          (sellerUsernameRaw || '?').charAt(0).toUpperCase()
+        )}
+      </div>
+      <div className="min-w-0">
+        <h4 className="font-bold text-base group-hover:text-indigo-600 transition-colors truncate">
+          {sellerDisplayHandle}
+        </h4>
+        <div className="flex items-center gap-0.5 flex-wrap">
+          {[1, 2, 3, 4, 5].map((star) => (
+            <Star
+              key={star}
+              size={12}
+              className={cn(
+                star <= filledStarCount
+                  ? 'fill-yellow-500 text-yellow-500'
+                  : 'text-gray-300 dark:text-gray-600'
+              )}
+              aria-hidden
+            />
+          ))}
+          <span className="text-[10px] text-gray-500 ml-1">
+            {reviewCountLabel}
+            {reviewStats.count > 0 && (
+              <span className="sr-only">{`, average ${reviewStats.average.toFixed(1)}`}</span>
+            )}
+          </span>
+        </div>
+      </div>
+    </>
+  );
 
   return (
     <motion.div 
@@ -641,34 +769,28 @@ export default function ProductDetailPage() {
 
               {/* Seller Card */}
               <div className="bg-white dark:bg-gray-900 rounded-2xl p-4 border border-gray-100 dark:border-gray-800 shadow-sm">
-                <div 
-                  onClick={product.seller?.username ? handleGoToSellerProfile : undefined}
-                  className={cn(
-                    'flex items-center gap-3 mb-4 group',
-                    product.seller?.username ? 'cursor-pointer' : 'cursor-default'
-                  )}
-                >
-                  <div className="w-12 h-12 rounded-full overflow-hidden border border-gray-100 dark:border-gray-800 bg-gray-200 dark:bg-gray-700 flex items-center justify-center text-sm font-bold text-gray-600 dark:text-gray-300">
-                    {(product.seller?.username || '?').charAt(0).toUpperCase()}
+                {canOpenSellerProfile ? (
+                  <button
+                    type="button"
+                    onClick={handleGoToSellerProfile}
+                    aria-label={`View seller profile ${sellerDisplayHandle}`}
+                    className={cn(
+                      'flex items-center gap-3 mb-4 group w-full text-left',
+                      'cursor-pointer p-0 m-0 border-0 bg-transparent font-inherit text-inherit',
+                      'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-gray-900'
+                    )}
+                  >
+                    {sellerHeaderInner}
+                  </button>
+                ) : (
+                  <div className="flex items-center gap-3 mb-4 group cursor-default">
+                    {sellerHeaderInner}
                   </div>
-                  <div>
-                    <h4 className="font-bold text-base group-hover:text-indigo-600 transition-colors">
-                      {product.seller?.username ? `@${product.seller.username}` : 'Seller'}
-                    </h4>
-                    <div className="flex items-center gap-0.5 text-yellow-500">
-                      <Star size={12} className="fill-current" />
-                      <Star size={12} className="fill-current" />
-                      <Star size={12} className="fill-current" />
-                      <Star size={12} className="fill-current" />
-                      <Star size={12} className="fill-current" />
-                      <span className="text-[10px] text-gray-500 ml-1">(48 reviews)</span>
-                    </div>
-                  </div>
-                </div>
+                )}
 
                 <button 
                   onClick={() => {
-                    const sellerId = product.seller?.id?.trim();
+                    const sellerId = String(product.user_id || product.seller?.id || '').trim();
                     if (sellerId) {
                       navigate(
                         `/messages?seller=${encodeURIComponent(sellerId)}&product=${encodeURIComponent(product.id)}`
