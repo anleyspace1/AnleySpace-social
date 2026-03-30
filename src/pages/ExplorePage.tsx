@@ -20,7 +20,8 @@ import {
 } from 'lucide-react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { cn } from '../lib/utils';
-import { apiUrl } from '../lib/apiOrigin';
+import { apiUrl, fetchFeedApiSafe } from '../lib/apiOrigin';
+import { persistFollowEdge } from '../lib/followsClient';
 import { productImagePublicUrl } from '../lib/marketplaceImage';
 import { fetchMarketplaceTableRowsAsApiProducts, mapMarketplaceRowsToProducts } from '../lib/marketplaceRemote';
 import { supabase } from '../lib/supabase';
@@ -656,19 +657,33 @@ export default function ExplorePage() {
       console.log('[Explore] /api/users/search sample', Array.isArray(data) ? data.slice(0, 1) : data);
       
       if (data && user) {
-        // Check following status for each
         const followingMap: Record<string, boolean> = {};
-        await Promise.all(data.map(async (p: any) => {
-          try {
-            const fRes = await fetch(apiUrl(`/api/users/${user.id}/following/${p.id}`));
-            const fData = await fRes.json();
-            if (fData.isFollowing) followingMap[p.id] = true;
-          } catch (e) {
-            console.error('DEBUG: Follow check error:', e);
-          }
-        }));
-        
-        setFollowing(prev => ({ ...prev, ...followingMap }));
+        await Promise.all(
+          data.map(async (p: any) => {
+            try {
+              const { data: row, error } = await supabase
+                .from('follows')
+                .select('follower_id')
+                .eq('follower_id', user.id)
+                .eq('following_id', p.id)
+                .maybeSingle();
+              if (error) console.warn('[Explore] follow check query error', error);
+              if (row) {
+                followingMap[p.id] = true;
+                return;
+              }
+              const fRes = await fetchFeedApiSafe(apiUrl(`/api/users/${user.id}/following/${p.id}`));
+              if (fRes && fRes.ok) {
+                const fData = await fRes.json().catch(() => ({}));
+                if (fData?.isFollowing) followingMap[p.id] = true;
+              }
+            } catch (e) {
+              console.error('DEBUG: Follow check error:', e);
+            }
+          })
+        );
+
+        setFollowing((prev) => ({ ...prev, ...followingMap }));
       }
       
       setRealCreators((data || []).map((creator: any) => ({
@@ -770,27 +785,12 @@ export default function ExplorePage() {
     setFollowing(prev => ({ ...prev, [creatorId]: !wasFollowing }));
 
     try {
-      const endpoint = wasFollowing ? apiUrl('/api/users/unfollow') : apiUrl('/api/users/follow');
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          followerId: user.id,
-          followingId: creatorId
-        })
+      const result = await persistFollowEdge({
+        followerId: user.id,
+        followingId: creatorId,
+        unfollow: wasFollowing,
       });
-
-      if (!res.ok) throw new Error('Failed to toggle follow');
-      
-      // Also update Supabase for redundancy if needed
-      if (wasFollowing) {
-        await supabase.from('follows').delete().eq('follower_id', user.id).eq('following_id', creatorId);
-      } else {
-        const { error: followInsertErr } = await supabase
-          .from('follows')
-          .insert({ follower_id: user.id, following_id: creatorId });
-        if (followInsertErr && followInsertErr.code !== '23505') throw followInsertErr;
-      }
+      if (!result.ok) throw new Error(result.error || 'Failed to toggle follow');
     } catch (err) {
       console.error('Error toggling follow:', err);
       setFollowing(prev => ({ ...prev, [creatorId]: wasFollowing }));

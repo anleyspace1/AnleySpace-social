@@ -38,6 +38,7 @@ import { ResponsiveImage } from '../components/ResponsiveImage';
 import { isValidVideoUrl } from '../lib/videoUrl';
 import { ProfileHeaderSkeleton } from '../components/LoadingSkeletons';
 import { fetchCommentsWithProfiles, type CommentForDisplay } from '../lib/postComments';
+import { persistFollowEdge } from '../lib/followsClient';
 
 function feedApiResponseIsJson(res: Response): boolean {
   const ct = res.headers.get('content-type') || '';
@@ -358,9 +359,26 @@ export default function ProfilePage() {
   const checkIfFollowing = async () => {
     if (!user || !userProfile) return;
     try {
-      const res = await fetch(apiUrl(`/api/users/${user.id}/following/${userProfile.id}`));
-      const data = await res.json();
-      setIsFollowing(data.isFollowing);
+      const { data: row, error } = await supabase
+        .from('follows')
+        .select('follower_id')
+        .eq('follower_id', user.id)
+        .eq('following_id', userProfile.id)
+        .maybeSingle();
+      if (error) {
+        console.warn('[ProfilePage] checkIfFollowing follow query error', error);
+      }
+      if (row) {
+        setIsFollowing(true);
+        return;
+      }
+      const res = await fetchFeedApiSafe(apiUrl(`/api/users/${user.id}/following/${userProfile.id}`));
+      if (res && res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setIsFollowing(Boolean(data?.isFollowing));
+      } else {
+        setIsFollowing(false);
+      }
     } catch (err) {
       console.error('Error checking follow status:', err);
     }
@@ -375,27 +393,12 @@ export default function ProfilePage() {
     const wasFollowing = isFollowing;
     setIsFollowing(!wasFollowing);
     try {
-      const endpoint = wasFollowing ? apiUrl('/api/users/unfollow') : apiUrl('/api/users/follow');
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          followerId: user.id,
-          followingId: userProfile.id
-        })
+      const result = await persistFollowEdge({
+        followerId: user.id,
+        followingId: userProfile.id,
+        unfollow: wasFollowing,
       });
-
-      if (!res.ok) throw new Error('Failed to toggle follow');
-
-      // Also update Supabase for redundancy
-      if (wasFollowing) {
-        await supabase.from('follows').delete().eq('follower_id', user.id).eq('following_id', userProfile.id);
-      } else {
-        const { error: followInsertErr } = await supabase
-          .from('follows')
-          .insert({ follower_id: user.id, following_id: userProfile.id });
-        if (followInsertErr && followInsertErr.code !== '23505') throw followInsertErr;
-      }
+      if (!result.ok) throw new Error(result.error || 'Failed to toggle follow');
       await refreshFollowCounts(userProfile.id);
     } catch (err) {
       console.error('Error toggling follow:', err);
@@ -451,9 +454,11 @@ export default function ProfilePage() {
         .from('follows')
         .select('follower_id')
         .eq('following_id', userProfile.id);
-      console.log("FOLLOWERS QUERY", userProfile.id, rows);
-      
-      if (error) throw error;
+      console.log('FOLLOW DATA:', { profileId: userProfile.id, rows });
+      if (error) {
+        console.error('FOLLOW ERROR (followers query):', error);
+        throw error;
+      }
       const followerIds = Array.from(
         new Set((rows || []).map((f: any) => f.follower_id).filter(Boolean))
       );
@@ -481,8 +486,8 @@ export default function ProfilePage() {
       let resolvedProfiles = profiles || [];
       // Keep profile counts/list source consistent: if Supabase rows are empty, fallback to local API list.
       if (resolvedProfiles.length === 0) {
-        const res = await fetch(apiUrl(`/api/users/${encodeURIComponent(userProfile.id)}/followers-list`));
-        if (res.ok) {
+        const res = await fetchFeedApiSafe(apiUrl(`/api/users/${encodeURIComponent(userProfile.id)}/followers-list`));
+        if (res && res.ok) {
           const list = await res.json();
           resolvedProfiles = Array.isArray(list) ? list : [];
         }
@@ -494,8 +499,8 @@ export default function ProfilePage() {
     } catch (err) {
       console.error('Error fetching followers:', err);
       try {
-        const res = await fetch(apiUrl(`/api/users/${encodeURIComponent(userProfile.id)}/followers-list`));
-        if (res.ok) {
+        const res = await fetchFeedApiSafe(apiUrl(`/api/users/${encodeURIComponent(userProfile.id)}/followers-list`));
+        if (res && res.ok) {
           const list = await res.json();
           let followingIds: string[] = [];
           if (user) {
@@ -528,8 +533,12 @@ export default function ProfilePage() {
         .from('follows')
         .select('following_id')
         .eq('follower_id', userProfile.id);
-      
-      if (error) throw error;
+
+      console.log('FOLLOW DATA:', { profileId: userProfile.id, followingRows: rows });
+      if (error) {
+        console.error('FOLLOW ERROR (following query):', error);
+        throw error;
+      }
       const followedIds = Array.from(
         new Set((rows || []).map((f: any) => f.following_id).filter(Boolean))
       );
@@ -557,8 +566,8 @@ export default function ProfilePage() {
       let resolvedProfiles = profiles || [];
       // Keep profile counts/list source consistent: if Supabase rows are empty, fallback to local API list.
       if (resolvedProfiles.length === 0) {
-        const res = await fetch(apiUrl(`/api/users/${encodeURIComponent(userProfile.id)}/following-list`));
-        if (res.ok) {
+        const res = await fetchFeedApiSafe(apiUrl(`/api/users/${encodeURIComponent(userProfile.id)}/following-list`));
+        if (res && res.ok) {
           const list = await res.json();
           resolvedProfiles = Array.isArray(list) ? list : [];
         }
@@ -570,8 +579,8 @@ export default function ProfilePage() {
     } catch (err) {
       console.error('Error fetching following:', err);
       try {
-        const res = await fetch(apiUrl(`/api/users/${encodeURIComponent(userProfile.id)}/following-list`));
-        if (res.ok) {
+        const res = await fetchFeedApiSafe(apiUrl(`/api/users/${encodeURIComponent(userProfile.id)}/following-list`));
+        if (res && res.ok) {
           const list = await res.json();
           let myFollowingIds: string[] = [];
           if (user) {
@@ -623,14 +632,12 @@ export default function ProfilePage() {
     }
 
     try {
-      if (shouldUnfollow) {
-        await supabase.from('follows').delete().eq('follower_id', user.id).eq('following_id', targetUserId);
-      } else {
-        const { error: followInsertErr } = await supabase
-          .from('follows')
-          .insert({ follower_id: user.id, following_id: targetUserId });
-        if (followInsertErr && followInsertErr.code !== '23505') throw followInsertErr;
-      }
+      const result = await persistFollowEdge({
+        followerId: user.id,
+        followingId: targetUserId,
+        unfollow: shouldUnfollow,
+      });
+      if (!result.ok) throw new Error(result.error || 'Follow update failed');
 
       if (userProfile?.id) {
         await refreshFollowCounts(userProfile.id);

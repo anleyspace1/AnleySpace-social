@@ -2,7 +2,8 @@ import React, { useState, useEffect } from 'react';
 import { motion } from 'motion/react';
 import { UserPlus, UserMinus, Check, X, Search, MoreHorizontal, Loader2 } from 'lucide-react';
 import { cn } from '../lib/utils';
-import { apiUrl } from '../lib/apiOrigin';
+import { apiUrl, fetchFeedApiSafe } from '../lib/apiOrigin';
+import { persistFollowEdge } from '../lib/followsClient';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import { useNavigate } from 'react-router-dom';
@@ -148,8 +149,8 @@ export default function FriendsPage() {
       }
 
       if (followingData.length === 0) {
-        const res = await fetch(apiUrl(`/api/users/${encodeURIComponent(user.id)}/following-list`));
-        if (res.ok) {
+        const res = await fetchFeedApiSafe(apiUrl(`/api/users/${encodeURIComponent(user.id)}/following-list`));
+        if (res && res.ok) {
           const list = await res.json();
           followingData = Array.isArray(list) ? list.map(mapProfileRow) : [];
           console.log('[FriendsPage] following: SQLite API fallback count', followingData.length);
@@ -170,8 +171,8 @@ export default function FriendsPage() {
       console.error('Error fetching following:', err);
       setFollowingIds([]);
       try {
-        const res = await fetch(apiUrl(`/api/users/${encodeURIComponent(user!.id)}/following-list`));
-        if (res.ok) {
+        const res = await fetchFeedApiSafe(apiUrl(`/api/users/${encodeURIComponent(user!.id)}/following-list`));
+        if (res && res.ok) {
           const list = await res.json();
           const followingData = Array.isArray(list) ? list.map(mapProfileRow) : [];
           console.log('[FriendsPage] following: error path SQLite fallback count', followingData.length);
@@ -228,8 +229,8 @@ export default function FriendsPage() {
       }
 
       if (followersData.length === 0) {
-        const res = await fetch(apiUrl(`/api/users/${encodeURIComponent(user.id)}/followers-list`));
-        if (res.ok) {
+        const res = await fetchFeedApiSafe(apiUrl(`/api/users/${encodeURIComponent(user.id)}/followers-list`));
+        if (res && res.ok) {
           const list = await res.json();
           followersData = Array.isArray(list) ? list.map(mapProfileRow) : [];
           console.log('[FriendsPage] followers: SQLite API fallback count', followersData.length);
@@ -243,8 +244,8 @@ export default function FriendsPage() {
     } catch (err) {
       console.error('Error fetching followers:', err);
       try {
-        const res = await fetch(apiUrl(`/api/users/${encodeURIComponent(user!.id)}/followers-list`));
-        if (res.ok) {
+        const res = await fetchFeedApiSafe(apiUrl(`/api/users/${encodeURIComponent(user!.id)}/followers-list`));
+        if (res && res.ok) {
           const list = await res.json();
           const followersData = Array.isArray(list) ? list.map(mapProfileRow) : [];
           console.log('[FriendsPage] followers: error path SQLite fallback count', followersData.length);
@@ -326,26 +327,16 @@ export default function FriendsPage() {
     setFollowingStatus(prev => ({ ...prev, [creatorId]: !wasFollowing }));
 
     try {
+      const result = await persistFollowEdge({
+        followerId: user.id,
+        followingId: creatorId,
+        unfollow: wasFollowing,
+      });
+      if (!result.ok) throw new Error(result.error || 'Follow update failed');
+
       if (wasFollowing) {
-        const res = await fetch(apiUrl('/api/users/unfollow'), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ followerId: user.id, followingId: creatorId }),
-        });
-        if (!res.ok) throw new Error('Failed to unfollow');
-        await supabase.from('follows').delete().eq('follower_id', user.id).eq('following_id', creatorId);
-        setFollowing(prev => prev.filter(f => f.id !== creatorId));
+        setFollowing((prev) => prev.filter((f) => f.id !== creatorId));
       } else {
-        const res = await fetch(apiUrl('/api/users/follow'), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ followerId: user.id, followingId: creatorId }),
-        });
-        if (!res.ok) throw new Error('Failed to follow');
-        const { error: followInsertErr } = await supabase
-          .from('follows')
-          .insert({ follower_id: user.id, following_id: creatorId });
-        if (followInsertErr && followInsertErr.code !== '23505') throw followInsertErr;
         fetchFollowing();
         fetchFollowers();
       }
@@ -359,16 +350,15 @@ export default function FriendsPage() {
     if (!user) return;
     if (window.confirm('Are you sure you want to unfollow this user?')) {
       try {
-        const res = await fetch(apiUrl('/api/users/unfollow'), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ followerId: user.id, followingId: id }),
+        const result = await persistFollowEdge({
+          followerId: user.id,
+          followingId: id,
+          unfollow: true,
         });
-        if (!res.ok) throw new Error('Failed to unfollow');
-        await supabase.from('follows').delete().eq('follower_id', user.id).eq('following_id', id);
-        setFollowing(prev => prev.filter(f => f.id !== id));
-        setFollowingIds(prev => prev.filter(followingId => followingId !== id));
-        setFollowingStatus(prev => ({ ...prev, [id]: false }));
+        if (!result.ok) throw new Error(result.error || 'Unfollow failed');
+        setFollowing((prev) => prev.filter((f) => f.id !== id));
+        setFollowingIds((prev) => prev.filter((followingId) => followingId !== id));
+        setFollowingStatus((prev) => ({ ...prev, [id]: false }));
       } catch (err) {
         console.error('Error unfollowing:', err);
       }
