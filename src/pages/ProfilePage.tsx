@@ -45,6 +45,67 @@ function feedApiResponseIsJson(res: Response): boolean {
   return ct.includes('application/json');
 }
 
+/** Align follows.*_id values with profiles.id / auth.users.id (case, whitespace). */
+function normalizeFollowUserId(id: string | null | undefined): string | null {
+  if (id == null) return null;
+  const s = String(id).trim();
+  if (!s) return null;
+  return s.toLowerCase();
+}
+
+/**
+ * Load profile rows for follower/following modals.
+ * Uses .select('*'), chunked .in(), then per-id .eq() if batch returns nothing (ID mismatch / PostgREST quirks).
+ */
+async function fetchProfilesForFollowModal(
+  rawIds: string[],
+  options: { context: 'followers' | 'following' }
+) {
+  const normalized = Array.from(
+    new Set(
+      rawIds
+        .map((id) => normalizeFollowUserId(id))
+        .filter((x): x is string => x != null)
+    )
+  );
+  console.log('FOLLOW USER IDS:', { context: options.context, ids: normalized });
+
+  if (normalized.length === 0) return [];
+
+  const chunkSize = 100;
+  const rows: any[] = [];
+  for (let i = 0; i < normalized.length; i += chunkSize) {
+    const chunk = normalized.slice(i, i + chunkSize);
+    const { data, error } = await supabase.from('profiles').select('*').in('id', chunk);
+    console.log('PROFILE QUERY RESULT:', { context: options.context, chunkIndex: i, data });
+    console.log('PROFILE QUERY ERROR:', error);
+    if (error) {
+      console.log('FOLLOW LIST ERROR:', error);
+      throw error;
+    }
+    rows.push(...(data || []));
+  }
+
+  if (rows.length === 0 && normalized.length > 0) {
+    const probe = await supabase.from('profiles').select('*').limit(10);
+    console.log('PROFILE PROBE (limit 10):', probe.data, probe.error);
+
+    for (const id of normalized) {
+      const { data: one, error } = await supabase.from('profiles').select('*').eq('id', id).maybeSingle();
+      console.log('PROFILE QUERY RESULT (single):', { id, data: one });
+      console.log('PROFILE QUERY ERROR (single):', error);
+      if (!error && one) rows.push(one);
+    }
+  }
+
+  const byId = new Map<string, any>();
+  for (const r of rows) {
+    const k = normalizeFollowUserId(r?.id);
+    if (k) byId.set(k, r);
+  }
+  return Array.from(byId.values());
+}
+
 export default function ProfilePage() {
   const { id: profileIdParam } = useParams();
   const navigate = useNavigate();
@@ -426,13 +487,21 @@ export default function ProfilePage() {
   const [followersList, setFollowersList] = useState<any[]>([]);
   const [followingList, setFollowingList] = useState<any[]>([]);
   const [loadingList, setLoadingList] = useState(false);
-  const mapModalProfile = (p: any, myFollowingIds: string[]) => ({
-    id: p.id,
-    username: p.username || p.id,
-    name: p.full_name || p.display_name || p.username,
-    avatar: p.avatar_url || `https://picsum.photos/seed/${p.id}/100/100`,
-    isFollowing: myFollowingIds.includes(p.id),
-  });
+  const mapModalProfile = (p: any, myFollowingIds: string[]) => {
+    const rawId = p?.id ?? p?.user_id ?? p?.userId;
+    const id = rawId != null ? String(rawId) : '';
+    const followingSet = new Set(
+      myFollowingIds.map((x) => normalizeFollowUserId(String(x))).filter(Boolean) as string[]
+    );
+    const idKey = normalizeFollowUserId(id);
+    return {
+      id,
+      username: p.username || id || 'user',
+      name: p.full_name || p.display_name || p.username,
+      avatar: p.avatar_url || `https://picsum.photos/seed/${id}/100/100`,
+      isFollowing: idKey != null ? followingSet.has(idKey) : false,
+    };
+  };
 
   useEffect(() => {
     if (isFollowersModalOpen) {
@@ -450,43 +519,56 @@ export default function ProfilePage() {
     if (!userProfile) return;
     setLoadingList(true);
     try {
+      const {
+        data: { user: authUser },
+      } = await supabase.auth.getUser();
+      console.log('AUTH USER:', authUser);
+
+      const ownerId = normalizeFollowUserId(userProfile.id);
+      if (!ownerId) {
+        setFollowersList([]);
+        return;
+      }
+
       const { data: rows, error } = await supabase
         .from('follows')
         .select('follower_id')
-        .eq('following_id', userProfile.id);
-      console.log('FOLLOW DATA:', { profileId: userProfile.id, rows });
+        .eq('following_id', ownerId);
+      console.log('FOLLOW LIST DATA (raw follows):', rows);
       if (error) {
-        console.error('FOLLOW ERROR (followers query):', error);
+        console.log('FOLLOW LIST ERROR:', error);
         throw error;
       }
       const followerIds = Array.from(
         new Set((rows || []).map((f: any) => f.follower_id).filter(Boolean))
       );
+      console.log('FOLLOW USER IDS:', { context: 'followers-extracted', ids: followerIds });
 
       if (followerIds.length === 0) {
         setFollowersList([]);
         return;
       }
 
-      const { data: profiles, error: profilesErr } = await supabase
-        .from('profiles')
-        .select('id, username, full_name, display_name, avatar_url')
-        .in('id', followerIds);
-      if (profilesErr) throw profilesErr;
+      const profiles = await fetchProfilesForFollowModal(followerIds, { context: 'followers' });
       
       let followingIds: string[] = [];
       if (user) {
-        const { data: myFollowing } = await supabase
-          .from('follows')
-          .select('following_id')
-          .eq('follower_id', user.id);
-        followingIds = myFollowing?.map(f => f.following_id) || [];
+        const uid = normalizeFollowUserId(user.id);
+        if (uid) {
+          const { data: myFollowing } = await supabase
+            .from('follows')
+            .select('following_id')
+            .eq('follower_id', uid);
+          followingIds = myFollowing?.map((f) => f.following_id) || [];
+        }
       }
 
       let resolvedProfiles = profiles || [];
       // Keep profile counts/list source consistent: if Supabase rows are empty, fallback to local API list.
       if (resolvedProfiles.length === 0) {
-        const res = await fetchFeedApiSafe(apiUrl(`/api/users/${encodeURIComponent(userProfile.id)}/followers-list`));
+        const res = await fetchFeedApiSafe(
+          apiUrl(`/api/users/${encodeURIComponent(userProfile.id)}/followers-list`)
+        );
         if (res && res.ok) {
           const list = await res.json();
           resolvedProfiles = Array.isArray(list) ? list : [];
@@ -495,8 +577,10 @@ export default function ProfilePage() {
 
       setFollowersList(resolvedProfiles
         .map((p: any) => mapModalProfile(p, followingIds))
-        .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i));
+        .filter((u: any) => u.id)
+        .filter((v, i, a) => a.findIndex((t) => t.id === v.id) === i));
     } catch (err) {
+      console.log('FOLLOW LIST ERROR:', err);
       console.error('Error fetching followers:', err);
       try {
         const res = await fetchFeedApiSafe(apiUrl(`/api/users/${encodeURIComponent(userProfile.id)}/followers-list`));
@@ -504,16 +588,20 @@ export default function ProfilePage() {
           const list = await res.json();
           let followingIds: string[] = [];
           if (user) {
-            const { data: myFollowing } = await supabase
-              .from('follows')
-              .select('following_id')
-              .eq('follower_id', user.id);
-            followingIds = myFollowing?.map(f => f.following_id) || [];
+            const uid = normalizeFollowUserId(user.id);
+            if (uid) {
+              const { data: myFollowing } = await supabase
+                .from('follows')
+                .select('following_id')
+                .eq('follower_id', uid);
+              followingIds = myFollowing?.map((f) => f.following_id) || [];
+            }
           }
           const fallbackProfiles = Array.isArray(list) ? list : [];
           setFollowersList(fallbackProfiles
             .map((p: any) => mapModalProfile(p, followingIds))
-            .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i));
+            .filter((u: any) => u.id)
+            .filter((v, i, a) => a.findIndex((t) => t.id === v.id) === i));
           return;
         }
       } catch (fallbackErr) {
@@ -529,44 +617,57 @@ export default function ProfilePage() {
     if (!userProfile) return;
     setLoadingList(true);
     try {
+      const {
+        data: { user: authUser },
+      } = await supabase.auth.getUser();
+      console.log('AUTH USER:', authUser);
+
+      const ownerId = normalizeFollowUserId(userProfile.id);
+      if (!ownerId) {
+        setFollowingList([]);
+        return;
+      }
+
       const { data: rows, error } = await supabase
         .from('follows')
         .select('following_id')
-        .eq('follower_id', userProfile.id);
+        .eq('follower_id', ownerId);
 
-      console.log('FOLLOW DATA:', { profileId: userProfile.id, followingRows: rows });
+      console.log('FOLLOW LIST DATA (raw follows):', rows);
       if (error) {
-        console.error('FOLLOW ERROR (following query):', error);
+        console.log('FOLLOW LIST ERROR:', error);
         throw error;
       }
       const followedIds = Array.from(
         new Set((rows || []).map((f: any) => f.following_id).filter(Boolean))
       );
+      console.log('FOLLOW USER IDS:', { context: 'following-extracted', ids: followedIds });
 
       if (followedIds.length === 0) {
         setFollowingList([]);
         return;
       }
 
-      const { data: profiles, error: profilesErr } = await supabase
-        .from('profiles')
-        .select('id, username, full_name, display_name, avatar_url')
-        .in('id', followedIds);
-      if (profilesErr) throw profilesErr;
+      const profiles = await fetchProfilesForFollowModal(followedIds, { context: 'following' });
       
       let myFollowingIds: string[] = [];
       if (user) {
-        const { data: myFollowing } = await supabase
-          .from('follows')
-          .select('following_id')
-          .eq('follower_id', user.id);
-        myFollowingIds = myFollowing?.map(f => f.following_id) || [];
+        const uid = normalizeFollowUserId(user.id);
+        if (uid) {
+          const { data: myFollowing } = await supabase
+            .from('follows')
+            .select('following_id')
+            .eq('follower_id', uid);
+          myFollowingIds = myFollowing?.map((f) => f.following_id) || [];
+        }
       }
 
       let resolvedProfiles = profiles || [];
       // Keep profile counts/list source consistent: if Supabase rows are empty, fallback to local API list.
       if (resolvedProfiles.length === 0) {
-        const res = await fetchFeedApiSafe(apiUrl(`/api/users/${encodeURIComponent(userProfile.id)}/following-list`));
+        const res = await fetchFeedApiSafe(
+          apiUrl(`/api/users/${encodeURIComponent(userProfile.id)}/following-list`)
+        );
         if (res && res.ok) {
           const list = await res.json();
           resolvedProfiles = Array.isArray(list) ? list : [];
@@ -575,8 +676,10 @@ export default function ProfilePage() {
 
       setFollowingList(resolvedProfiles
         .map((p: any) => mapModalProfile(p, myFollowingIds))
-        .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i));
+        .filter((u: any) => u.id)
+        .filter((v, i, a) => a.findIndex((t) => t.id === v.id) === i));
     } catch (err) {
+      console.log('FOLLOW LIST ERROR:', err);
       console.error('Error fetching following:', err);
       try {
         const res = await fetchFeedApiSafe(apiUrl(`/api/users/${encodeURIComponent(userProfile.id)}/following-list`));
@@ -584,16 +687,20 @@ export default function ProfilePage() {
           const list = await res.json();
           let myFollowingIds: string[] = [];
           if (user) {
-            const { data: myFollowing } = await supabase
-              .from('follows')
-              .select('following_id')
-              .eq('follower_id', user.id);
-            myFollowingIds = myFollowing?.map(f => f.following_id) || [];
+            const uid = normalizeFollowUserId(user.id);
+            if (uid) {
+              const { data: myFollowing } = await supabase
+                .from('follows')
+                .select('following_id')
+                .eq('follower_id', uid);
+              myFollowingIds = myFollowing?.map((f) => f.following_id) || [];
+            }
           }
           const fallbackProfiles = Array.isArray(list) ? list : [];
           setFollowingList(fallbackProfiles
             .map((p: any) => mapModalProfile(p, myFollowingIds))
-            .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i));
+            .filter((u: any) => u.id)
+            .filter((v, i, a) => a.findIndex((t) => t.id === v.id) === i));
           return;
         }
       } catch (fallbackErr) {

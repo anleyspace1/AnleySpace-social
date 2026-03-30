@@ -192,3 +192,51 @@ export async function fetchSingleProductAsApiShape(id: string): Promise<Record<s
   }
   return null;
 }
+
+/** Default category labels (filter chips + list form). */
+export const MARKETPLACE_CATEGORY_OPTIONS: { name: string; icon: string }[] = [
+  { name: 'All', icon: '🛍️' },
+  { name: 'Electronics', icon: '📱' },
+  { name: 'Vehicles', icon: '🚗' },
+  { name: 'Property', icon: '🏠' },
+  { name: 'Apparel', icon: '👕' },
+  { name: 'Home', icon: '🛋️' },
+];
+
+/**
+ * Insert a listing when Express `/api/marketplace/products` is unavailable (e.g. Vercel static).
+ * Matches server upsert shape for `public.marketplace`.
+ */
+export async function insertMarketplaceListingSupabase(opts: {
+  title: string;
+  description: string;
+  price: number;
+  category: string | null;
+  location: string | null;
+  stock: number | null;
+  imageUrl: string;
+  userId: string;
+}) {
+  const title = opts.title.trim();
+  const description = opts.description.trim();
+  const image_url = opts.imageUrl.trim();
+  const price = Number(opts.price);
+  const stock =
+    opts.stock != null && String(opts.stock).trim() !== '' && Number.isFinite(Number(opts.stock))
+      ? Number(opts.stock)
+      : null;
+
+  const row = {
+    title,
+    description,
+    price,
+    image_url,
+    user_id: opts.userId,
+    category: opts.category?.trim() || null,
+    location: opts.location?.trim() || null,
+    stock,
+  };
+
+  const { data, error } = await supabase.from('marketplace').insert(row).select('id').single();
+  return { data, error };
+}

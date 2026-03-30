@@ -24,10 +24,12 @@ import { Product, Video, Post } from '../types';
 import { cn } from '../lib/utils';
 import { useAuth } from '../contexts/AuthContext';
 import { isSupabaseConfigured, supabase } from '../lib/supabase';
-import { apiUrl } from '../lib/apiOrigin';
+import { apiUrl, fetchFeedApiSafe } from '../lib/apiOrigin';
 import {
   fetchMarketplaceTableRowsAsApiProducts,
+  insertMarketplaceListingSupabase,
   mapMarketplaceRowsToProducts,
+  MARKETPLACE_CATEGORY_OPTIONS,
 } from '../lib/marketplaceRemote';
 import { resolveMarketplaceListingImageUrl } from '../lib/marketplaceImage';
 import { isDemoOrPlaceholderImageUrl, isPlaceholderUsername } from '../lib/realDataGuards';
@@ -170,7 +172,10 @@ export default function MarketplacePage() {
       if (isSupabaseConfigured) {
         data = await fetchMarketplaceTableRowsAsApiProducts();
       } else {
-      const res = await fetch(apiUrl('/api/marketplace/products'));
+      const res = await fetchFeedApiSafe(apiUrl('/api/marketplace/products'));
+      if (!res) {
+        data = await fetchMarketplaceTableRowsAsApiProducts();
+      } else {
       const ct = res.headers.get('content-type') || '';
       let raw: unknown;
       try {
@@ -182,6 +187,7 @@ export default function MarketplacePage() {
       console.log('REELS DATA:', raw);
       if (res.ok && Array.isArray(raw)) data = raw as Record<string, unknown>[];
       if (!data.length) data = await fetchMarketplaceTableRowsAsApiProducts();
+      }
       }
       if (!data.length) {
         setReels([]);
@@ -272,30 +278,34 @@ export default function MarketplacePage() {
       if (isSupabaseConfigured) {
         list = await fetchMarketplaceTableRowsAsApiProducts();
       } else {
-      res = await fetch(apiEndpoint);
-      const ct = res.headers.get('content-type') || '';
-      try {
-        if (!ct.includes('application/json')) payload = null;
-        else payload = await res.json();
-      } catch (parseErr) {
-        console.log('marketplace error:', parseErr);
-        payload = null;
-      }
-      console.log('[Marketplace][diag] API /marketplace/products', {
-        ok: res.ok,
-        status: res.status,
-        contentType: ct,
-        looksLikeJson: ct.includes('application/json'),
-        payloadType: Array.isArray(payload) ? 'array' : payload == null ? 'null' : typeof payload,
-        payloadLength: Array.isArray(payload) ? payload.length : null,
-      });
-      console.log('MARKETPLACE PRODUCTS:', payload);
-      if (res.ok && Array.isArray(payload)) {
-        list = payload as Record<string, unknown>[];
-      }
-      if (!list.length) {
-        list = await fetchMarketplaceTableRowsAsApiProducts();
-      }
+        res = (await fetchFeedApiSafe(apiEndpoint)) ?? undefined;
+        if (!res) {
+          list = await fetchMarketplaceTableRowsAsApiProducts();
+        } else {
+          const ct = res.headers.get('content-type') || '';
+          try {
+            if (!ct.includes('application/json')) payload = null;
+            else payload = await res.json();
+          } catch (parseErr) {
+            console.log('marketplace error:', parseErr);
+            payload = null;
+          }
+          console.log('[Marketplace][diag] API /marketplace/products', {
+            ok: res.ok,
+            status: res.status,
+            contentType: ct,
+            looksLikeJson: ct.includes('application/json'),
+            payloadType: Array.isArray(payload) ? 'array' : payload == null ? 'null' : typeof payload,
+            payloadLength: Array.isArray(payload) ? payload.length : null,
+          });
+          console.log('MARKETPLACE PRODUCTS:', payload);
+          if (res.ok && Array.isArray(payload)) {
+            list = payload as Record<string, unknown>[];
+          }
+          if (!list.length) {
+            list = await fetchMarketplaceTableRowsAsApiProducts();
+          }
+        }
       }
       console.log('Marketplace rows (merged list length):', list.length);
       if (!list.length) {
@@ -349,14 +359,7 @@ export default function MarketplacePage() {
     }
   };
 
-  const categories = [
-    { name: 'All', icon: '🛍️' },
-    { name: 'Electronics', icon: '📱' },
-    { name: 'Vehicles', icon: '🚗' },
-    { name: 'Property', icon: '🏠' },
-    { name: 'Apparel', icon: '👕' },
-    { name: 'Home', icon: '🛋️' },
-  ];
+  const categories = MARKETPLACE_CATEGORY_OPTIONS;
 
   const filteredProducts = products.filter((p) => {
     const matchesSearch = (p.title || '').toLowerCase().includes((searchQuery || '').toLowerCase());
@@ -467,32 +470,82 @@ export default function MarketplacePage() {
       location: formData.get('location') as string,
       stock: Number(formData.get('stock')) || 1,
       image: finalImageUrl,
-      sellerId: user.id
+      sellerId: user.id,
+    };
+    console.log('LIST ITEM PAYLOAD:', payload);
+
+    const runSupabaseInsert = async (): Promise<boolean> => {
+      if (!isSupabaseConfigured) {
+        alert('Cannot save listing: Supabase is not configured. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.');
+        return false;
+      }
+      const { data, error } = await insertMarketplaceListingSupabase({
+        title: payload.title,
+        description: payload.description,
+        price: payload.price,
+        category: (payload.category || '').trim() || null,
+        location: (payload.location || '').trim() || null,
+        stock: Number.isFinite(Number(payload.stock)) ? Number(payload.stock) : null,
+        imageUrl: finalImageUrl,
+        userId: user.id,
+      });
+      console.log('SUPABASE INSERT RESULT:', data, error);
+      if (error) {
+        alert(error.message || 'Could not save listing to Supabase.');
+        return false;
+      }
+      return true;
     };
 
     try {
-      const res = await fetch(apiUrl('/api/marketplace/products'), {
+      const res = await fetchFeedApiSafe(apiUrl('/api/marketplace/products'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
       });
-      let body: unknown;
-      try {
-        body = await res.json();
-      } catch {
-        body = null;
+      console.log('API RESPONSE:', { ok: res?.ok, status: res?.status });
+
+      let body: unknown = null;
+      if (res) {
+        try {
+          body = await res.json();
+        } catch {
+          body = null;
+        }
       }
-      console.log('marketplace data:', body);
-      if (!res.ok) {
-        const msg = (body as { error?: string })?.error ?? res.statusText;
-        console.log('marketplace error:', msg);
-        if (msg) alert(msg);
+      console.log('API RESPONSE BODY:', body);
+
+      if (res && res.ok) {
+        fetchProducts();
+        closePostModal();
         return;
       }
-      fetchProducts();
-      closePostModal();
+
+      const apiErr =
+        body && typeof body === 'object' && 'error' in body && typeof (body as { error?: unknown }).error === 'string'
+          ? (body as { error: string }).error
+          : null;
+      const isExplicitApiValidation =
+        res && res.status >= 400 && res.status < 500 && apiErr;
+
+      if (isExplicitApiValidation) {
+        console.log('marketplace error:', apiErr);
+        alert(apiErr);
+        return;
+      }
+
+      const ok = await runSupabaseInsert();
+      if (ok) {
+        fetchProducts();
+        closePostModal();
+      }
     } catch (err) {
       console.log('marketplace error:', err);
+      const ok = await runSupabaseInsert();
+      if (ok) {
+        fetchProducts();
+        closePostModal();
+      }
     }
   };
 
