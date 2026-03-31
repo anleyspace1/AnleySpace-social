@@ -65,17 +65,17 @@ export default function StoryEditor({ isOpen, onClose, onPublished, content }: S
           const fileName = `${user.id}/${Date.now()}.${fileExt}`;
           const filePath = `stories/${fileName}`;
 
-          const { error: uploadError } = await supabase.storage
+          const { data: uploadData, error: uploadError } = await supabase.storage
             .from('posts') // Reusing "posts" bucket if "stories" doesn't exist
             .upload(filePath, blob, {
               cacheControl: '3600',
               upsert: false
             });
+          console.log('STORAGE UPLOAD:', uploadData, uploadError);
 
           if (uploadError) {
             console.error('Supabase upload error:', uploadError);
-            // If it fails, we'll try to fallback to base64 if it's not too large, 
-            // but the user wants a public URL.
+            throw uploadError;
           } else {
             const { data: publicUrlData } = supabase.storage
               .from('posts')
@@ -85,6 +85,7 @@ export default function StoryEditor({ isOpen, onClose, onPublished, content }: S
           }
         } catch (uploadErr) {
           console.error('Failed to upload image to Supabase:', uploadErr);
+          throw uploadErr instanceof Error ? uploadErr : new Error('Failed to upload story image');
         }
       }
 
@@ -133,7 +134,12 @@ export default function StoryEditor({ isOpen, onClose, onPublished, content }: S
           created_at: nowIso,
           expires_at: expiresAtIso,
         };
-        const { error: insertError } = await supabase.from('stories').insert(payload);
+        const { data: insertData, error: insertError } = await supabase
+          .from('stories')
+          .insert(payload)
+          .select('*')
+          .single();
+        console.log('STORY INSERT RESULT:', insertData, insertError);
         if (insertError) throw insertError;
         published = true;
         console.warn('[StoryEditor] API unavailable; published story via Supabase fallback.');
@@ -166,7 +172,11 @@ export default function StoryEditor({ isOpen, onClose, onPublished, content }: S
       }
     } catch (err) {
       console.error('Publish story error:', err);
-      alert('Failed to publish story. Please try again.');
+      const message =
+        err instanceof Error && err.message
+          ? err.message
+          : 'Failed to publish story. Please try again.';
+      alert(message);
     } finally {
       setIsPublishing(false);
     }

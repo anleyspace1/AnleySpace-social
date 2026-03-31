@@ -715,7 +715,13 @@ export default function StoryPage() {
               </button>
             ))}
           </div>
-          <form onSubmit={handleStoryReplySubmit} className="flex gap-2 w-full pt-1">
+          <form
+            onSubmit={handleStoryReplySubmit}
+            onClick={() => {
+              console.log('SEND CLICKED');
+            }}
+            className="flex gap-2 w-full pt-1"
+          >
             <input
               type="text"
               value={replyText}
@@ -733,7 +739,11 @@ export default function StoryPage() {
               className="flex-1 min-w-0 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2 text-sm text-gray-900 dark:text-gray-100 placeholder:text-gray-500"
             />
             <button
-              type="submit"
+              type="button"
+              onClick={(e) => {
+                console.log('SEND CLICKED');
+                void handleStoryReplySubmit(e as unknown as React.FormEvent);
+              }}
               disabled={!user || replySending || !replyText.trim()}
               className="shrink-0 rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-50"
             >
