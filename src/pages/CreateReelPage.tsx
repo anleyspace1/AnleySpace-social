@@ -25,6 +25,7 @@ import { cn } from '../lib/utils';
 import { supabase } from '../lib/supabase';
 import { apiUrl } from '../lib/apiOrigin';
 import { useAuth } from '../contexts/AuthContext';
+import { rewardInviter } from '../lib/referralRewards';
 import {
   feedStoragePath,
   resolveStorageExtension,
@@ -199,6 +200,7 @@ export default function CreateReelPage() {
         error: insertError ?? null,
       });
       if (insertError) throw insertError;
+      void rewardInviter(user.id, 'first_post', 15);
 
       // Diagnostics only: verify whether direct Supabase table access works under current auth/RLS.
       const { data: probeRows, error: probeError } = await supabase

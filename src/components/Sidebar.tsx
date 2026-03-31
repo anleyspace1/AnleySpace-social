@@ -168,6 +168,21 @@ export default function Sidebar({
           </div>
         </button>
 
+        <SidebarLink
+          to="/support"
+          icon={<Bell size={20} />}
+          label="Support 💬"
+          onClick={onClose}
+          navAppearance={navAppearance}
+        />
+        <SidebarLink
+          to="/ads/create"
+          icon={<ShoppingBag size={20} />}
+          label="Create Ad 📣"
+          onClick={onClose}
+          navAppearance={navAppearance}
+        />
+
         <button 
           onClick={() => signOut()}
           className={cn(

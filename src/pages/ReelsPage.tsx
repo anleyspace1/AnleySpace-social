@@ -50,6 +50,7 @@ import { isPlaceholderUsername } from '../lib/realDataGuards';
 import { getViews, getViralScore } from '../lib/postViews';
 import { getPersonalizedScore, trackWatchTime, updateInterest } from '../lib/personalizedRanking';
 import { maybeRewardViralPost } from '../lib/viralRewards';
+import { startCreatorValidViewWatch, stopCreatorValidViewWatch } from '../lib/creatorValidViews';
 import {
   fetchMonetizationPost,
   sendMonetizationGift,
@@ -305,14 +306,39 @@ export default function ReelsPage() {
           })
           .filter((v: any): v is NonNullable<typeof v> => v != null && !!v.url);
 
-        setVideos(list);
+        let finalList = list;
+        let followingIds: string[] = [];
+        if (activeNav === 'following' && user?.id) {
+          const { data: follows } = await supabase
+            .from('follows')
+            .select('following_id')
+            .eq('follower_id', user.id);
+          followingIds = (follows || [])
+            .map((f: { following_id?: string | null }) => String(f.following_id || '').trim())
+            .filter(Boolean);
+
+          const followingSet = new Set(followingIds);
+          const filtered = list.filter((post: any) => {
+            const ownerId = String(post?.post_user_id || post?.user_id || '').trim();
+            return ownerId && followingSet.has(ownerId);
+          });
+          // Fallback: keep current trending list when user follows nobody or filtered list is empty.
+          finalList = filtered.length > 0 ? filtered : list;
+        }
+
+        console.log('FOLLOWING FEED APPLIED:', {
+          count: finalList.length,
+          followingCount: followingIds.length,
+        });
+
+        setVideos(finalList);
         const targetById = targetId
-          ? list.find((v: any) => String(v.id) === String(targetId))
+          ? finalList.find((v: any) => String(v.id) === String(targetId))
           : null;
         const targetByUrl = targetUrl
-          ? list.find((v: any) => normalizeUrl(String(v.url)) === targetUrl)
+          ? finalList.find((v: any) => normalizeUrl(String(v.url)) === targetUrl)
           : null;
-        const target = targetById || targetByUrl || list[0] || null;
+        const target = targetById || targetByUrl || finalList[0] || null;
         setActiveVideoId(target ? String(target.id) : null);
       } catch (e) {
         console.error('[ReelsPage] fetchReels', e);
@@ -322,7 +348,7 @@ export default function ReelsPage() {
     };
 
     void fetchReels();
-  }, [isSelectedMode, params.id, selectedVideoId, selectedVideoUrl, location.key]);
+  }, [isSelectedMode, params.id, selectedVideoId, selectedVideoUrl, location.key, activeNav, user?.id]);
 
   useEffect(() => {
     const channel = supabase
@@ -1912,6 +1938,9 @@ function VideoPost({
             intersectingRef.current = true;
             pauseAllReelVideos();
             onReelActive(reelId);
+            if (user?.id && reelId) {
+              startCreatorValidViewWatch(user.id, reelId);
+            }
             const v = videoRef.current;
             const b = blurVideoRef.current;
             if (v) {
@@ -1952,6 +1981,9 @@ function VideoPost({
             }
           } else {
             intersectingRef.current = false;
+            if (user?.id && reelId) {
+              void stopCreatorValidViewWatch(user.id, reelId);
+            }
             const v = videoRef.current;
             const b = blurVideoRef.current;
             if (v) {
@@ -1982,7 +2014,12 @@ function VideoPost({
     );
 
     observer.observe(root);
-    return () => observer.disconnect();
+    return () => {
+      if (user?.id && reelId) {
+        void stopCreatorValidViewWatch(user.id, reelId);
+      }
+      observer.disconnect();
+    };
   }, [
     feedScrollRoot,
     onReelActive,
@@ -1993,6 +2030,7 @@ function VideoPost({
     urlOk,
     videoFailed,
     video,
+    user?.id,
   ]);
 
   /** If metadata loads after the reel became active, ensure playback starts once the element is ready. */

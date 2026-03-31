@@ -36,6 +36,7 @@ export default function NotificationsPage() {
 
     const type = String(notification.type || '').toLowerCase();
     const actorId = notification.actor_id;
+    const message = String(notification.message || '').toLowerCase();
 
     if (type === 'inbox_message') {
       if (actorId) navigate(`/messages?userId=${encodeURIComponent(actorId)}`);
@@ -63,6 +64,11 @@ export default function NotificationsPage() {
       const postId = notification.entity_id || notification.story_id;
       if (postId) navigate(`/post/${encodeURIComponent(postId)}`);
       else if (actorId) navigate(`/profile/${encodeURIComponent(actorId)}`);
+      return;
+    }
+    if (type === 'system' || message.includes('withdraw')) {
+      console.log('SYSTEM NOTIFICATION CLICK:', notification);
+      navigate('/wallet');
     }
   };
 

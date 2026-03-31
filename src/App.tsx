@@ -55,6 +55,8 @@ import PostDetailPage from './pages/PostDetailPage';
 import EditProfilePage from './pages/EditProfilePage';
 import CreateReelPage from './pages/CreateReelPage';
 import StoryPage from './pages/StoryPage';
+import SupportPage from './pages/SupportPage';
+import CreateAdPage from './pages/CreateAdPage';
 import AssetsHomePage from './assets_system/pages/AssetsHomePage';
 import CreatorGemsPage from './assets_system/pages/CreatorGemsPage';
 import InfluencerGiftsPage from './assets_system/pages/InfluencerGiftsPage';
@@ -515,6 +517,8 @@ function AppContent() {
                 <Route path="/groups/:groupId/chat" element={<ProtectedRoute><GroupChatPage /></ProtectedRoute>} />
                 <Route path="/hashtag/:tag" element={<ProtectedRoute><HashtagPage /></ProtectedRoute>} />
                 <Route path="/story/:id" element={<ProtectedRoute><StoryPage /></ProtectedRoute>} />
+                <Route path="/support" element={<ProtectedRoute><SupportPage /></ProtectedRoute>} />
+                <Route path="/ads/create" element={<ProtectedRoute><CreateAdPage /></ProtectedRoute>} />
                 <Route path="/notifications" element={<ProtectedRoute><NotificationsPage /></ProtectedRoute>} />
                 <Route path="/post/:id" element={<ProtectedRoute><PostDetailPage /></ProtectedRoute>} />
               </Routes>

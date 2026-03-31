@@ -36,6 +36,9 @@ export default function WalletPage() {
   const [balance, setBalance] = useState(MOCK_USER.coins);
   const [usdBalance, setUsdBalance] = useState(50.00);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [withdrawHistory, setWithdrawHistory] = useState<
+    { id: string; coins: number; status: string; created_at: string }[]
+  >([]);
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
@@ -67,6 +70,28 @@ export default function WalletPage() {
 
     fetchData();
   }, []);
+
+  useEffect(() => {
+    const fetchWithdrawHistory = async () => {
+      if (!user) return;
+      const { data, error } = await supabase
+        .from('withdraw_requests')
+        .select('*')
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: false });
+      console.log('WITHDRAW HISTORY:', data, error);
+      if (error) return;
+      setWithdrawHistory(
+        (Array.isArray(data) ? data : []).map((row: any) => ({
+          id: String(row.id),
+          coins: Number(row.coins) || 0,
+          status: String(row.status || 'pending'),
+          created_at: String(row.created_at || ''),
+        }))
+      );
+    };
+    void fetchWithdrawHistory();
+  }, [user?.id]);
 
   const { buyCoinsMenuOpen, toggleBuyCoinsMenu, closeBuyCoinsMenu } = useBuyCoins();
   const [isWithdrawModalOpen, setIsWithdrawModalOpen] = useState(false);
@@ -364,6 +389,41 @@ export default function WalletPage() {
               </div>
             </div>
           ))}
+        </div>
+      </section>
+
+      {/* Withdraw History */}
+      <section className="px-4 lg:px-0 mt-10">
+        <div className="flex items-center justify-between mb-6">
+          <h2 className="text-xl font-bold">Withdraw History</h2>
+        </div>
+        <div className="space-y-0 lg:space-y-4">
+          {withdrawHistory.length === 0 ? (
+            <div className="bg-white dark:bg-gray-900 p-4 rounded-none lg:rounded-2xl border-b lg:border border-gray-100 dark:border-gray-800 text-sm text-gray-500">
+              No withdraw history found
+            </div>
+          ) : (
+            withdrawHistory.map((w) => {
+              const status = String(w.status || '').toLowerCase();
+              const statusClass =
+                status === 'approved'
+                  ? 'text-green-600 dark:text-green-400'
+                  : status === 'rejected'
+                    ? 'text-red-600 dark:text-red-400'
+                    : 'text-yellow-600 dark:text-yellow-400';
+              return (
+                <div key={w.id} className="bg-white dark:bg-gray-900 p-4 rounded-none lg:rounded-2xl flex items-center justify-between border-b lg:border border-gray-100 dark:border-gray-800">
+                  <div>
+                    <h4 className="font-bold">{w.coins} coins</h4>
+                    <p className="text-xs text-gray-500">
+                      {w.created_at ? new Date(w.created_at).toLocaleString() : ''}
+                    </p>
+                  </div>
+                  <div className={`text-sm font-bold uppercase ${statusClass}`}>{w.status}</div>
+                </div>
+              );
+            })
+          )}
         </div>
       </section>
 

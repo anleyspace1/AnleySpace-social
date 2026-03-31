@@ -26,8 +26,11 @@ function StatusBadge({ status }: { status: string }) {
 }
 
 export default function AdminWithdrawPage() {
-  const { user } = useAuth();
-  const isAdmin = user?.email === ADMIN_EMAIL;
+  const { user, profile, loading: authLoading } = useAuth();
+  console.log('ADMIN CHECK:', profile);
+  const role = typeof profile?.role === 'string' ? profile.role.trim().toLowerCase() : '';
+  const isAdmin = role === 'admin' || user?.email === ADMIN_EMAIL;
+  const waitingProfile = !!user && !profile;
   const [requests, setRequests] = useState<WithdrawRequest[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>('');
@@ -84,6 +87,7 @@ export default function AdminWithdrawPage() {
     }
   };
 
+  if (authLoading || waitingProfile) return null;
   if (!canRender) return null;
 
   return (

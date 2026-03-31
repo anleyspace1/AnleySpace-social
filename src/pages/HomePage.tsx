@@ -54,6 +54,10 @@ import { getViews } from '../lib/postViews';
 import { hasRecordedViewThisSession, markPostViewRecordedSession } from '../lib/postViewTracking';
 import { fetchCommentsWithProfiles, resolveProfileUsername } from '../lib/postComments';
 import { notifyLikeCommentFollowDm } from '../lib/supabaseNotifications';
+import { rewardInviter } from '../lib/referralRewards';
+import { getUserTopInterest, trackUserBehavior } from '../lib/userBehavior';
+import { incrementCoins } from '../lib/coinsWallet';
+import { startCreatorValidViewWatch, stopCreatorValidViewWatch } from '../lib/creatorValidViews';
 
 /** Home feed: white cards on #F5F6FA (see App layout when path is `/`). */
 const homeCard =
@@ -1179,6 +1183,7 @@ function CreatePostModal({
       }
 
       onClose();
+      void rewardInviter(user.id, 'first_post', 15);
       onPostCreated?.();
     } catch (err: any) {
       console.error('CreatePostModal publish error:', err);
@@ -1400,6 +1405,28 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
   const { user } = useAuth();
   const navigate = useNavigate();
   const [posts, setPosts] = useState<any[]>([]);
+  const [ads, setAds] = useState<
+    Array<{
+      id: string;
+      title?: string | null;
+      image_url: string;
+      link_url: string;
+      clicks?: number | null;
+      impressions?: number | null;
+      created_at?: string | null;
+      ends_at?: string | null;
+      target_country?: string | null;
+      target_interest?: string | null;
+      target_min_age?: number | null;
+      target_max_age?: number | null;
+    }>
+  >([]);
+  const [adViewerProfile, setAdViewerProfile] = useState<{
+    country?: string | null;
+    interests?: string[] | null;
+    age?: number | null;
+  } | null>(null);
+  const [userTopInterest, setUserTopInterest] = useState<string | null>(null);
   const [suggestedReels, setSuggestedReels] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [userStoriesMap, setUserStoriesMap] = useState<Record<string, any[]>>({});
@@ -1487,10 +1514,17 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
           const comments_count = commentsMergeOk
             ? commentsByPost[post.id] ?? 0
             : post.comments_count ?? 0;
+          const createdMs = new Date(post.created_at || 0).getTime();
+          const hoursRaw = (Date.now() - createdMs) / (1000 * 60 * 60);
+          const hours = Number.isFinite(hoursRaw) ? Math.max(hoursRaw, 0) : 0;
+          const views = Number(post.views ?? post.view_count ?? 0) || 0;
+          const score = (Number(likes_count) || 0) * 2 + (Number(comments_count) || 0) * 3 + views * 0.5;
+          const finalScore = hours > 0 ? score / hours : score;
           return {
             ...post,
             likes_count,
             comments_count,
+            finalScore,
             profiles: prof || null,
             username: prof?.username || null,
             avatar_url: prof?.avatar_url || null,
@@ -1504,7 +1538,33 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
           return true;
         });
 
-      setPosts(mappedPosts);
+      const trendingSorted = [...mappedPosts].sort(
+        (a: any, b: any) => (Number(b.finalScore) || 0) - (Number(a.finalScore) || 0)
+      );
+      const newestSorted = [...mappedPosts].sort(
+        (a: any, b: any) =>
+          new Date(String(b.created_at || 0)).getTime() - new Date(String(a.created_at || 0)).getTime()
+      );
+
+      const trendingTake = Math.floor(trendingSorted.length * 0.7);
+      const mixedPosts: any[] = [];
+      const usedIds = new Set<string>();
+
+      for (const post of trendingSorted.slice(0, trendingTake)) {
+        const id = String(post?.id || '');
+        if (!id || usedIds.has(id)) continue;
+        usedIds.add(id);
+        mixedPosts.push(post);
+      }
+      for (const post of newestSorted) {
+        const id = String(post?.id || '');
+        if (!id || usedIds.has(id)) continue;
+        usedIds.add(id);
+        mixedPosts.push(post);
+      }
+
+      console.log('HOME TRENDING APPLIED:', mixedPosts.slice(0, 5));
+      setPosts(mixedPosts);
     } catch (err) {
       console.error('Error in fetchPosts:', err);
       setPosts([]);
@@ -1516,6 +1576,54 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
   useEffect(() => {
     fetchPosts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshKey, user?.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const fetchViewerProfile = async () => {
+      if (!user?.id) {
+        if (!cancelled) setAdViewerProfile(null);
+        if (!cancelled) setUserTopInterest(null);
+        return;
+      }
+      const { data } = await supabase
+        .from('profiles')
+        .select('country, interests, age')
+        .eq('id', user.id)
+        .maybeSingle();
+      if (!cancelled) {
+        setAdViewerProfile(
+          (data as { country?: string | null; interests?: string[] | null; age?: number | null } | null) || null
+        );
+        const top = await getUserTopInterest(user.id);
+        if (!cancelled) setUserTopInterest(top);
+      }
+    };
+    const fetchActiveAds = async () => {
+      const nowIso = new Date().toISOString();
+      const { data, error } = await supabase
+        .from('ads')
+        .select('id, title, image_url, link_url, clicks, impressions, created_at, ends_at, target_country, target_interest, target_min_age, target_max_age')
+        .eq('is_active', true)
+        .or(`starts_at.is.null,starts_at.lte.${nowIso}`)
+        .or(`ends_at.is.null,ends_at.gte.${nowIso}`)
+        .order('created_at', { ascending: false });
+      if (error) {
+        console.warn('[Home] ads fetch failed:', error);
+        if (!cancelled) setAds([]);
+        return;
+      }
+      if (!cancelled) {
+        setAds(
+          (data || []).filter((a: any) => String(a?.image_url || '').trim() && String(a?.link_url || '').trim())
+        );
+      }
+    };
+    void fetchViewerProfile();
+    void fetchActiveAds();
+    return () => {
+      cancelled = true;
+    };
   }, [refreshKey, user?.id]);
 
   useEffect(() => {
@@ -1646,56 +1754,157 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
   };
 
   const filteredPosts = posts;
+  const targetedAds = useMemo(() => {
+    const viewerCountry = String(adViewerProfile?.country || '').trim().toLowerCase();
+    const viewerInterests = Array.isArray(adViewerProfile?.interests)
+      ? adViewerProfile!.interests!.map((x) => String(x || '').trim().toLowerCase()).filter(Boolean)
+      : [];
+    const viewerAge = Number(adViewerProfile?.age ?? NaN);
+
+    const matched = ads.filter((ad) => {
+      const tCountry = String(ad.target_country || '').trim().toLowerCase();
+      const tInterest = String(ad.target_interest || '').trim().toLowerCase();
+      const tMin = ad.target_min_age != null ? Number(ad.target_min_age) : null;
+      const tMax = ad.target_max_age != null ? Number(ad.target_max_age) : null;
+
+      const countryMatch = !tCountry || (!!viewerCountry && viewerCountry === tCountry);
+      const interestMatch = !tInterest || viewerInterests.includes(tInterest);
+      const minMatch = tMin == null || (Number.isFinite(viewerAge) && viewerAge >= tMin);
+      const maxMatch = tMax == null || (Number.isFinite(viewerAge) && viewerAge <= tMax);
+      const match = countryMatch && interestMatch && minMatch && maxMatch;
+      console.log('TARGETED ADS FILTER:', { user: adViewerProfile, ad, match });
+      return match;
+    });
+    return matched.length > 0 ? matched : ads;
+  }, [ads, adViewerProfile]);
+  const smartMatchedAds = useMemo(() => {
+    const top = String(userTopInterest || '').trim().toLowerCase();
+    if (!top) return [];
+    const matched = ads.filter((ad) => String(ad.target_interest || '').trim().toLowerCase() === top);
+    matched.forEach((ad) => {
+      console.log('SMART ADS MATCH:', { userTopInterest: top, ad, score: 1 });
+    });
+    return matched;
+  }, [ads, userTopInterest]);
+  const feedItems = useMemo(() => {
+    const adPoolRaw = smartMatchedAds.length > 0 ? smartMatchedAds : targetedAds;
+    const rankedAds = [...adPoolRaw].sort((a: any, b: any) => {
+      const score = (ad: any) => {
+        const clicks = Number(ad?.clicks || 0);
+        const impressions = Number(ad?.impressions || 0);
+        const ctr = impressions > 0 ? clicks / impressions : 0;
+
+        const createdAtMs = Date.parse(String(ad?.created_at || ''));
+        const endsAtMs = Date.parse(String(ad?.ends_at || ''));
+        const durationDays =
+          Number.isFinite(createdAtMs) && Number.isFinite(endsAtMs) && endsAtMs > createdAtMs
+            ? (endsAtMs - createdAtMs) / (1000 * 60 * 60 * 24)
+            : 0;
+        const durationBoost = durationDays >= 30 ? 0.6 : durationDays >= 7 ? 0.25 : 0;
+
+        const hasReachedGuarantee = impressions >= 50;
+        const lowPerformancePenalty =
+          hasReachedGuarantee && impressions > 100 && ctr < 0.01 ? 0.6 : 0;
+
+        const priority = ctr + durationBoost - lowPerformancePenalty;
+        console.log('ADS RANKING:', { ctr, impressions, priority });
+        return priority;
+      };
+      return score(b) - score(a);
+    });
+
+    const adPool = rankedAds;
+    if (filteredPosts.length === 0 || adPool.length === 0) {
+      return filteredPosts.map((p) => ({ kind: 'post' as const, post: p }));
+    }
+    const items: Array<
+      | { kind: 'post'; post: any }
+      | {
+          kind: 'ad';
+          ad: {
+            id: string;
+            title?: string | null;
+            image_url: string;
+            link_url: string;
+            target_country?: string | null;
+            target_interest?: string | null;
+            target_min_age?: number | null;
+            target_max_age?: number | null;
+          };
+        }
+    > = [];
+    let adIndex = 0;
+    filteredPosts.forEach((post, idx) => {
+      items.push({ kind: 'post', post });
+      if ((idx + 1) % 5 === 0) {
+        const ad = adPool[adIndex % adPool.length];
+        if (ad) items.push({ kind: 'ad', ad });
+        adIndex += 1;
+      }
+    });
+    return items;
+  }, [filteredPosts, smartMatchedAds, targetedAds]);
 
   return (
     <div className="space-y-6 pb-4">
       {loading && filteredPosts.length === 0 ? (
         <FeedSkeleton />
       ) : filteredPosts.length > 0 ? (
-        filteredPosts.map((post, index) => (
-          <React.Fragment key={post.id}>
-            <PostItem
-              post={post}
-              index={index}
-              onDelete={() => handleDeletePost(post.id, post.user_id)}
-              onPostUpdated={(postId, newContent) => {
-                setPosts((prev) =>
-                  prev.map((p) => (p.id === postId ? { ...p, content: newContent } : p))
-                );
-              }}
-              onPostViewRecorded={(postId) => {
-                setPosts((prev) =>
-                  prev.map((p) =>
-                    p.id === postId
-                      ? { ...p, view_count: getViews(p) + 1, views: getViews(p) + 1 }
-                      : p
-                  )
-                );
-              }}
-              userStoriesMap={userStoriesMap}
-            />
-            {index === 0 && (
-              <div className="xl:hidden space-y-6">
-                <PeopleYouMayKnow />
-                <TrendingSection />
-              </div>
-            )}
-            {(index + 1) % 6 === 0 && suggestedReels.length > 0 && (
-              <SuggestedReelsStrip
-                reels={suggestedReels}
-                onOpenReel={(reel) => {
-                  navigate(`/reels/${reel.id}?autoplaySound=1`, {
-                    state: {
-                      selectedReelId: reel.id,
-                      videoId: reel.id,
-                      videoUrl: reel.video_url,
-                    },
-                  });
+        feedItems.map((item, itemIndex) => {
+          if (item.kind === 'ad') {
+            return (
+              <React.Fragment key={`ad-${item.ad.id}-${itemIndex}`}>
+                <SponsoredAdCard ad={item.ad} />
+              </React.Fragment>
+            );
+          }
+          const post = item.post;
+          const index = filteredPosts.findIndex((p) => String(p.id) === String(post.id));
+          return (
+            <React.Fragment key={post.id}>
+              <PostItem
+                post={post}
+                index={index}
+                onDelete={() => handleDeletePost(post.id, post.user_id)}
+                onPostUpdated={(postId, newContent) => {
+                  setPosts((prev) =>
+                    prev.map((p) => (p.id === postId ? { ...p, content: newContent } : p))
+                  );
                 }}
+                onPostViewRecorded={(postId) => {
+                  setPosts((prev) =>
+                    prev.map((p) =>
+                      p.id === postId
+                        ? { ...p, view_count: getViews(p) + 1, views: getViews(p) + 1 }
+                        : p
+                    )
+                  );
+                }}
+                userStoriesMap={userStoriesMap}
               />
-            )}
-          </React.Fragment>
-        ))
+              {index === 0 && (
+                <div className="xl:hidden space-y-6">
+                  <PeopleYouMayKnow />
+                  <TrendingSection />
+                </div>
+              )}
+              {(index + 1) % 6 === 0 && suggestedReels.length > 0 && (
+                <SuggestedReelsStrip
+                  reels={suggestedReels}
+                  onOpenReel={(reel) => {
+                    navigate(`/reels/${reel.id}?autoplaySound=1`, {
+                      state: {
+                        selectedReelId: reel.id,
+                        videoId: reel.id,
+                        videoUrl: reel.video_url,
+                      },
+                    });
+                  }}
+                />
+              )}
+            </React.Fragment>
+          );
+        })
       ) : (
         <div className={cn(homeCard, 'p-8 text-center')}>
           <div className="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-4">
@@ -1706,6 +1915,54 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
         </div>
       )}
     </div>
+  );
+}
+
+function SponsoredAdCard({
+  ad,
+}: {
+  ad: { id: string; title?: string | null; image_url: string; link_url: string };
+}) {
+  const title = String(ad.title || 'Sponsored').trim() || 'Sponsored';
+  useEffect(() => {
+    let cancelled = false;
+    const trackImpression = async () => {
+      if (cancelled) return;
+      try {
+        await supabase.rpc('increment_ads_impressions', { p_ad_id: ad.id });
+      } catch {
+        /* non-fatal analytics */
+      }
+    };
+    void trackImpression();
+    return () => {
+      cancelled = true;
+    };
+  }, [ad.id]);
+
+  const handleAdClick = async (e: React.MouseEvent<HTMLAnchorElement>) => {
+    e.preventDefault();
+    console.log('AD CLICK:', ad.id);
+    try {
+      await supabase.rpc('increment_ads_clicks', { p_ad_id: ad.id });
+    } catch {
+      const { data } = await supabase.from('ads').select('clicks').eq('id', ad.id).maybeSingle();
+      const nextClicks = Number((data as { clicks?: number | null } | null)?.clicks || 0) + 1;
+      await supabase.from('ads').update({ clicks: nextClicks }).eq('id', ad.id);
+    } finally {
+      window.open(ad.link_url, '_blank', 'noopener,noreferrer');
+    }
+  };
+  return (
+    <article className={cn(homeCard, 'overflow-hidden')}>
+      <a href={ad.link_url} target="_blank" rel="noreferrer noopener" className="block" onClick={handleAdClick}>
+        <img src={ad.image_url} alt={title} className="w-full max-h-[360px] object-cover" referrerPolicy="no-referrer" />
+        <div className="p-3">
+          <p className="text-[10px] font-black uppercase tracking-wider text-indigo-600">Sponsored</p>
+          <p className="mt-1 text-sm font-semibold text-gray-900 dark:text-gray-100">{title}</p>
+        </div>
+      </a>
+    </article>
   );
 }
 
@@ -2025,6 +2282,9 @@ function PostItem({
       if (entry.isIntersecting) {
         void node.play().catch(() => {});
         const pid = post?.id != null ? String(post.id) : '';
+        if (user?.id && pid) {
+          startCreatorValidViewWatch(user.id, pid);
+        }
         if (
           pid &&
           !hasVideoViewCountedRef.current &&
@@ -2034,6 +2294,15 @@ function PostItem({
           markPostViewRecordedSession(pid);
           const next = getViews(post) + 1;
           onPostViewRecorded?.(pid);
+          if (user?.id) {
+            void trackUserBehavior({
+              userId: user.id,
+              actionType: 'view',
+              targetType: 'video',
+              targetId: pid,
+              category: String(post?.category || 'video'),
+            });
+          }
           void supabase
             .from('posts')
             .update({ view_count: next })
@@ -2046,6 +2315,10 @@ function PostItem({
             });
         }
       } else {
+        const pid = post?.id != null ? String(post.id) : '';
+        if (user?.id && pid) {
+          void stopCreatorValidViewWatch(user.id, pid);
+        }
         node.pause();
       }
     };
@@ -2056,9 +2329,13 @@ function PostItem({
 
     observer.observe(node);
     return () => {
+      const pid = post?.id != null ? String(post.id) : '';
+      if (user?.id && pid) {
+        void stopCreatorValidViewWatch(user.id, pid);
+      }
       observer.disconnect();
     };
-  }, [canPlayVideo, feedVideoError, videoUrl, videoRef, post, onPostViewRecorded]);
+  }, [canPlayVideo, feedVideoError, videoUrl, videoRef, post, onPostViewRecorded, user?.id]);
 
   // Kick off autoplay after mount / src change (ref may attach next frame; muted comes from <video muted> + touch sync)
   useEffect(() => {
@@ -2273,6 +2550,13 @@ function PostItem({
                   storyId: post.id,
                   entityId: post.id,
                 });
+                notifyLikeCommentFollowDm({
+                  recipientUserId: ownerLike,
+                  type: 'system',
+                  message: 'Someone interacted with your post 🔥',
+                  storyId: post.id,
+                  entityId: post.id,
+                });
               }
             }
           }
@@ -2290,7 +2574,22 @@ function PostItem({
             storyId: post.id,
             entityId: post.id,
           });
+          notifyLikeCommentFollowDm({
+            recipientUserId: ownerLike,
+            type: 'system',
+            message: 'Someone interacted with your post 🔥',
+            storyId: post.id,
+            entityId: post.id,
+          });
         }
+        void trackUserBehavior({
+          userId: user.id,
+          actionType: 'like',
+          targetType: 'post',
+          targetId: String(post.id),
+          category: String(post.category || (post.video_url ? 'video' : 'post')),
+        });
+        void rewardInviter(user.id, 'first_like', 5);
       }
 
       await fetchLikesCount();
@@ -2402,7 +2701,22 @@ function PostItem({
           storyId: post.id,
           entityId: post.id,
         });
+        notifyLikeCommentFollowDm({
+          recipientUserId: ownerComment,
+          type: 'system',
+          message: 'Someone interacted with your post 🔥',
+          storyId: post.id,
+          entityId: post.id,
+        });
       }
+      void trackUserBehavior({
+        userId: user.id,
+        actionType: 'comment',
+        targetType: 'post',
+        targetId: String(post.id),
+        category: String(post.category || (post.video_url ? 'video' : 'post')),
+      });
+      void rewardInviter(user.id, 'first_comment', 5);
 
       const newCommentObj = {
         id: data.id,
@@ -2434,7 +2748,52 @@ function PostItem({
   };
 
   const handleShare = () => {
+    const link = `${window.location.origin}/post/${encodeURIComponent(String(post?.id || ''))}`;
+    if (post?.id) {
+      void navigator.clipboard.writeText(link).catch(() => {});
+      if (user?.id) {
+        void incrementCoins(user.id, 2);
+      }
+      console.log('VIRAL EVENT:', { event: 'share_post', postId: post.id, link });
+    }
+    if (user?.id) {
+      void rewardInviter(user.id, 'first_share', 5);
+    }
     setIsShareModalOpen(true);
+  };
+
+  const handleReportPost = async () => {
+    if (!user?.id) {
+      alert('Please sign in to report posts.');
+      return;
+    }
+    const reason = (window.prompt('Reason for report?') || '').trim();
+    if (!reason || !reason.trim()) {
+      alert('Please enter a reason');
+      return;
+    }
+    const { data, error } = await supabase
+      .from('reports')
+      .insert({
+        reporter_id: user.id,
+        post_id: post.id,
+        reason,
+      })
+      .select('*');
+    console.log('REPORT INSERT:', data, error);
+    if (error) {
+      if (String((error as { code?: string; message?: string })?.code || '') === '23505') {
+        alert('You have already reported this post');
+        return;
+      }
+      if (String((error as { message?: string })?.message || '').toLowerCase().includes('duplicate')) {
+        alert('You have already reported this post');
+        return;
+      }
+      alert(error.message || 'Failed to submit report.');
+      return;
+    }
+    alert('Report submitted.');
   };
 
   const handleCopyLink = () => {
@@ -2704,7 +3063,7 @@ function PostItem({
           isMe={postUser.isMe}
           onDelete={onDelete}
           onEdit={() => setIsEditing(true)}
-          onReport={() => alert('Post reported. Thank you for keeping our community safe.')}
+          onReport={() => void handleReportPost()}
           onShare={handleShare}
           onCopyLink={handleCopyLink}
         />

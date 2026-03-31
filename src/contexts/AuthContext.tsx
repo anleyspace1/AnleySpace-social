@@ -3,6 +3,7 @@ import { User } from '@supabase/supabase-js';
 import { supabase, isSupabaseConfigured, invalidateSessionCache } from '../lib/supabase';
 import { apiUrl } from '../lib/apiOrigin';
 import { loadPersonalizationFromSupabase } from '../lib/personalizedRanking';
+import { incrementCoins } from '../lib/coinsWallet';
 
 interface AuthContextType {
   user: User | null;
@@ -15,6 +16,37 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const applyDailyStreakReward = async (userId: string) => {
+    try {
+      const today = new Date();
+      const todayDate = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+      const todayIso = todayDate.toISOString().slice(0, 10);
+      const yesterdayIso = new Date(todayDate.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+      const { data: row } = await supabase
+        .from('profiles')
+        .select('streak_count, last_login_date')
+        .eq('id', userId)
+        .maybeSingle();
+
+      const lastDate = String((row as { last_login_date?: string | null } | null)?.last_login_date || '').slice(0, 10);
+      if (lastDate === todayIso) return;
+
+      const prevStreak = Number((row as { streak_count?: number | null } | null)?.streak_count || 0);
+      const nextStreak = lastDate === yesterdayIso ? prevStreak + 1 : 1;
+      const coinsToAward = nextStreak >= 7 ? 10 : 2;
+
+      await supabase
+        .from('profiles')
+        .update({ streak_count: nextStreak, last_login_date: todayIso })
+        .eq('id', userId);
+      await incrementCoins(userId, coinsToAward);
+      console.log('VIRAL EVENT:', { event: 'daily_streak', userId, streak: nextStreak, coins: coinsToAward });
+    } catch (e) {
+      console.warn('daily streak reward failed:', e);
+    }
+  };
+
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<any | null>(null);
   const [loading, setLoading] = useState(true);
@@ -85,6 +117,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
       }
       if (!profileRow) return;
+      if (profileRow?.is_banned) {
+        alert('Your account has been banned');
+        await supabase.auth.signOut();
+        window.location.href = '/login';
+        return;
+      }
       setProfile(profileRow);
       
       // Sync with local SQLite DB
@@ -135,6 +173,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (currentUser) {
         void loadPersonalizationFromSupabase(currentUser.id);
         fetchProfile(currentUser.id);
+        void applyDailyStreakReward(currentUser.id);
       } else {
         setProfile(null);
       }

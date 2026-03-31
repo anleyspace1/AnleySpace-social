@@ -1,0 +1,2 @@
+ALTER TABLE public.ads
+  ADD COLUMN IF NOT EXISTS clicks integer NOT NULL DEFAULT 0;

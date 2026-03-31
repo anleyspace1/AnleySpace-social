@@ -1,6 +1,8 @@
 import { supabase } from './supabase';
 import { apiUrl, fetchFeedApiSafe } from './apiOrigin';
 import { notifyLikeCommentFollowDm } from './supabaseNotifications';
+import { rewardInviter } from './referralRewards';
+import { trackUserBehavior } from './userBehavior';
 
 /**
  * Best-effort Express API (local/dev), then always persist to Supabase so static hosting (e.g. Vercel)
@@ -76,6 +78,25 @@ export async function persistFollowEdge(opts: {
           recipientUserId: followingId,
           type: 'follow',
           message: `${name} started following you`,
+        });
+        notifyLikeCommentFollowDm({
+          recipientUserId: followingId,
+          type: 'system',
+          message: 'Someone interacted with your post 🔥',
+        });
+        const { count } = await supabase
+          .from('follows')
+          .select('*', { count: 'exact', head: true })
+          .eq('follower_id', followerId);
+        if (typeof count === 'number' && count >= 3) {
+          await rewardInviter(followerId, 'follow_3', 10);
+        }
+        await trackUserBehavior({
+          userId: followerId,
+          actionType: 'follow',
+          targetType: 'user',
+          targetId: followingId,
+          category: 'user',
         });
       })();
     }

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { motion } from 'motion/react';
 import { 
   Share2, 
@@ -15,16 +15,35 @@ import {
   QrCode
 } from 'lucide-react';
 import { MOCK_USER } from '../constants';
+import { useAuth } from '../contexts/AuthContext';
+import { supabase } from '../lib/supabase';
 
 export default function InviteEarnPage() {
+  const { user } = useAuth();
   const [copied, setCopied] = useState(false);
-  const referralCode = "ANL8F92K";
-  const referralLink = `anleyspace.com/join/${referralCode}`;
+  const [totalEarned, setTotalEarned] = useState(0);
+  const [progress, setProgress] = useState(0);
+  const referralCode = String(user?.id || 'ANL8F92K').slice(0, 8).toUpperCase();
+  const referralLink = `${window.location.origin}/invite?code=${encodeURIComponent(referralCode)}`;
 
   const copyToClipboard = () => {
     navigator.clipboard.writeText(referralLink);
     setCopied(true);
+    console.log('VIRAL EVENT:', { event: 'invite_link_copied', referralLink });
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const shareInviteLink = async () => {
+    try {
+      if (navigator.share) {
+        await navigator.share({ title: 'Join me on AnleySpace', text: 'Join using my invite link', url: referralLink });
+      } else {
+        await navigator.clipboard.writeText(referralLink);
+      }
+      console.log('VIRAL EVENT:', { event: 'invite_link_shared', referralLink });
+    } catch {
+      /* user cancelled */
+    }
   };
 
   const recentInvites = [
@@ -32,6 +51,28 @@ export default function InviteEarnPage() {
     { id: 'i2', name: 'Marie Paul', time: 'Yesterday, 8:10 PM', amount: 50, avatar: 'https://picsum.photos/seed/marie/100/100' },
     { id: 'i3', name: 'Robens Jean', time: 'Apr 22, 3:45 PM', amount: 50, avatar: 'https://picsum.photos/seed/robens/100/100' },
   ];
+
+  useEffect(() => {
+    const loadReferralProgress = async () => {
+      if (!user?.id) {
+        setTotalEarned(0);
+        setProgress(0);
+        return;
+      }
+      const { data: rewards } = await supabase
+        .from('referral_rewards')
+        .select('coins')
+        .eq('inviter_id', user.id);
+
+      const earned = (rewards || []).reduce(
+        (sum, r) => sum + Number((r as { coins?: number | null })?.coins || 0),
+        0
+      );
+      setTotalEarned(earned);
+      setProgress(Math.min((earned / 50) * 100, 100));
+    };
+    void loadReferralProgress();
+  }, [user?.id]);
 
   return (
     <motion.div 
@@ -92,7 +133,7 @@ export default function InviteEarnPage() {
               </div>
               <div>
                 <span className="text-sm opacity-80">Total Coins Earned</span>
-                <h2 className="text-2xl font-bold">600 Coins</h2>
+                <h2 className="text-2xl font-bold">{totalEarned} Coins</h2>
               </div>
             </div>
           </div>
@@ -100,10 +141,10 @@ export default function InviteEarnPage() {
           <div className="mt-8 pt-8 border-t border-white/10">
             <div className="flex items-center justify-between mb-2">
               <span className="text-sm font-medium">Bonus Progress</span>
-              <span className="text-sm font-bold">75%</span>
+              <span className="text-sm font-bold">{Math.round(progress)}%</span>
             </div>
             <div className="h-2 bg-white/20 rounded-full overflow-hidden">
-              <div className="h-full bg-yellow-400 w-3/4"></div>
+              <div className="h-full bg-yellow-400" style={{ width: `${progress}%` }}></div>
             </div>
             <p className="text-xs mt-3 opacity-80">Invite 5 more friends to unlock 200 bonus coins!</p>
           </div>
@@ -114,7 +155,7 @@ export default function InviteEarnPage() {
       <section className="mb-12">
         <h2 className="text-xl font-bold mb-6 text-center">Share Now</h2>
         <div className="flex justify-center gap-6">
-          <ShareButton icon={<MessageCircle size={28} />} label="WhatsApp" color="bg-green-500" />
+          <ShareButton icon={<MessageCircle size={28} />} label="WhatsApp" color="bg-green-500" onClick={shareInviteLink} />
           <ShareButton icon={<Facebook size={28} />} label="Facebook" color="bg-blue-600" />
           <ShareButton icon={<Telegram size={28} />} label="Telegram" color="bg-sky-500" />
           <ShareButton icon={<MoreHorizontal size={28} />} label="More" color="bg-gray-600" />
@@ -146,9 +187,9 @@ export default function InviteEarnPage() {
   );
 }
 
-function ShareButton({ icon, label, color }: { icon: React.ReactNode; label: string; color: string }) {
+function ShareButton({ icon, label, color, onClick }: { icon: React.ReactNode; label: string; color: string; onClick?: () => void }) {
   return (
-    <button className="flex flex-col items-center gap-2 group">
+    <button className="flex flex-col items-center gap-2 group" onClick={onClick}>
       <div className={`w-16 h-16 ${color} text-white rounded-[1.5rem] flex items-center justify-center shadow-lg group-hover:scale-110 transition-transform`}>
         {icon}
       </div>

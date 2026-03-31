@@ -40,6 +40,7 @@ import { ProfileHeaderSkeleton } from '../components/LoadingSkeletons';
 import { fetchCommentsWithProfiles, type CommentForDisplay } from '../lib/postComments';
 import { persistFollowEdge } from '../lib/followsClient';
 import { notifyLikeCommentFollowDm } from '../lib/supabaseNotifications';
+import { rewardInviter } from '../lib/referralRewards';
 
 function feedApiResponseIsJson(res: Response): boolean {
   const ct = res.headers.get('content-type') || '';
@@ -117,6 +118,12 @@ export default function ProfilePage() {
   const [loading, setLoading] = useState(true);
   const [userPosts, setUserPosts] = useState<Post[]>([]);
   const [savedItems, setSavedItems] = useState<Post[]>([]);
+  const [showSecurity, setShowSecurity] = useState(false);
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [showNewPassword, setShowNewPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+  const [updatingPassword, setUpdatingPassword] = useState(false);
 
   const isOwnProfile = !profileIdParam || (myProfile && profileIdParam === myProfile.id);
 
@@ -478,6 +485,7 @@ export default function ProfilePage() {
       const res = await fetch(apiUrl(`/api/user/${user.id}/verify`), { method: 'POST' });
       if (res.ok) {
         setIsVerified(true);
+        void rewardInviter(user.id, 'verify', 10);
         alert('Congratulations! Your profile is now verified. 🎖️');
       }
     } catch (err) {
@@ -805,6 +813,39 @@ export default function ProfilePage() {
     }
   };
 
+  const handleChangePassword = async () => {
+    const pwd = newPassword.trim();
+    const confirm = confirmPassword.trim();
+    if (pwd.length < 6) {
+      alert('Password must be at least 6 characters.');
+      return;
+    }
+    if (pwd !== confirm) {
+      alert('Passwords do not match.');
+      return;
+    }
+    setUpdatingPassword(true);
+    try {
+      const { error } = await supabase.auth.updateUser({
+        password: pwd,
+      });
+      console.log('CHANGE PASSWORD:', error);
+      if (error) throw error;
+
+      alert('Password updated successfully');
+      setNewPassword('');
+      setConfirmPassword('');
+      setShowSecurity(false);
+      await supabase.auth.signOut();
+      navigate('/login');
+    } catch (err: any) {
+      console.log('CHANGE PASSWORD:', err);
+      alert(err?.message || 'Failed to update password.');
+    } finally {
+      setUpdatingPassword(false);
+    }
+  };
+
   if (loading && !userProfile && (!isOwnProfile || !myProfile)) {
     return (
       <div className="lg:max-w-4xl lg:mx-auto p-4 lg:p-8 pb-12">
@@ -912,13 +953,81 @@ export default function ProfilePage() {
                   >
                     Edit Profile
                   </button>
-                  <button type="button" className="bg-white/15 backdrop-blur-md border border-white/20 text-white p-2 rounded-xl hover:bg-white/25 transition-colors">
+                  <button
+                    type="button"
+                    onClick={() => setShowSecurity((v) => !v)}
+                    className="bg-white/15 backdrop-blur-md border border-white/20 text-white p-2 rounded-xl hover:bg-white/25 transition-colors"
+                  >
                     <Settings size={20} />
                   </button>
                 </>
               )}
             </div>
           </div>
+
+          {isOwnProfile && showSecurity && (
+            <div className="mb-6 rounded-2xl border border-white/20 bg-white/10 backdrop-blur-md p-4">
+              <h3 className="text-sm font-bold text-white mb-3">Security / Change Password</h3>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="relative">
+                  <input
+                    type={showNewPassword ? 'text' : 'password'}
+                    value={newPassword}
+                    onChange={(e) => setNewPassword(e.target.value)}
+                    placeholder="New password"
+                    className="w-full rounded-xl border border-white/20 bg-black/20 px-3 py-2 pr-10 text-sm text-white placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowNewPassword((s) => !s)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-base leading-none"
+                    aria-label={showNewPassword ? 'Hide password' : 'Show password'}
+                  >
+                    👁️
+                  </button>
+                </div>
+                <div className="relative">
+                  <input
+                    type={showConfirmPassword ? 'text' : 'password'}
+                    value={confirmPassword}
+                    onChange={(e) => setConfirmPassword(e.target.value)}
+                    placeholder="Confirm password"
+                    className="w-full rounded-xl border border-white/20 bg-black/20 px-3 py-2 pr-10 text-sm text-white placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowConfirmPassword((s) => !s)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-base leading-none"
+                    aria-label={showConfirmPassword ? 'Hide password' : 'Show password'}
+                  >
+                    👁️
+                  </button>
+                </div>
+              </div>
+              <div className="mt-3 flex gap-2">
+                <button
+                  type="button"
+                  disabled={updatingPassword}
+                  onClick={handleChangePassword}
+                  className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-xl text-sm font-bold disabled:opacity-50"
+                >
+                  {updatingPassword ? 'Updating...' : 'Update Password'}
+                </button>
+                <button
+                  type="button"
+                  disabled={updatingPassword}
+                  onClick={() => {
+                    setShowSecurity(false);
+                    setNewPassword('');
+                    setConfirmPassword('');
+                  }}
+                  className="bg-white/15 border border-white/20 text-white px-4 py-2 rounded-xl text-sm font-bold disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
 
           <div className="flex items-center justify-center md:justify-start gap-8 mb-6">
             <Stat label="Coins" value={displayUser.coins} icon={<Coins size={14} className="text-yellow-500" />} />
