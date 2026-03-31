@@ -39,6 +39,7 @@ import { isValidVideoUrl } from '../lib/videoUrl';
 import { ProfileHeaderSkeleton } from '../components/LoadingSkeletons';
 import { fetchCommentsWithProfiles, type CommentForDisplay } from '../lib/postComments';
 import { persistFollowEdge } from '../lib/followsClient';
+import { notifyLikeCommentFollowDm } from '../lib/supabaseNotifications';
 
 function feedApiResponseIsJson(res: Response): boolean {
   const ct = res.headers.get('content-type') || '';
@@ -209,7 +210,8 @@ export default function ProfilePage() {
         videoUrl: p.video_url ? String(p.video_url) : undefined,
         user: { 
           username: nameForPosts || userProfile?.username || 'user', 
-          avatar: userProfile?.avatar || '' 
+          avatar: userProfile?.avatar || '',
+          id: String(userId),
         },
         caption: p.content ?? '',
         likes: Number(p.likes_count) || 0,
@@ -321,6 +323,7 @@ export default function ProfilePage() {
           user: {
             username: prof?.username || 'Unknown',
             avatar: prof?.avatar_url || `https://picsum.photos/seed/${p.user_id}/100/100`,
+            id: String(p.user_id ?? ''),
           },
           caption: p.content,
           likes: p.likes_count ?? 0,
@@ -1340,7 +1343,7 @@ function PostDetailModal({ post, onClose }: { post: Post; onClose: () => void })
         if (error) throw error;
         data = ins;
         try {
-          await fetch(apiUrl('/api/notifications/from-feed-comment'), {
+          const notifyRes = await fetchFeedApiSafe(apiUrl('/api/notifications/from-feed-comment'), {
             method: 'POST',
             headers: jsonHeaders,
             body: JSON.stringify({
@@ -1349,12 +1352,25 @@ function PostDetailModal({ post, onClose }: { post: Post; onClose: () => void })
               commentId: ins.id,
             }),
           });
+          await notifyRes?.text();
         } catch {
           /* non-fatal */
         }
       }
 
       if (!data) throw new Error('Comment was not saved.');
+
+      const ownerComment = String((post.user as { id?: string } | undefined)?.id ?? '').trim();
+      if (ownerComment && ownerComment !== user.id) {
+        const commenterName = (profile?.username || user.email?.split('@')[0] || 'Someone').trim();
+        notifyLikeCommentFollowDm({
+          recipientUserId: ownerComment,
+          type: 'comment',
+          message: `${commenterName} commented on your post`,
+          storyId: post.id,
+          entityId: post.id,
+        });
+      }
 
       const rows = await fetchCommentsWithProfiles(supabase, String(post.id));
       setComments(rows);

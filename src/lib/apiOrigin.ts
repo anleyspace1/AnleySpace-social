@@ -45,3 +45,14 @@ export async function fetchFeedApiSafe(url: string, init?: RequestInit): Promise
     return null;
   }
 }
+
+/**
+ * True only when the response looks like a real JSON API (not Vercel SPA HTML).
+ * Static hosts often return 200 + `text/html` for unknown `/api/*` — `res.ok` is still true,
+ * so callers must not treat that as a successful API call.
+ */
+export function responseLooksLikeJsonApi(res: Response | null): boolean {
+  if (!res || !res.ok) return false;
+  const ct = res.headers.get('content-type') || '';
+  return ct.includes('application/json');
+}

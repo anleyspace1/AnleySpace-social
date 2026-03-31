@@ -39,7 +39,8 @@ import {
 import { MOCK_CHATS, MOCK_USER } from '../constants';
 import { Message } from '../types';
 import { cn } from '../lib/utils';
-import { apiUrl } from '../lib/apiOrigin';
+import { apiUrl, fetchFeedApiSafe, responseLooksLikeJsonApi } from '../lib/apiOrigin';
+import { insertDmNotificationFallback } from '../lib/supabaseNotifications';
 import { productImagePublicUrl } from '../lib/marketplaceImage';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
@@ -52,17 +53,37 @@ function isStoryMediaVideo(url: string, mediaType?: string | null) {
   return /\.(mp4|webm|mov|m4v)(\?|$)/i.test(u) || u.includes('/video');
 }
 
-/** Triggers SQLite + socket notification for the receiver (server verifies the Supabase row). */
-async function notifyInboxMessageRealtime(messageId: string, senderId: string, receiverId: string) {
+/** Triggers server notification + Supabase row when API is unavailable (e.g. Vercel). */
+async function notifyInboxMessageRealtime(
+  messageId: string,
+  senderId: string,
+  receiverId: string,
+  opts?: { senderDisplayName?: string; contentPreview?: string }
+) {
   try {
-    const res = await fetch(apiUrl('/api/notifications/dm'), {
+    const res = await fetchFeedApiSafe(apiUrl('/api/notifications/dm'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ messageId, senderId, receiverId }),
     });
-    if (!res.ok) {
-      console.warn('notifyInboxMessageRealtime:', res.status);
-    }
+    const ct = res?.headers.get('content-type') || '';
+    console.log('NOTIFICATIONS DM API RESPONSE:', {
+      ok: res?.ok,
+      status: res?.status,
+      contentType: ct,
+      useSupabaseFallback: !responseLooksLikeJsonApi(res),
+    });
+    // On Vercel, missing routes often return 200 + HTML — res.ok is true but it is not the Express API.
+    if (responseLooksLikeJsonApi(res)) return;
+    const name = (opts?.senderDisplayName || 'Someone').trim();
+    const { error } = await insertDmNotificationFallback({
+      messageId,
+      receiverId,
+      senderDisplayName: name,
+      contentPreview: opts?.contentPreview,
+    });
+    console.log('NOTIFICATIONS DATA:', { dmFallback: true });
+    if (error) console.warn('NOTIFICATIONS ERROR:', error.message);
   } catch (e) {
     console.warn('notifyInboxMessageRealtime failed', e);
   }
@@ -1111,7 +1132,10 @@ export default function MessagesPage() {
         const savedMsg = data[0];
         setMessages((prev) => [...prev, formatMessageFromDb(savedMsg)]);
         setOfferDraft('');
-        void notifyInboxMessageRealtime(savedMsg.id, user.id, selectedChat.user.id);
+        void notifyInboxMessageRealtime(savedMsg.id, user.id, selectedChat.user.id, {
+          senderDisplayName: profile?.username || user.email?.split('@')[0] || 'Someone',
+          contentPreview: String(savedMsg.content ?? ''),
+        });
       }
     } catch (e: any) {
       console.error('sendOffer:', e);
@@ -1204,7 +1228,10 @@ export default function MessagesPage() {
         setSelectedImage(null);
         setSelectedFile(null);
         setMessage('');
-        void notifyInboxMessageRealtime(savedMsg.id, user.id, selectedChat.user.id);
+        void notifyInboxMessageRealtime(savedMsg.id, user.id, selectedChat.user.id, {
+          senderDisplayName: profile?.username || user.email?.split('@')[0] || 'Someone',
+          contentPreview: String(savedMsg.content ?? ''),
+        });
       }
     } catch (err: any) {
       console.error('Error in handleSendMessage:', err);
@@ -1350,7 +1377,10 @@ export default function MessagesPage() {
           isSeen: savedMsg.is_seen === true,
         };
         setMessages(prev => [...prev, newMessage]);
-        void notifyInboxMessageRealtime(savedMsg.id, user.id, selectedChat.user.id);
+        void notifyInboxMessageRealtime(savedMsg.id, user.id, selectedChat.user.id, {
+          senderDisplayName: profile?.username || user.email?.split('@')[0] || 'Someone',
+          contentPreview: String(savedMsg.content ?? ''),
+        });
       }
     } catch (err: any) {
       console.error('Error sending voice message:', err);

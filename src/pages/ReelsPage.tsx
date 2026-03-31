@@ -39,6 +39,7 @@ import { MOCK_SOUNDS } from '../constants';
 import { cn } from '../lib/utils';
 import { supabase } from '../lib/supabase';
 import { apiUrl, fetchFeedApiSafe } from '../lib/apiOrigin';
+import { notifyLikeCommentFollowDm } from '../lib/supabaseNotifications';
 import { useAuth } from '../contexts/AuthContext';
 import { Video } from '../types';
 import ShareModal from '../components/ShareModal';
@@ -1506,6 +1507,17 @@ function VideoPost({
         setIsLiked(data.liked);
         onCountsChange(reelId, { liked: data.liked });
       }
+
+      if (nextLiked && ownerId && ownerId !== userId) {
+        const likerName = (profile?.username || user.email?.split('@')[0] || 'Someone').trim();
+        notifyLikeCommentFollowDm({
+          recipientUserId: ownerId,
+          type: 'like',
+          message: `${likerName} liked your post`,
+          storyId: reelId,
+          entityId: reelId,
+        });
+      }
     } catch (err) {
       console.error('[LikeError]', err);
       console.error('[ReelsPage] like API failed, trying supabase fallback:', err);
@@ -1518,14 +1530,24 @@ function VideoPost({
 
           // Best-effort notification (non-fatal).
           try {
-            const notifyRes = await fetch(apiUrl('/api/notifications/from-feed-like'), {
+            const notifyRes = await fetchFeedApiSafe(apiUrl('/api/notifications/from-feed-like'), {
               method: 'POST',
               headers: jsonHeaders,
               body: JSON.stringify({ userId, postId: reelId }),
             });
-            await notifyRes.text();
+            await notifyRes?.text();
           } catch {
             /* non-fatal */
+          }
+          if (ownerId && ownerId !== userId) {
+            const likerName = (profile?.username || user.email?.split('@')[0] || 'Someone').trim();
+            notifyLikeCommentFollowDm({
+              recipientUserId: ownerId,
+              type: 'like',
+              message: `${likerName} liked your post`,
+              storyId: reelId,
+              entityId: reelId,
+            });
           }
         } else {
           const { error: delErr } = await supabase
@@ -2551,7 +2573,7 @@ function CommentsSection({
         inserted = ins;
 
         try {
-          await fetch(apiUrl('/api/notifications/from-feed-comment'), {
+          const notifyRes = await fetchFeedApiSafe(apiUrl('/api/notifications/from-feed-comment'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -2560,6 +2582,7 @@ function CommentsSection({
               commentId: inserted?.id,
             }),
           });
+          await notifyRes?.text();
         } catch {
           /* non-fatal */
         }
@@ -2571,6 +2594,24 @@ function CommentsSection({
           content: text,
           created_at: new Date().toISOString(),
         };
+      }
+
+      const ownerComment = String(
+        (video as { post_user_id?: string; user_id?: string })?.post_user_id ??
+          (video as { user_id?: string })?.user_id ??
+          (video as { user?: { id?: string } })?.user?.id ??
+          ''
+      ).trim();
+      const commentSavedForNotify = inserted && !String(inserted.id).startsWith('temp-');
+      if (commentSavedForNotify && ownerComment && ownerComment !== userId) {
+        const commenterName = (profile?.username || user.email?.split('@')[0] || 'Someone').trim();
+        notifyLikeCommentFollowDm({
+          recipientUserId: ownerComment,
+          type: 'comment',
+          message: `${commenterName} commented on your post`,
+          storyId: postId,
+          entityId: postId,
+        });
       }
 
       // Optimistic UI append so the new comment shows immediately.

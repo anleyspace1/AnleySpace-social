@@ -1,8 +1,9 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { io, type Socket } from 'socket.io-client';
 import { useAuth } from './AuthContext';
-import { API_ORIGIN, apiUrl } from '../lib/apiOrigin';
+import { API_ORIGIN, apiUrl, fetchFeedApiSafe } from '../lib/apiOrigin';
 import { playNotificationSound } from '../lib/notificationSound';
+import { isSupabaseConfigured, supabase } from '../lib/supabase';
 
 export type AppNotification = {
   id: string;
@@ -32,6 +33,35 @@ type NotificationContextValue = {
 };
 
 const NotificationContext = createContext<NotificationContextValue | null>(null);
+
+/** Map Supabase `public.notifications` row → AppNotification (supports group + future columns). */
+function mapSupabaseNotificationRow(row: Record<string, unknown>): AppNotification {
+  const type = String(row.type ?? 'unknown');
+  const groupId = row.group_id != null ? String(row.group_id) : null;
+  const messageId = row.message_id != null ? String(row.message_id) : null;
+  const entityFromRow = row.entity_id != null ? String(row.entity_id) : null;
+  const storyFromRow = row.story_id != null ? String(row.story_id) : null;
+  return {
+    id: String(row.id ?? ''),
+    user_id: String(row.user_id ?? ''),
+    type,
+    actor_id: row.actor_id != null && String(row.actor_id).trim() !== '' ? String(row.actor_id) : null,
+    story_id: storyFromRow,
+    entity_id: entityFromRow ?? storyFromRow ?? groupId ?? messageId,
+    message:
+      row.message != null && String(row.message).trim() !== ''
+        ? String(row.message)
+        : type === 'group_message'
+          ? 'New message in your group'
+          : null,
+    is_read: Boolean(row.is_read),
+    created_at:
+      typeof row.created_at === 'string' ? row.created_at : new Date().toISOString(),
+    actor_username:
+      row.actor_username != null ? String(row.actor_username) : null,
+    actor_avatar: row.actor_avatar != null ? String(row.actor_avatar) : null,
+  };
+}
 
 function normalizeSocketNotification(raw: Record<string, unknown>, userId: string): AppNotification {
   const storyId = raw.story_id != null ? String(raw.story_id) : null;
@@ -74,14 +104,59 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
     }
     setLoading(true);
     try {
-      const res = await fetch(apiUrl(`/api/notifications?userId=${encodeURIComponent(user.id)}`));
-      if (!res.ok) {
+      const {
+        data: { user: authUser },
+      } = await supabase.auth.getUser();
+      console.log('NOTIFICATIONS AUTH USER:', authUser);
+
+      const url = apiUrl(`/api/notifications?userId=${encodeURIComponent(user.id)}`);
+      const response = await fetchFeedApiSafe(url);
+      console.log('API RESPONSE:', {
+        ok: response?.ok,
+        status: response?.status,
+        url,
+      });
+
+      if (response && response.ok) {
+        let data: unknown;
+        try {
+          data = await response.json();
+        } catch {
+          data = null;
+        }
+        const list = Array.isArray(data) ? (data as AppNotification[]) : [];
+        console.log('NOTIFICATIONS DATA:', list);
+        setNotifications(list);
+        return;
+      }
+
+      if (!isSupabaseConfigured) {
+        console.log('NOTIFICATIONS ERROR:', 'Supabase not configured; cannot load notifications without API');
         setNotifications([]);
         return;
       }
-      const data = (await res.json()) as AppNotification[];
-      setNotifications(Array.isArray(data) ? data : []);
-    } catch {
+
+      const { data, error } = await supabase
+        .from('notifications')
+        .select('*')
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: false })
+        .limit(100);
+
+      console.log('NOTIFICATIONS DATA:', data);
+      console.log('NOTIFICATIONS ERROR:', error);
+
+      if (error) {
+        setNotifications([]);
+        return;
+      }
+
+      const mapped = (Array.isArray(data) ? data : []).map((row) =>
+        mapSupabaseNotificationRow(row as Record<string, unknown>)
+      );
+      setNotifications(mapped.filter((n) => n.id));
+    } catch (e) {
+      console.log('NOTIFICATIONS ERROR:', e);
       setNotifications([]);
     } finally {
       setLoading(false);
@@ -136,16 +211,33 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
       if (!user?.id) return;
       setNotifications((prev) => prev.map((n) => (n.id === id ? { ...n, is_read: true } : n)));
       try {
-        const res = await fetch(apiUrl(`/api/notifications/${encodeURIComponent(id)}/read`), {
+        const res = await fetchFeedApiSafe(apiUrl(`/api/notifications/${encodeURIComponent(id)}/read`), {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ userId: user.id }),
         });
-        if (!res.ok) {
+        if (res && res.ok) return;
+        if (isSupabaseConfigured) {
+          const { error } = await supabase
+            .from("notifications")
+            .update({ is_read: true })
+            .eq("id", id)
+            .eq("user_id", user.id);
+          if (error) console.warn("[Notifications] mark read Supabase:", error.message);
+        } else {
           await refresh();
         }
       } catch {
-        await refresh();
+        if (isSupabaseConfigured) {
+          const { error } = await supabase
+            .from("notifications")
+            .update({ is_read: true })
+            .eq("id", id)
+            .eq("user_id", user.id);
+          if (error) await refresh();
+        } else {
+          await refresh();
+        }
       }
     },
     [user?.id, refresh]
@@ -167,15 +259,26 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
       return prev.map((n) => ({ ...n, is_read: true }));
     });
     try {
-      await Promise.all(
+      const results = await Promise.all(
         idsToMark.map((id) =>
-          fetch(apiUrl(`/api/notifications/${encodeURIComponent(id)}/read`), {
+          fetchFeedApiSafe(apiUrl(`/api/notifications/${encodeURIComponent(id)}/read`), {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ userId: user.id }),
           })
         )
       );
+      const anyFailed = results.some((r) => !r || !r.ok);
+      if (anyFailed && isSupabaseConfigured && idsToMark.length > 0) {
+        const { error } = await supabase
+          .from("notifications")
+          .update({ is_read: true })
+          .eq("user_id", user.id)
+          .in("id", idsToMark);
+        if (error) console.warn("[Notifications] mark all read Supabase:", error.message);
+      } else if (anyFailed) {
+        await refresh();
+      }
     } catch {
       await refresh();
     }

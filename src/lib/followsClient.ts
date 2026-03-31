@@ -1,5 +1,6 @@
 import { supabase } from './supabase';
 import { apiUrl, fetchFeedApiSafe } from './apiOrigin';
+import { notifyLikeCommentFollowDm } from './supabaseNotifications';
 
 /**
  * Best-effort Express API (local/dev), then always persist to Supabase so static hosting (e.g. Vercel)
@@ -67,6 +68,17 @@ export async function persistFollowEdge(opts: {
       return { ok: false, error: error.message };
     }
     console.log('FOLLOW DATA:', data);
+    if (!error) {
+      void (async () => {
+        const { data: p } = await supabase.from('profiles').select('username').eq('id', followerId).maybeSingle();
+        const name = (p?.username && String(p.username).trim()) || 'Someone';
+        notifyLikeCommentFollowDm({
+          recipientUserId: followingId,
+          type: 'follow',
+          message: `${name} started following you`,
+        });
+      })();
+    }
   }
   return { ok: true };
 }

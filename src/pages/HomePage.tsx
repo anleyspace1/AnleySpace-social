@@ -53,6 +53,7 @@ import { isPlaceholderUsername } from '../lib/realDataGuards';
 import { getViews } from '../lib/postViews';
 import { hasRecordedViewThisSession, markPostViewRecordedSession } from '../lib/postViewTracking';
 import { fetchCommentsWithProfiles, resolveProfileUsername } from '../lib/postComments';
+import { notifyLikeCommentFollowDm } from '../lib/supabaseNotifications';
 
 /** Home feed: white cards on #F5F6FA (see App layout when path is `/`). */
 const homeCard =
@@ -2168,17 +2169,44 @@ function PostItem({
               console.error('[PostItem] Supabase like insert failed', insErr);
               throw insErr;
             }
+            if (!insErr) {
+              try {
+                const notifyRes = await fetchFeedApiSafe(apiUrl('/api/notifications/from-feed-like'), {
+                  method: 'POST',
+                  headers: jsonHeaders,
+                  body: likePayload,
+                });
+                await notifyRes?.text();
+              } catch {
+                /* non-fatal */
+              }
+              const likerName = (profile?.username || user.email?.split('@')[0] || 'Someone').trim();
+              const ownerLike = post.user_id != null ? String(post.user_id).trim() : '';
+              if (ownerLike && ownerLike !== user.id) {
+                notifyLikeCommentFollowDm({
+                  recipientUserId: ownerLike,
+                  type: 'like',
+                  message: `${likerName} liked your post`,
+                  storyId: post.id,
+                  entityId: post.id,
+                });
+              }
+            }
           }
-          try {
-            const notifyRes = await fetch(apiUrl('/api/notifications/from-feed-like'), {
-              method: 'POST',
-              headers: jsonHeaders,
-              body: likePayload,
-            });
-            await notifyRes.text();
-          } catch {
-            /* non-fatal */
-          }
+        }
+      }
+
+      if (!wasLiked) {
+        const ownerLike = post.user_id != null ? String(post.user_id).trim() : '';
+        if (ownerLike && ownerLike !== user.id && handledByApi) {
+          const likerName = (profile?.username || user.email?.split('@')[0] || 'Someone').trim();
+          notifyLikeCommentFollowDm({
+            recipientUserId: ownerLike,
+            type: 'like',
+            message: `${likerName} liked your post`,
+            storyId: post.id,
+            entityId: post.id,
+          });
         }
       }
 
@@ -2266,12 +2294,12 @@ function PostItem({
             postId: post.id,
             commentId: ins.id,
           });
-          const notifyRes = await fetch(apiUrl('/api/notifications/from-feed-comment'), {
+          const notifyRes = await fetchFeedApiSafe(apiUrl('/api/notifications/from-feed-comment'), {
             method: 'POST',
             headers: jsonHeaders,
             body: notifyPayload,
           });
-          await notifyRes.text();
+          await notifyRes?.text();
         } catch {
           /* non-fatal */
         }
@@ -2279,6 +2307,18 @@ function PostItem({
 
       if (!data) {
         throw new Error('Comment was not saved.');
+      }
+
+      const ownerComment = post.user_id != null ? String(post.user_id).trim() : '';
+      if (ownerComment && ownerComment !== user.id) {
+        const commenterName = (profile?.username || user.email?.split('@')[0] || 'Someone').trim();
+        notifyLikeCommentFollowDm({
+          recipientUserId: ownerComment,
+          type: 'comment',
+          message: `${commenterName} commented on your post`,
+          storyId: post.id,
+          entityId: post.id,
+        });
       }
 
       const newCommentObj = {
