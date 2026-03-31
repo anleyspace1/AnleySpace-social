@@ -11,7 +11,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../lib/supabase';
-import { apiUrl } from '../lib/apiOrigin';
+import { apiUrl, fetchFeedApiSafe, responseLooksLikeJsonApi } from '../lib/apiOrigin';
 
 interface StoryEditorProps {
   isOpen: boolean;
@@ -42,6 +42,9 @@ export default function StoryEditor({ isOpen, onClose, onPublished, content }: S
 
     setIsPublishing(true);
     try {
+      if (import.meta.env.PROD) {
+        console.log('ENV CHECK:', import.meta.env.VITE_SUPABASE_URL);
+      }
       let finalImageUrl = content.image;
 
       // 1. If image is base64, upload to Supabase Storage
@@ -85,7 +88,7 @@ export default function StoryEditor({ isOpen, onClose, onPublished, content }: S
         }
       }
 
-      const response = await fetch(apiUrl('/api/stories'), {
+      const response = await fetchFeedApiSafe(apiUrl('/api/stories'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -99,23 +102,67 @@ export default function StoryEditor({ isOpen, onClose, onPublished, content }: S
         }),
       });
 
-      const responseBody = await response.json().catch(() => null);
-      console.log('[StoryEditor] /api/stories response:', {
-        status: response.status,
-        ok: response.ok,
-        body: responseBody,
-      });
+      let published = false;
+      if (responseLooksLikeJsonApi(response)) {
+        const responseBody = await response!.json().catch(() => null);
+        console.log('[StoryEditor] /api/stories response:', {
+          status: response!.status,
+          ok: response!.ok,
+          body: responseBody,
+        });
+        if (response!.ok) {
+          published = true;
+        } else {
+          const serverMessage =
+            (responseBody && typeof responseBody === 'object' && 'error' in responseBody
+              ? String((responseBody as any).error || '')
+              : '') || 'Failed to publish story';
+          throw new Error(serverMessage);
+        }
+      } else {
+        // Vercel/static fallback when /api/stories route is missing.
+        const nowIso = new Date().toISOString();
+        const expiresAtIso = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+        const payload = {
+          user_id: user.id,
+          username: content.user.username,
+          avatar: content.user.avatar || null,
+          image_url: finalImageUrl,
+          media_url: finalImageUrl,
+          media_type: 'image',
+          created_at: nowIso,
+          expires_at: expiresAtIso,
+        };
+        const { error: insertError } = await supabase.from('stories').insert(payload);
+        if (insertError) throw insertError;
+        published = true;
+        console.warn('[StoryEditor] API unavailable; published story via Supabase fallback.');
+        console.log('STORY TIME CHECK:', {
+          frontend_now: new Date().toISOString(),
+          created_at: nowIso,
+          expires_at: expiresAtIso,
+        });
+      }
 
-      if (response.ok) {
+      if (published) {
+        console.log('Inserted story:', {
+          user_id: user.id,
+          imageUrl: finalImageUrl,
+          source: responseLooksLikeJsonApi(response) ? 'api' : 'supabase-fallback',
+        });
+        if (import.meta.env.PROD) {
+          console.log('Inserted story (PROD):', {
+            user_id: user.id,
+            imageUrl: finalImageUrl,
+            source: responseLooksLikeJsonApi(response) ? 'api' : 'supabase-fallback',
+          });
+        }
+      }
+
+      if (published) {
         alert('Published to your story!');
         if (onPublished) onPublished();
         onClose();
-      } else {
-        const serverMessage =
-          (responseBody && typeof responseBody === 'object' && 'error' in responseBody
-            ? String((responseBody as any).error || '')
-            : '') || 'Failed to publish story';
-        throw new Error(serverMessage);
       }
     } catch (err) {
       console.error('Publish story error:', err);

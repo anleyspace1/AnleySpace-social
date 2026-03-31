@@ -33,7 +33,7 @@ import {
 } from 'lucide-react';
 import { useNavigate, useSearchParams, useLocation } from 'react-router-dom';
 import { cn } from '../lib/utils';
-import { apiUrl, fetchFeedApiSafe } from '../lib/apiOrigin';
+import { apiUrl, fetchFeedApiSafe, responseLooksLikeJsonApi } from '../lib/apiOrigin';
 import { fetchActiveStories, filterActiveStories } from '../lib/activeStories';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
@@ -241,6 +241,7 @@ function Stories() {
   const recordedChunksRef = useRef<Blob[]>([]);
   const discardRecordingRef = useRef(false);
   const expectingRecorderOnStopRef = useRef(false);
+  const keepStoriesOnEmptyUntilRef = useRef(0);
 
   useEffect(() => {
     try {
@@ -271,7 +272,21 @@ function Stories() {
     if (isUploadingStory) return;
     try {
       const data = await fetchActiveStories();
-      setRealStories(data);
+      console.log('Fetched stories:', data);
+      if (import.meta.env.PROD) {
+        console.log('Fetched stories (PROD):', data);
+      }
+      setRealStories((prev) => {
+        const gotRows = Array.isArray(data) && data.length > 0;
+        const protectOptimisticStory =
+          !gotRows && prev.length > 0 && Date.now() < keepStoriesOnEmptyUntilRef.current;
+        if (protectOptimisticStory) {
+          console.warn('[Stories] Keeping optimistic stories; fetch returned empty during post-sync window.');
+          return prev;
+        }
+        if (gotRows) keepStoriesOnEmptyUntilRef.current = 0;
+        return Array.isArray(data) ? data : [];
+      });
     } catch (err) {
       console.error('Error fetching stories:', err);
     }
@@ -423,6 +438,9 @@ function Stories() {
       throw new Error('Invalid story file type. Please choose an image or video.');
     }
     console.log('[StoryUpload] file:', file);
+    if (import.meta.env.PROD) {
+      console.log('ENV CHECK:', import.meta.env.VITE_SUPABASE_URL);
+    }
 
     const username =
       (user as { username?: string }).username ||
@@ -455,28 +473,93 @@ function Stories() {
         user_id: user.id,
       });
 
-      const response = await fetch(apiUrl('/api/stories'), {
+      const response = await fetchFeedApiSafe(apiUrl('/api/stories'), {
         method: 'POST',
         body: form,
       });
 
-      const body = await response.json().catch(() => null);
-      console.log('[StoryUpload] /api/stories response', {
-        status: response.status,
-        ok: response.ok,
-        body,
-      });
+      let insertedStory: any = null;
+      if (responseLooksLikeJsonApi(response)) {
+        const body = await response!.json().catch(() => null);
+        console.log('[StoryUpload] /api/stories response', {
+          status: response!.status,
+          ok: response!.ok,
+          body,
+        });
+        if (!response!.ok) {
+          const serverMessage =
+            (body && typeof body === 'object' && 'error' in body && typeof (body as any).error === 'string'
+              ? (body as any).error
+              : '') || 'Failed to upload story media.';
+          throw new Error(serverMessage);
+        }
+        insertedStory = body && typeof body === 'object' ? (body as any) : null;
+      } else {
+        // Vercel/static fallback: upload media directly and insert story row in Supabase.
+        const safeName = file.name.replace(/[^\w.\-]+/g, '_');
+        const storagePath = `stories/${user.id}/${Date.now()}-${safeName}`;
+        const { error: uploadError } = await supabase.storage
+          .from('posts')
+          .upload(storagePath, file, { cacheControl: '3600', upsert: false });
+        if (uploadError) throw uploadError;
+        const { data: pub } = supabase.storage.from('posts').getPublicUrl(storagePath);
+        const mediaUrl = String(pub?.publicUrl || '').trim();
+        if (!mediaUrl) throw new Error('Failed to resolve story media URL.');
 
-      if (!response.ok) {
-        const serverMessage =
-          (body && typeof body === 'object' && 'error' in body && typeof (body as any).error === 'string'
-            ? (body as any).error
-            : '') || 'Failed to upload story media.';
-        throw new Error(serverMessage);
+        const nowIso = new Date().toISOString();
+        const expiresAtIso = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+        const mediaType = file.type.startsWith('video/') ? 'video' : 'image';
+        const payload = {
+          user_id: user.id,
+          username,
+          avatar: avatar || null,
+          image_url: mediaUrl,
+          media_url: mediaUrl,
+          media_type: mediaType,
+          created_at: nowIso,
+          expires_at: expiresAtIso,
+        };
+        const { data: fallbackStory, error: fallbackErr } = await supabase
+          .from('stories')
+          .insert(payload)
+          .select('*')
+          .single();
+        if (fallbackErr) throw fallbackErr;
+        insertedStory = fallbackStory;
+        console.warn('[StoryUpload] API unavailable; posted story via Supabase fallback.');
+        console.log('STORY TIME CHECK:', {
+          frontend_now: new Date().toISOString(),
+          created_at: nowIso,
+          expires_at: expiresAtIso,
+        });
       }
 
-      const insertedStory = body && typeof body === 'object' ? (body as any) : null;
+      console.log('Inserted story:', insertedStory);
+      if (import.meta.env.PROD) {
+        console.log('Inserted story (PROD):', insertedStory);
+      }
+      if (insertedStory) {
+        console.log('STORY TIME CHECK:', {
+          frontend_now: new Date().toISOString(),
+          created_at: insertedStory.created_at,
+          expires_at: insertedStory.expires_at,
+        });
+        if (import.meta.env.PROD) {
+          console.log('STORY TIME CHECK (PROD):', {
+            frontend_now: new Date().toISOString(),
+            created_at: insertedStory.created_at,
+            expires_at: insertedStory.expires_at,
+          });
+        }
+        console.log('STORY USER CHECK:', {
+          session_user_id: user.id,
+          inserted_user_id: insertedStory.user_id,
+          matches: String(insertedStory.user_id || '') === String(user.id),
+        });
+      }
+
       if (insertedStory?.id && insertedStory?.media_url) {
+        keepStoriesOnEmptyUntilRef.current = Date.now() + 30000;
         const optimistic = {
           id: insertedStory.id,
           user_id: insertedStory.user_id || user.id,

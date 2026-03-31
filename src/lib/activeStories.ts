@@ -1,5 +1,5 @@
 import { supabase, isSupabaseConfigured } from './supabase';
-import { apiUrl } from './apiOrigin';
+import { apiUrl, fetchFeedApiSafe, responseLooksLikeJsonApi } from './apiOrigin';
 import { fetchJsonWithDeployLog, logClientDeployEnvOnce } from './deployDebug';
 
 /**
@@ -8,14 +8,47 @@ import { fetchJsonWithDeployLog, logClientDeployEnvOnce } from './deployDebug';
  */
 export function filterActiveStories(storyList: any[]) {
   const rows = storyList || [];
-  return rows.filter((s) => {
+  if (import.meta.env.PROD) {
+    console.log('FILTER INPUT (PROD):', rows);
+  }
+  if (import.meta.env.DEV) {
+    console.log('FILTER INPUT:', rows);
+  }
+  const filtered = rows.filter((s) => {
     if (!s.expires_at) return true;
 
     const expTime = Date.parse(s.expires_at);
     if (!Number.isFinite(expTime)) return true;
+    const nowMs = Date.now();
+    if (expTime > nowMs) return true;
 
-    return expTime > Date.now();
+    // Safety: some environments may persist expires_at incorrectly (e.g. ~= created_at/now).
+    // Keep very recent rows if created_at is fresh so brand-new stories do not disappear.
+    const createdMs = Date.parse(String(s.created_at || ''));
+    if (Number.isFinite(createdMs)) {
+      const ageMs = nowMs - createdMs;
+      if (ageMs >= 0 && ageMs < 24 * 60 * 60 * 1000) {
+        if (import.meta.env.DEV) {
+          console.warn('[Stories] Keeping fresh story despite expires_at in the past', {
+            id: s?.id,
+            user_id: s?.user_id,
+            created_at: s?.created_at,
+            expires_at: s?.expires_at,
+            now: new Date(nowMs).toISOString(),
+          });
+        }
+        return true;
+      }
+    }
+    return false;
   });
+  if (import.meta.env.DEV) {
+    console.log('FILTER OUTPUT:', filtered);
+  }
+  if (import.meta.env.PROD) {
+    console.log('FILTER OUTPUT (PROD):', filtered);
+  }
+  return filtered;
 }
 
 type ProfileMap = Record<string, { id: string; username?: string | null; avatar_url?: string | null }>;
@@ -45,43 +78,34 @@ export async function fetchActiveStories(): Promise<any[]> {
   if (isSupabaseConfigured) {
     try {
       const nowIso = new Date().toISOString();
-      // Avoid `.or(<timestamp>)` which can be brittle when PostgREST parses the URL-encoded filter string.
-      // We implement the same logic with two explicit queries:
-      //  - expires_at IS NULL
-      //  - expires_at > nowIso
-      const [
-        { data: nullExpRows, error: nullExpError },
-        { data: futureExpRows, error: futureExpError },
-      ] = await Promise.all([
-        supabase.from('stories').select('*').is('expires_at', null).order('created_at', { ascending: false }),
-        supabase.from('stories').select('*').gt('expires_at', nowIso).order('created_at', { ascending: false }),
-      ]);
-
-      const rows = [
-        ...(Array.isArray(nullExpRows) ? nullExpRows : []),
-        ...(Array.isArray(futureExpRows) ? futureExpRows : []),
-      ];
+      // Fetch all rows first, then filter client-side to avoid immediate misses caused by
+      // DB-side timestamp filter differences (timezone/drift/schema).
+      const { data: rowsRaw, error: rowsError } = await supabase
+        .from('stories')
+        .select('*')
+        .order('created_at', { ascending: false });
+      const rows = Array.isArray(rowsRaw) ? rowsRaw : [];
 
       const sampleTop3 = rows
         .slice(0, 3)
         .map((s: any) => ({ id: s?.id, user_id: s?.user_id, created_at: s?.created_at, expires_at: s?.expires_at }));
 
-      console.log('[DEPLOY_DEBUG] fetchActiveStories Supabase stories (active)', {
+      console.log('[DEPLOY_DEBUG] fetchActiveStories Supabase stories (raw)', {
         nowIso,
-        nullExpCount: Array.isArray(nullExpRows) ? nullExpRows.length : 0,
-        futureExpCount: Array.isArray(futureExpRows) ? futureExpRows.length : 0,
-        error: nullExpError || futureExpError ? [nullExpError, futureExpError].map((e: any) => ({
-          message: e?.message,
-          code: e?.code,
-          details: e?.details,
-        })) : null,
+        count: rows.length,
+        error: rowsError
+          ? {
+              message: rowsError?.message,
+              code: (rowsError as any)?.code,
+              details: (rowsError as any)?.details,
+            }
+          : null,
         sampleTop3,
       });
 
-      if (nullExpError && !nullExpRows?.length && futureExpError && !futureExpRows?.length) {
+      if (rowsError) {
         console.error('[fetchActiveStories] Supabase stories select failed; returning [].', {
-          nullExpError,
-          futureExpError,
+          rowsError,
         });
         return [];
       }
@@ -96,7 +120,8 @@ export async function fetchActiveStories(): Promise<any[]> {
 
       // Dedupe by id in case a row matches both branches (e.g., null edge cases).
       const byId = new Map<string, any>();
-      for (const r of rows || []) {
+      const activeRows = filterActiveStories(rows);
+      for (const r of activeRows || []) {
         if (!r?.id) continue;
         byId.set(String(r.id), r);
       }
@@ -118,6 +143,11 @@ export async function fetchActiveStories(): Promise<any[]> {
   }
   try {
     const url = apiUrl('/api/stories');
+    const apiRes = await fetchFeedApiSafe(url, { method: 'GET' });
+    if (!responseLooksLikeJsonApi(apiRes)) {
+      console.warn('[fetchActiveStories] GET /api/stories unavailable/non-JSON; returning [].');
+      return [];
+    }
     const { ok, status, data } = await fetchJsonWithDeployLog('GET /api/stories', url, {
       method: 'GET',
     });
