@@ -3,7 +3,7 @@ import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { ArrowLeft } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { supabase, isSupabaseConfigured, getCachedSession } from '../lib/supabase';
-import { apiUrl } from '../lib/apiOrigin';
+import { apiUrl, fetchFeedApiSafe, responseLooksLikeJsonApi } from '../lib/apiOrigin';
 import { fetchActiveStories } from '../lib/activeStories';
 
 /** Only stories that can be rendered: persisted id, real user, and media from the API (no seed/dummy rows). */
@@ -487,6 +487,7 @@ export default function StoryPage() {
     const senderId = user.id;
     const receiverId = activeStory.user_id;
     const payload = { storyId, senderId, receiverId, message: msg };
+    console.log('Sending story message:', msg);
     console.log('[Story reply] sending POST /api/story-replies', {
       url: apiUrl('/api/story-replies'),
       ...payload,
@@ -494,21 +495,48 @@ export default function StoryPage() {
     replySubmitLockRef.current = true;
     setReplySending(true);
     try {
-      const res = await fetch(apiUrl('/api/story-replies'), {
+      const res = await fetchFeedApiSafe(apiUrl('/api/story-replies'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const bodyText = await res.text();
-      console.log('[Story reply] response', { status: res.status, ok: res.ok, body: bodyText });
-      if (!res.ok) {
-        let err: { error?: string } = {};
-        try {
-          err = JSON.parse(bodyText) as { error?: string };
-        } catch {
-          /* not JSON */
+      if (responseLooksLikeJsonApi(res)) {
+        const bodyText = await res!.text();
+        console.log('[Story reply] response', { status: res!.status, ok: res!.ok, body: bodyText });
+        if (!res!.ok) {
+          let err: { error?: string } = {};
+          try {
+            err = JSON.parse(bodyText) as { error?: string };
+          } catch {
+            /* not JSON */
+          }
+          throw new Error(err.error || res!.statusText);
         }
-        throw new Error(err.error || res.statusText);
+      } else {
+        // Vercel/static fallback: persist story reply directly in Supabase messages.
+        const row = {
+          sender_id: senderId,
+          receiver_id: receiverId,
+          content: msg,
+          is_seen: false,
+          type: 'story_reply',
+          message_type: 'story_reply',
+          story_id: storyId,
+          story_media:
+            typeof activeStory.media_url === 'string' && activeStory.media_url.trim()
+              ? activeStory.media_url.trim()
+              : typeof activeStory.image_url === 'string'
+                ? activeStory.image_url.trim()
+                : null,
+          story_media_type:
+            typeof activeStory.media_type === 'string' && activeStory.media_type.trim()
+              ? activeStory.media_type.trim()
+              : null,
+        };
+        console.log('[Story reply] Supabase fallback insert payload:', row);
+        const { data, error } = await supabase.from('messages').insert([row]).select();
+        console.log('Insert response:', data, error);
+        if (error) throw error;
       }
       setReplyText('');
       console.log('[Story reply] saved successfully');
