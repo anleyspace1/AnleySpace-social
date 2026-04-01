@@ -18,9 +18,7 @@ import {
   Users,
   Ban,
   Flag,
-  VideoOff,
   MicOff,
-  Monitor,
   UserPlus,
   Settings,
   Maximize2,
@@ -40,12 +38,15 @@ import { MOCK_CHATS, MOCK_USER } from '../constants';
 import { Message } from '../types';
 import { cn } from '../lib/utils';
 import { apiUrl, fetchFeedApiSafe, responseLooksLikeJsonApi } from '../lib/apiOrigin';
+import { readCallApiJson } from '../lib/callApiHelpers';
+import { createSocketIoClient } from '../lib/socketIoClient';
 import { insertDmNotificationFallback } from '../lib/supabaseNotifications';
 import { productImagePublicUrl } from '../lib/marketplaceImage';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
-import io from 'socket.io-client';
 import Peer from 'simple-peer';
+import DmAgoraVideoCall from '../components/DmAgoraVideoCall';
+import { agoraNumericUid, buildDmAgoraChannelId } from '../lib/dmAgoraChannel';
 
 function isStoryMediaVideo(url: string, mediaType?: string | null) {
   if (mediaType && String(mediaType).toLowerCase().includes('video')) return true;
@@ -235,6 +236,7 @@ export default function MessagesPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
   const productPrefillDoneRef = useRef(false);
+  const dmOpenCallConsumedRef = useRef<string | null>(null);
 
   useEffect(() => {
     productPrefillDoneRef.current = false;
@@ -299,31 +301,48 @@ export default function MessagesPage() {
   }, [user, targetUser, targetUserId]);
 
   useEffect(() => {
-    if (location.state?.openCall && user) {
-      const { openCall, callType, callerId } = location.state;
-      
-      // Prefer normal DM; if only a marketplace thread exists with that user, use it so calls still open.
-      const chat =
-        chats.find((c) => c.user.id === callerId && !c.product_id) ||
-        chats.find((c) => c.user.id === callerId);
-      if (chat) {
-        setSelectedChat(chat);
-        setActiveCall({ 
-          id: openCall, 
-          type: callType, 
-          status: 'active', 
-          hostId: callerId 
-        });
-        
-        // Join the call room
-        socketRef.current.emit('call:join', { 
-          callId: openCall, 
-          userId: user.id, 
-          username: profile?.username || user.email 
-        });
-      }
+    const st = location.state as {
+      openCall?: string;
+      callType?: 'audio' | 'video';
+      callerId?: string;
+    } | null;
+    if (!st?.openCall || !user?.id) {
+      dmOpenCallConsumedRef.current = null;
+      return;
     }
-  }, [location.state, chats, user]);
+
+    const { openCall, callType, callerId, ...rest } = st;
+    if (!openCall || !callType || !callerId) return;
+
+    // Prefer normal DM; if only a marketplace thread exists with that user, use it so calls still open.
+    const chat =
+      chats.find((c) => c.user.id === callerId && !c.product_id) ||
+      chats.find((c) => c.user.id === callerId);
+    if (!chat) return;
+
+    if (dmOpenCallConsumedRef.current === openCall) return;
+    dmOpenCallConsumedRef.current = openCall;
+
+    setSelectedChat(chat);
+    setActiveCall({
+      id: openCall,
+      type: callType,
+      status: 'active',
+      hostId: callerId,
+    });
+
+    socketRef.current.emit('call:join', {
+      callId: openCall,
+      userId: user.id,
+      username: profile?.username || user.email || '',
+    });
+
+    const restKeys = Object.keys(rest);
+    navigate(`${location.pathname}${location.search}`, {
+      replace: true,
+      state: restKeys.length > 0 ? rest : null,
+    });
+  }, [location.state, location.pathname, location.search, chats, user, navigate, profile?.username, profile?.email]);
 
   const fetchChats = async () => {
     try {
@@ -827,8 +846,6 @@ export default function MessagesPage() {
   const [isInfoOpen, setIsInfoOpen] = useState(false);
   const [activeCall, setActiveCall] = useState<{ id: string, type: 'audio' | 'video', status: 'calling' | 'active' | 'ended', hostId: string } | null>(null);
   const [isMuted, setIsMuted] = useState(false);
-  const [isCameraOff, setIsCameraOff] = useState(false);
-  const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [isLive, setIsLive] = useState(false);
   const [viewerCount, setViewerCount] = useState(0);
   const [liveMessages, setLiveMessages] = useState<any[]>([]);
@@ -863,7 +880,7 @@ export default function MessagesPage() {
   }, [selectedChat?.user?.id]);
 
   useEffect(() => {
-    socketRef.current = io();
+    socketRef.current = createSocketIoClient();
 
     if (user) {
       socketRef.current.emit('register_user', user.id);
@@ -952,6 +969,7 @@ export default function MessagesPage() {
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(track => track.stop());
       }
+      streamRef.current = null;
     });
 
     return () => {
@@ -1030,19 +1048,21 @@ export default function MessagesPage() {
     if (!user) return;
     setCallError(null);
     try {
-      // Request media FIRST to ensure permissions are granted before starting call on server
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: type === 'video'
-      });
-      streamRef.current = stream;
+      // DM video now uses Agora tracks directly; keep getUserMedia preflight for audio calls only.
+      if (type === 'audio') {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+          video: false,
+        });
+        streamRef.current = stream;
+      }
 
       const res = await fetch(apiUrl('/api/calls/start'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ hostId: user.id, type })
       });
-      const data = await res.json();
+      const data = await readCallApiJson<{ id: string; capacity?: number }>(res, 'POST /api/calls/start');
       
       setActiveCall({ id: data.id, type, status: 'calling', hostId: user.id });
       setCallCapacity(data.capacity);
@@ -1179,6 +1199,11 @@ export default function MessagesPage() {
       console.error('Failed to respond to join request:', err);
     }
   };
+
+  const dmAgoraChannelId =
+    user?.id && selectedChat?.user?.id
+      ? buildDmAgoraChannelId(String(user.id), String(selectedChat.user.id))
+      : '';
 
   const sendOffer = async (price: number) => {
     if (!selectedChat?.product_id || !user) return;
@@ -2275,60 +2300,13 @@ export default function MessagesPage() {
 
               <div className="flex-1 relative overflow-y-auto p-2 sm:p-4">
                 {activeCall.type === 'video' ? (
-                  <div className={cn(
-                    "grid gap-2 sm:gap-4 h-full",
-                    "grid-cols-2",
-                    participants.length > 3 && "md:grid-cols-3"
-                  )}>
-                  {/* Main User (You) */}
-                  <div className="relative bg-gray-800 rounded-xl sm:rounded-3xl overflow-hidden border border-white/10 aspect-[4/3] sm:aspect-video md:aspect-auto">
-                    {!isCameraOff ? (
-                      <img src={profile?.avatar_url || MOCK_USER.avatar} alt="" className="w-full h-full object-cover opacity-50" />
-                    ) : (
-                      <div className="w-full h-full bg-gray-900 flex items-center justify-center">
-                        <VideoOff size={24} className="sm:size-[48px] text-gray-700" />
-                      </div>
-                    )}
-                    <div className="absolute inset-0 flex items-center justify-center">
-                      <img src={profile?.avatar_url || MOCK_USER.avatar} alt="" className="w-10 h-10 sm:w-24 sm:h-24 rounded-full border-2 border-white/20" />
-                    </div>
-                    <div className="absolute bottom-2 left-2 sm:bottom-4 sm:left-4 bg-black/50 backdrop-blur-md px-2 py-0.5 sm:px-3 sm:py-1 rounded-full text-white text-[9px] sm:text-xs font-bold">
-                      You
-                    </div>
-                  </div>
-
-                  {/* Selected Chat User (Always present in 1-on-1, or first in group) */}
-                  <div className="relative bg-gray-900 rounded-xl sm:rounded-3xl overflow-hidden border-2 border-indigo-500 shadow-2xl shadow-indigo-500/20 aspect-[4/3] sm:aspect-video md:aspect-auto">
-                    <img src={selectedChat.user.avatar} alt="" className="w-full h-full object-cover opacity-50" />
-                    <div className="absolute inset-0 flex items-center justify-center">
-                      <div className="text-center">
-                        <img src={selectedChat.user.avatar} alt="" className="w-10 h-10 sm:w-24 sm:h-24 rounded-full border-2 sm:border-4 border-indigo-500 mx-auto mb-1 sm:mb-2" />
-                        <h4 className="text-white font-bold text-[10px] sm:text-base">{selectedChat.user.displayName}</h4>
-                      </div>
-                    </div>
-                    <div className="absolute bottom-2 left-2 sm:bottom-4 sm:left-4 bg-black/50 backdrop-blur-md px-2 py-0.5 sm:px-3 sm:py-1 rounded-full text-white text-[9px] sm:text-xs font-bold flex items-center gap-1 sm:gap-2">
-                      <div className="w-1.5 h-1.5 sm:w-2 sm:h-2 bg-green-500 rounded-full"></div>
-                      {selectedChat.user.displayName}
-                    </div>
-                  </div>
-
-                  {/* Other Participants */}
-                  {participants.map((p, i) => (
-                    <div key={i} className="relative bg-gray-800 rounded-xl sm:rounded-3xl overflow-hidden border border-white/10 aspect-[4/3] sm:aspect-video md:aspect-auto">
-                      <div className="w-full h-full bg-gray-900 flex items-center justify-center">
-                        <div className="text-center">
-                          <div className="w-8 h-8 sm:w-20 sm:h-20 rounded-full bg-indigo-600/20 flex items-center justify-center mx-auto mb-1 sm:mb-2">
-                            <UserIcon size={16} className="sm:size-[32px] text-indigo-400" />
-                          </div>
-                          <h4 className="text-white font-bold text-[9px] sm:text-sm">{p.username}</h4>
-                        </div>
-                      </div>
-                      <div className="absolute bottom-2 left-2 sm:bottom-4 sm:left-4 bg-black/50 backdrop-blur-md px-2 py-0.5 sm:px-3 sm:py-1 rounded-full text-white text-[9px] sm:text-xs font-bold">
-                        {p.username}
-                      </div>
-                    </div>
-                  ))}
-                </div>
+                  <DmAgoraVideoCall
+                    key={`${dmAgoraChannelId}-${activeCall.id}`}
+                    appId={import.meta.env.VITE_AGORA_APP_ID || ''}
+                    channelName={dmAgoraChannelId}
+                    uid={agoraNumericUid(String(user?.id || ''))}
+                    onLeave={handleEndCall}
+                  />
               ) : (
                 <div className="h-full flex flex-col items-center justify-center">
                   <motion.div
@@ -2431,6 +2409,7 @@ export default function MessagesPage() {
             </div>
 
             {/* Call Controls */}
+            {activeCall.type !== 'video' && (
             <div className="p-3 sm:p-8 flex items-center justify-center gap-3 sm:gap-6 bg-gradient-to-t from-black/80 to-transparent">
               {activeCall.hostId === user?.id && !isLive && (
                 <button 
@@ -2458,29 +2437,6 @@ export default function MessagesPage() {
               >
                 {isMuted ? <MicOff size={16} className="sm:size-[24px]" /> : <Mic size={16} className="sm:size-[24px]" />}
               </button>
-              
-              {activeCall.type === 'video' && (
-                <>
-                  <button 
-                    onClick={() => setIsCameraOff(!isCameraOff)}
-                    className={cn(
-                      "w-9 h-9 sm:w-14 sm:h-14 rounded-full flex items-center justify-center transition-all",
-                      isCameraOff ? "bg-red-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
-                    )}
-                  >
-                    {isCameraOff ? <VideoOff size={16} className="sm:size-[24px]" /> : <Video size={16} className="sm:size-[24px]" />}
-                  </button>
-                  <button 
-                    onClick={() => setIsScreenSharing(!isScreenSharing)}
-                    className={cn(
-                      "w-9 h-9 sm:w-14 sm:h-14 rounded-full flex items-center justify-center transition-all",
-                      isScreenSharing ? "bg-green-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
-                    )}
-                  >
-                    <Monitor size={16} className="sm:size-[24px]" />
-                  </button>
-                </>
-              )}
 
               <button 
                 onClick={handleEndCall}
@@ -2489,6 +2445,7 @@ export default function MessagesPage() {
                 <PhoneOff size={20} className="sm:size-[32px]" />
               </button>
             </div>
+            )}
           </motion.div>
         )}
       </AnimatePresence>

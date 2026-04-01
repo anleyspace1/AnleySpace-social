@@ -3,7 +3,9 @@
  * - Default / empty: use **relative** paths like `/api/...` so the browser hits the same origin
  *   (Express+Vite on :3000 via `npm run dev`, or Vite on :5173 with `vite.config` proxy → :3000).
  * - Set `VITE_API_ORIGIN` (or `NEXT_PUBLIC_API_ORIGIN`) to your **deployed** API base URL when the
- *   frontend is on static hosting (e.g. Vercel) and the Express API is elsewhere.
+ *   frontend is on static hosting (e.g. Vercel) and the Express API is elsewhere. **Required** for
+ *   voice/video calls: `POST /api/calls/start` and Socket.IO signaling both use this origin (see
+ *   `socketIoClient.ts`). Without it, the browser talks to Vercel static hosting, which has no API.
  * - Do **not** set this to `http://localhost:...` in production — browsers will try the user's
  *   own machine, `fetch` throws "Failed to fetch", and feed fallbacks never run.
  */

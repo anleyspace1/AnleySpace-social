@@ -1,7 +1,8 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
-import { io, type Socket } from 'socket.io-client';
+import type { Socket } from 'socket.io-client';
 import { useAuth } from './AuthContext';
-import { API_ORIGIN, apiUrl, fetchFeedApiSafe } from '../lib/apiOrigin';
+import { apiUrl, fetchFeedApiSafe } from '../lib/apiOrigin';
+import { createSocketIoClient } from '../lib/socketIoClient';
 import { playNotificationSound } from '../lib/notificationSound';
 import { isSupabaseConfigured, supabase } from '../lib/supabase';
 
@@ -171,11 +172,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
   useEffect(() => {
     if (!user?.id) return;
 
-    const socketUrl = (API_ORIGIN && API_ORIGIN.trim()) || undefined;
-    const socket: Socket = io(socketUrl, {
-      transports: ["websocket", "polling"],
-      autoConnect: true,
-    });
+    const socket: Socket = createSocketIoClient();
 
     const register = () => socket.emit("register_user", user.id);
     socket.on("connect", register);

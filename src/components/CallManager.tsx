@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Phone, Video, X, PhoneOff, Check } from 'lucide-react';
-import io from 'socket.io-client';
+import { createSocketIoClient } from '../lib/socketIoClient';
 import { useAuth } from '../contexts/AuthContext';
 import { useNavigate } from 'react-router-dom';
 
@@ -14,7 +14,7 @@ export default function CallManager() {
   useEffect(() => {
     if (!user) return;
 
-    const socket = io(window.location.origin);
+    const socket = createSocketIoClient();
     socketRef.current = socket;
 
     socket.on('connect', () => {

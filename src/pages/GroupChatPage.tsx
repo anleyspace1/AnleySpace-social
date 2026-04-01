@@ -43,8 +43,9 @@ import { cn } from '../lib/utils';
 import AgoraCall from '../components/AgoraCall';
 import LiveChat from '../components/LiveChat';
 import { v4 as uuidv4 } from 'uuid';
-import io from 'socket.io-client';
 import { apiUrl } from '../lib/apiOrigin';
+import { readCallApiJson } from '../lib/callApiHelpers';
+import { createSocketIoClient } from '../lib/socketIoClient';
 
 /**
  * `messages` only persists `content`, `group_id`, `user_id` (no username / image_url / type).
@@ -474,7 +475,7 @@ export default function GroupChatPage() {
 
   useEffect(() => {
     // Initialize Socket.IO
-    const socket = io();
+    const socket = createSocketIoClient();
     socketRef.current = socket;
 
     const onUserTyping = (payload: { userId?: string; username?: string }) => {
@@ -1041,7 +1042,7 @@ export default function GroupChatPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ hostId: user.id, type, groupId: groupId })
       });
-      const data = await res.json();
+      const data = await readCallApiJson<{ id: string; capacity?: number }>(res, 'POST /api/calls/start');
       
       setActiveCall({ id: data.id, type, status: 'active', hostId: user.id });
       setCallCapacity(data.capacity);
@@ -1094,7 +1095,7 @@ export default function GroupChatPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId: user.id, channelName })
       });
-      const data = await res.json();
+      const data = await readCallApiJson<{ id: string }>(res, 'POST /api/lives/start');
       
       setActiveCall(prev => prev ? { ...prev, isLive: true, streamId: data.id } : null);
       socketRef.current.emit('call:go_live', { callId: activeCall.id, streamId: data.id });
@@ -1112,7 +1113,7 @@ export default function GroupChatPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ hostId: user.id, type: 'video', groupId: groupId })
       });
-      const callData = await resCall.json();
+      const callData = await readCallApiJson<{ id: string }>(resCall, 'POST /api/calls/start (go live)');
       
       // 2. Start a live session
       const channelName = `live_${callData.id}`;
@@ -1121,7 +1122,7 @@ export default function GroupChatPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId: user.id, channelName })
       });
-      const liveData = await resLive.json();
+      const liveData = await readCallApiJson<{ id: string }>(resLive, 'POST /api/lives/start (go live)');
       
       setActiveCall({ 
         id: callData.id, 
