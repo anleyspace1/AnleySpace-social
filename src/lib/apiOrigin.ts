@@ -1,38 +1,59 @@
 /**
  * Base URL for API calls.
- * - Default / empty: use **relative** paths like `/api/...` so the browser hits the same origin
- *   (Express+Vite on :3000 via `npm run dev`, or Vite on :5173 with `vite.config` proxy → :3000).
- * - Set `VITE_API_ORIGIN` (or `NEXT_PUBLIC_API_ORIGIN`) to your **deployed** API base URL when the
- *   frontend is on static hosting (e.g. Vercel) and the Express API is elsewhere. **Required** for
- *   voice/video calls: `POST /api/calls/start` and Socket.IO signaling both use this origin (see
- *   `socketIoClient.ts`). Without it, the browser talks to Vercel static hosting, which has no API.
- * - Do **not** set this to `http://localhost:...` in production — browsers will try the user's
- *   own machine, `fetch` throws "Failed to fetch", and feed fallbacks never run.
+ *
+ * Resolution: `VITE_API_ORIGIN` (or `NEXT_PUBLIC_API_ORIGIN`) → else `window.location.origin`.
+ * - **Dev (Vite):** env unset → same origin as the dev server; `/api/*` and `/socket.io` proxy to Express.
+ * - **Production (e.g. Vercel static):** set `VITE_API_ORIGIN=https://your-api.example.com` (no trailing slash)
+ *   so `fetch` and Socket.IO hit your deployed Node server. Without it, requests use the static host and
+ *   calls fail (`Could not start call`).
+ *
+ * Do **not** set production env to `localhost` — it is ignored in production builds.
  */
-function resolveApiOrigin(): string {
+
+function warnMissingViteApiOriginInProdOnce(): void {
+  if (!import.meta.env.PROD) return;
+  const env =
+    (import.meta.env.VITE_API_ORIGIN as string | undefined)?.trim() ||
+    (import.meta.env.NEXT_PUBLIC_API_ORIGIN as string | undefined)?.trim();
+  if (!env) {
+    console.error('Missing VITE_API_ORIGIN – calls will fail on Vercel');
+  }
+}
+
+warnMissingViteApiOriginInProdOnce();
+
+/**
+ * API base: env when set and valid, otherwise `window.location.origin` in the browser, else `''`.
+ * Matches: `import.meta.env.VITE_API_ORIGIN || window.location.origin` (with trimming / prod localhost guard).
+ */
+export function getApiBase(): string {
   const raw =
     (import.meta.env.VITE_API_ORIGIN as string | undefined)?.trim() ||
     (import.meta.env.NEXT_PUBLIC_API_ORIGIN as string | undefined)?.trim() ||
-    "";
-  let o = raw.replace(/\/$/, "");
-  if (import.meta.env.PROD && o && /localhost|127\.0\.0\.1/i.test(o)) {
+    '';
+  let fromEnv = raw.replace(/\/$/, '');
+  if (import.meta.env.PROD && fromEnv && /localhost|127\.0\.0\.1/i.test(fromEnv)) {
     console.warn(
-      '[apiOrigin] Ignoring localhost/127.0.0.1 API origin in production. Use your deployed API URL or leave unset (Supabase fallbacks for feed like/comment).'
+      '[apiOrigin] Ignoring localhost/127.0.0.1 API origin in production. Use your deployed API URL or leave unset to use window.location.origin.'
     );
-    o = '';
+    fromEnv = '';
   }
-  return o;
+  if (fromEnv) return fromEnv;
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    return window.location.origin;
+  }
+  return '';
 }
 
-export const API_ORIGIN = resolveApiOrigin();
-
 /**
- * Build API URL: relative `/api/...` when `VITE_API_ORIGIN` is unset (preferred for dev proxy).
+ * Absolute API URL: `{getApiBase()}{path}`. In the browser, `getApiBase()` is never empty, so paths are always
+ * same-origin absolute (dev) or pointed at `VITE_API_ORIGIN` (deployed API).
  */
 export function apiUrl(path: string): string {
-  const p = path.startsWith("/") ? path : `/${path}`;
-  if (!API_ORIGIN) return p;
-  return `${API_ORIGIN}${p}`;
+  const p = path.startsWith('/') ? path : `/${path}`;
+  const base = getApiBase();
+  if (!base) return p;
+  return `${base.replace(/\/$/, '')}${p}`;
 }
 
 /**

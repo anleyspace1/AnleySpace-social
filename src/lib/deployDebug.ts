@@ -3,7 +3,7 @@
  * Does not change UI — console only.
  */
 
-import { API_ORIGIN } from './apiOrigin';
+import { getApiBase } from './apiOrigin';
 
 let clientEnvLogged = false;
 
@@ -36,7 +36,7 @@ export function logClientDeployEnvOnce(): void {
     supabaseAnonKeyPresent: anonPresent,
     viteApiOriginRaw: rawViteApi || '(empty)',
     nextPublicApiOriginRaw: rawNextApi || '(empty)',
-    effectiveApiOrigin: API_ORIGIN || '(empty — relative /api/...; feed like/comment use Supabase if API missing)',
+    effectiveApiOrigin: getApiBase() || '(empty)',
   });
 
   if (hostname.includes('vercel.app') || hostname.endsWith('vercel.com')) {

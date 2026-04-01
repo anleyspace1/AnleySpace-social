@@ -30,14 +30,13 @@ import {
   Image as ImageIcon
 } from 'lucide-react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import io from 'socket.io-client';
-import type { Socket } from 'socket.io-client';
 import { cn } from '../lib/utils';
 import { MOCK_USER } from '../constants';
 import CameraFilters, { CAMERA_FILTERS, Filter } from '../components/CameraFilters';
 import FaceFilterEngine from '../components/FaceFilterEngine';
 import { useAuth } from '../contexts/AuthContext';
 import { apiUrl } from '../lib/apiOrigin';
+import { createSocketIoClient } from '../lib/socketIoClient';
 
 // Game Types
 type GameType = 'coin_rain' | 'gift_bomb' | 'power_duel' | 'live_kingdom' | 'spin_storm';
@@ -185,8 +184,8 @@ export default function LivePage() {
       checkCall();
     }
 
-    // Initialize Socket
-    socketRef.current = io(window.location.origin);
+    // Initialize Socket (same origin as API: VITE_API_ORIGIN or window.location.origin)
+    socketRef.current = createSocketIoClient();
     const socket = socketRef.current;
 
     const joinRoom = () => {

@@ -1,6 +1,6 @@
 import io from 'socket.io-client';
 import type { Socket } from 'socket.io-client';
-import { API_ORIGIN } from './apiOrigin';
+import { getApiBase } from './apiOrigin';
 
 const defaultOptions = {
   transports: ['websocket', 'polling'] as const,
@@ -9,12 +9,10 @@ const defaultOptions = {
 
 /**
  * Socket.IO connection to the same Express host that serves `/api/*`.
- * - Dev (Vite): `VITE_API_ORIGIN` unset → same browser origin; Vite proxies `/socket.io` → :3000.
- * - Production (Vercel static): **must** set `VITE_API_ORIGIN=https://your-api.example.com` so the
- *   client connects to your deployed Node server (calls, signaling). Connecting to the Vercel URL
- *   has no Socket.IO server and calls will fail.
+ * Uses `getApiBase()` → `VITE_API_ORIGIN` when set, else `window.location.origin` (dev proxy).
+ * On Vercel static hosting, set `VITE_API_ORIGIN` to your API server so Socket.IO does not connect to Vercel.
  */
 export function createSocketIoClient(): Socket {
-  const url = (API_ORIGIN && API_ORIGIN.trim()) || undefined;
+  const url = getApiBase() || undefined;
   return io(url, defaultOptions);
 }
