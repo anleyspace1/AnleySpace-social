@@ -11,6 +11,12 @@ export async function rewardInviter(userId: string, action: string, coins: numbe
     .single();
 
   const inviterId = String((profile as { referred_by?: string | null } | null)?.referred_by || '').trim();
+  console.log('REFERRAL CHECK:', {
+    userId: uid,
+    inviterId: inviterId || null,
+    action,
+    coins,
+  });
   if (!inviterId) return;
 
   const { data: existing } = await supabase
@@ -35,18 +41,26 @@ export async function rewardInviter(userId: string, action: string, coins: numbe
     return;
   }
 
-  const { error: insertError } = await supabase.from('referral_rewards').insert({
-    inviter_id: inviterId,
-    referred_user_id: uid,
-    action,
-    coins,
-  });
+  const { data: insertData, error: insertError } = await supabase
+    .from('referral_rewards')
+    .insert({
+      inviter_id: inviterId,
+      referred_user_id: uid,
+      action,
+      coins,
+    })
+    .select();
+  console.log('REFERRAL INSERT:', { data: insertData, error: insertError });
   if (insertError) return;
 
-  await supabase.rpc('increment_user_coins', {
+  const { error: rpcError } = await supabase.rpc('increment_user_coins', {
     p_user_id: inviterId,
     p_amount: coins,
   });
+  console.log('REFERRAL COINS ADDED:', inviterId);
+  if (rpcError) {
+    console.warn('[referralRewards] increment_user_coins:', rpcError);
+  }
 
   await supabase.from('notifications').insert({
     user_id: inviterId,

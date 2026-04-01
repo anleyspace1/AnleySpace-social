@@ -1938,6 +1938,9 @@ function VideoPost({
             intersectingRef.current = true;
             pauseAllReelVideos();
             onReelActive(reelId);
+            if (reelId) {
+              console.log('VIDEO VISIBLE:', reelId);
+            }
             if (user?.id && reelId) {
               startCreatorValidViewWatch(user.id, reelId);
             }

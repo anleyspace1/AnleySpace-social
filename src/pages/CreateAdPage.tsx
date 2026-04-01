@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { supabase } from '../lib/supabase';
-import { deductCoins, incrementCoins } from '../lib/coinsWallet';
+import { incrementCoins, platformSpendCoins, revertPlatformSpend } from '../lib/coinsWallet';
 import { resolveStorageExtension, storageUploadContentType } from '../lib/storageUpload';
 
 const AD_DURATION_OPTIONS = [
@@ -57,7 +57,11 @@ export default function CreateAdPage() {
         return;
       }
 
-      await deductCoins(authUser.id, adCostCoins);
+      const spend = await platformSpendCoins(authUser.id, adCostCoins, 'ads');
+      if (!spend.ok) {
+        alert(spend.error === 'insufficient_coins' ? 'Not enough coins' : spend.error || 'Payment failed');
+        return;
+      }
       deducted = true;
 
       const ext = resolveStorageExtension(imageFile.name || imageFile.type || '', 'jpg');
@@ -97,6 +101,7 @@ export default function CreateAdPage() {
         const uid = authData.user?.id;
         if (uid) {
           await incrementCoins(uid, adCostCoins);
+          await revertPlatformSpend(adCostCoins);
         }
       }
       alert(err?.message || 'Failed to submit ad');

@@ -18,6 +18,11 @@ export default function SignupPage() {
     setLoading(true);
     setError('');
     try {
+      console.log('SIGNUP INPUT:', {
+        fullNameInput: name,
+        usernameInput: username,
+      });
+
       const normalizedUsername = (username || '').toLowerCase().replace(/\s/g, '_');
       const fallbackUsername = email.split('@')[0]?.toLowerCase().replace(/\s/g, '_') || '';
       const finalUsername = normalizedUsername || fallbackUsername;
@@ -35,7 +40,11 @@ export default function SignupPage() {
       if (authError) throw authError;
 
       if (authData.user) {
-        const fallbackUsername = `user_${authData.user.id.slice(0, 6)}`;
+        const userIdFallback = `user_${authData.user.id.slice(0, 6)}`;
+        const usernameFromEmail = email.split('@')[0]?.toLowerCase().replace(/\s/g, '_') || '';
+        const guaranteedUsername = (finalUsername || usernameFromEmail || userIdFallback)
+          .toLowerCase()
+          .replace(/\s/g, '_');
         let existingUsername = '';
         try {
           const { data: existingProfile } = await supabase
@@ -52,45 +61,104 @@ export default function SignupPage() {
           Boolean(finalUsername) &&
           (!existingUsername || existingUsername.toLowerCase().startsWith('user_'));
 
-        const { error: profileError } = await supabase
+        const firstUpsertUsername =
+          (shouldUseEnteredUsername && finalUsername ? finalUsername : existingUsername) ||
+          guaranteedUsername;
+
+        console.log('USERNAME SOURCE:', firstUpsertUsername);
+        console.log('USERNAME SOURCE DETAIL:', {
+          formInput: normalizedUsername || null,
+          emailSplit: usernameFromEmail || null,
+          generatedUserIdFallback: userIdFallback,
+          finalUsername,
+          guaranteedUsername,
+          firstUpsertUsername,
+        });
+
+        console.log('PROFILE INSERT DATA:', {
+          id: authData.user.id,
+          username: firstUpsertUsername,
+          email,
+        });
+        if (!firstUpsertUsername) {
+          console.warn('USERNAME IS EMPTY OR NULL');
+        }
+
+        const profileUpsertPayload1 = {
+          id: authData.user.id,
+          username: firstUpsertUsername,
+          display_name: name || null,
+          full_name: name || null,
+          avatar_url: null,
+        };
+        console.log('PROFILE UPSERT DATA:', {
+          id: profileUpsertPayload1.id,
+          full_name: profileUpsertPayload1.full_name,
+          display_name: profileUpsertPayload1.display_name,
+          username: profileUpsertPayload1.username,
+        });
+
+        const {
+          data: profileUpsert1Data,
+          error: profileError,
+        } = await supabase
           .from('profiles')
-          .upsert(
-            {
-              id: authData.user.id,
-              username: shouldUseEnteredUsername
-                ? finalUsername
-                : (existingUsername || finalUsername || fallbackUsername),
-              display_name: name || null,
-              full_name: name || null,
-              avatar_url: null,
-            },
+          .upsert(profileUpsertPayload1,
             { onConflict: 'id' }
-          );
-        
+          )
+          .select('id, username, full_name, display_name')
+          .maybeSingle();
+
+        console.log('PROFILE INSERT RESULT:', { data: profileUpsert1Data, error: profileError });
+
         if (profileError && !String(profileError.message || '').includes('duplicate key')) {
           console.error('Error creating profile:', profileError);
         }
 
         // Authoritative signup sync: persist the real entered username/name.
         // Keep existing safeguards; this ensures fallback user_xxx is replaced immediately.
-        const { error: profileSyncError } = await supabase
+        console.log('PROFILE INSERT DATA (signup sync upsert):', {
+          id: authData.user.id,
+          username: guaranteedUsername,
+          email,
+        });
+        if (!guaranteedUsername) {
+          console.warn('USERNAME IS EMPTY OR NULL (signup sync upsert)');
+        }
+
+        const profileUpsertPayload2 = {
+          id: authData.user.id,
+          username: guaranteedUsername,
+          display_name: name || null,
+          full_name: name || null,
+        };
+        console.log('PROFILE UPSERT DATA (sync):', {
+          id: profileUpsertPayload2.id,
+          full_name: profileUpsertPayload2.full_name,
+          display_name: profileUpsertPayload2.display_name,
+          username: profileUpsertPayload2.username,
+        });
+
+        const {
+          data: profileUpsert2Data,
+          error: profileSyncError,
+        } = await supabase
           .from('profiles')
-          .upsert(
-            {
-              id: authData.user.id,
-              username: finalUsername || fallbackUsername,
-              display_name: name || null,
-              full_name: name || null,
-            },
-            { onConflict: 'id' }
-          );
+          .upsert(profileUpsertPayload2, { onConflict: 'id' })
+          .select('id, username, full_name, display_name')
+          .maybeSingle();
+
+        console.log('PROFILE INSERT RESULT (signup sync upsert):', {
+          data: profileUpsert2Data,
+          error: profileSyncError,
+        });
         if (profileSyncError) {
           console.warn('Profile sync after signup failed:', profileSyncError);
         }
 
         // Defensive cleanup: keep one valid profile and remove duplicate extras.
         try {
-          const expectedUsername = finalUsername || fallbackUsername;
+          const expectedUsername = finalUsername || usernameFromEmail || userIdFallback;
           const { data: duplicateCandidates, error: dupErr } = await supabase
             .from('profiles')
             .select('id, username, created_at')

@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { motion } from 'motion/react';
 import { 
   Share2, 
@@ -19,12 +20,23 @@ import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../lib/supabase';
 
 export default function InviteEarnPage() {
+  const [searchParams] = useSearchParams();
   const { user } = useAuth();
   const [copied, setCopied] = useState(false);
   const [totalEarned, setTotalEarned] = useState(0);
   const [progress, setProgress] = useState(0);
   const referralCode = String(user?.id || 'ANL8F92K').slice(0, 8).toUpperCase();
   const referralLink = `${window.location.origin}/invite?code=${encodeURIComponent(referralCode)}`;
+
+  useEffect(() => {
+    const code = searchParams.get('code');
+    if (code != null && String(code).length > 0) {
+      console.log('INVITE CODE DETECTED:', code);
+      const normalized = String(code).trim().toUpperCase();
+      localStorage.setItem('invite_code', normalized);
+      console.log('INVITE CODE SAVED:', normalized);
+    }
+  }, [searchParams]);
 
   const copyToClipboard = () => {
     navigator.clipboard.writeText(referralLink);

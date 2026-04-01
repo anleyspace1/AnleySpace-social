@@ -15,10 +15,18 @@ export default function ForgotPasswordPage() {
     setLoading(true);
     setError('');
     try {
-      const { error } = await supabase.auth.resetPasswordForEmail(email, {
-        redirectTo: `${window.location.origin}/reset-password`,
+      const redirectTo = `${window.location.origin}/reset-password`;
+      console.log('RESET REQUEST:', { email, redirectTo });
+      console.log('RESET REDIRECT URL:', redirectTo);
+      const { data, error } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo,
       });
-      if (error) throw error;
+      console.log('RESET REQUEST RESULT:', { data, error });
+      if (error) {
+        console.log('RESET REQUEST error.message:', error.message);
+        console.log('RESET REQUEST error.status:', (error as { status?: number }).status);
+        throw error;
+      }
       setSuccess(true);
     } catch (err: any) {
       setError(err.message || 'Failed to send reset link');

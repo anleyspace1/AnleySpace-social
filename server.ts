@@ -204,9 +204,33 @@ async function syncGroupMembershipToSupabase(args: {
     return { ok: false, error: "user_id is required and must be non-empty" };
   }
 
-  const { error: perr } = await client.from("profiles").upsert({ id: uid }, { onConflict: "id" });
-  if (perr && perr.code !== "42P01") {
-    console.warn(`[syncGroupMembershipToSupabase] ${args.context} profiles upsert:`, perr.code, perr.message);
+  const placeholderUsername = `user_${uid.slice(0, 6)}`;
+  const { data: existingProfile, error: profileSelErr } = await client
+    .from("profiles")
+    .select("id, username")
+    .eq("id", uid)
+    .maybeSingle();
+
+  if (profileSelErr && profileSelErr.code !== "42P01") {
+    console.warn(
+      `[syncGroupMembershipToSupabase] ${args.context} profiles select:`,
+      profileSelErr.code,
+      profileSelErr.message
+    );
+  }
+
+  const hasUsername =
+    Boolean(existingProfile?.id) && String(existingProfile?.username ?? "").trim().length > 0;
+
+  if (!hasUsername) {
+    const { error: perr } = await client
+      .from("profiles")
+      .upsert({ id: uid, username: placeholderUsername }, { onConflict: "id" })
+      .select("id, username")
+      .maybeSingle();
+    if (perr && perr.code !== "42P01") {
+      console.warn(`[syncGroupMembershipToSupabase] ${args.context} profiles upsert:`, perr.code, perr.message);
+    }
   }
 
   const { data: upsertRows, error: upErr } = await client

@@ -1,5 +1,5 @@
 import { supabase, isSupabaseConfigured } from './supabase';
-import { deductCoins, incrementCoins } from './coinsWallet';
+import { incrementCoins, platformSpendCoins, revertPlatformSpend } from './coinsWallet';
 import { addBoostAmount } from './personalizedRanking';
 
 const BOOST_COST = 50;
@@ -8,10 +8,18 @@ export async function boostPostAction(postId: string, userId: string): Promise<{
   if (!isSupabaseConfigured || !postId || !userId) {
     return { ok: false, message: 'Unavailable' };
   }
-  try {
-    await deductCoins(userId, BOOST_COST);
-  } catch {
-    return { ok: false, message: 'Not enough coins (50 required).' };
+  console.log('ADMIN ACTION:', {
+    action: 'boost_post',
+    adminId: userId,
+    postId: postId,
+  });
+  const spend = await platformSpendCoins(userId, BOOST_COST, 'boost');
+  if (!spend.ok) {
+    return {
+      ok: false,
+      message:
+        spend.error === 'insufficient_coins' ? 'Not enough coins (50 required).' : spend.error || 'Payment failed',
+    };
   }
   const { error } = await supabase.from('post_boosts').insert({
     post_id: postId,
@@ -20,6 +28,7 @@ export async function boostPostAction(postId: string, userId: string): Promise<{
   });
   if (error) {
     await incrementCoins(userId, BOOST_COST);
+    await revertPlatformSpend(BOOST_COST);
     return { ok: false, message: error.message || 'Boost failed' };
   }
   addBoostAmount(postId, BOOST_COST);

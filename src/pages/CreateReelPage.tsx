@@ -200,6 +200,7 @@ export default function CreateReelPage() {
         error: insertError ?? null,
       });
       if (insertError) throw insertError;
+      console.log('REFERRAL TRIGGER: first_post', user.id);
       void rewardInviter(user.id, 'first_post', 15);
 
       // Diagnostics only: verify whether direct Supabase table access works under current auth/RLS.

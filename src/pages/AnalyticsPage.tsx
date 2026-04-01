@@ -243,6 +243,7 @@ const TX_DEBIT_TYPES = new Set([
   'game_start',
   'purchase',
   'fee',
+  'spend',
 ]);
 
 /** Sum earned vs spent from local API transaction rows (null-safe). */

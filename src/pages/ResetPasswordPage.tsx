@@ -13,12 +13,54 @@ export default function ResetPasswordPage() {
   const navigate = useNavigate();
 
   useEffect(() => {
-    // Check if we have a session (the user should be logged in via the reset link)
-    getCachedSession().then((session) => {
-      if (!session) {
-        setError('Invalid or expired reset link. Please request a new one.');
+    const run = async () => {
+      console.log('RESET PAGE LOADED:', window.location.href);
+      const hash = window.location.hash || '';
+      const search = window.location.search || '';
+      const hasAccessTokenInUrl =
+        /access_token=/.test(hash) ||
+        /access_token=/.test(search) ||
+        /type=recovery/.test(hash) ||
+        /type=recovery/.test(search);
+      console.log('RESET URL DEBUG:', {
+        origin: window.location.origin,
+        pathname: window.location.pathname,
+        hashPreview: hash ? `${hash.slice(0, 80)}${hash.length > 80 ? '…' : ''}` : '(empty)',
+        search,
+        hasAccessTokenInUrl,
+      });
+      if (!hasAccessTokenInUrl) {
+        console.warn(
+          'RESET DEBUG: Missing access_token / type=recovery in URL (link may be wrong domain, expired, or already consumed)'
+        );
       }
-    });
+
+      const { data } = await supabase.auth.getSession();
+      console.log('RESET SESSION:', data);
+
+      if (!data.session) {
+        console.warn('RESET DEBUG: session is null after getSession() on reset page load');
+      }
+
+      // Check if we have a session (the user should be logged in via the reset link)
+      const session = await getCachedSession();
+      if (!session) {
+        console.warn('RESET DEBUG: getCachedSession() returned null');
+        setError('Invalid or expired reset link. Please request a new one.');
+      } else {
+        console.log('RESET DEBUG: recovery session present (user id):', session.user?.id);
+      }
+    };
+    void run();
+
+    const t = window.setTimeout(async () => {
+      const { data } = await supabase.auth.getSession();
+      console.log('RESET SESSION (delayed 750ms):', data);
+      if (!data.session) {
+        console.warn('RESET DEBUG: session still null after delay — token may not have been parsed');
+      }
+    }, 750);
+    return () => window.clearTimeout(t);
   }, []);
 
   const handleReset = async (e: React.FormEvent) => {
@@ -30,9 +72,18 @@ export default function ResetPasswordPage() {
     setLoading(true);
     setError('');
     try {
-      const { error } = await supabase.auth.updateUser({
+      const pre = await supabase.auth.getSession();
+      console.log('UPDATE PASSWORD ATTEMPT (session before updateUser):', pre.data);
+
+      console.log('UPDATE PASSWORD ATTEMPT');
+      const { data, error } = await supabase.auth.updateUser({
         password: password,
       });
+      console.log('UPDATE PASSWORD RESULT:', { data, error });
+      if (error) {
+        console.log('UPDATE PASSWORD ERROR.message:', error.message);
+        console.log('UPDATE PASSWORD ERROR.status:', (error as { status?: number }).status);
+      }
       if (error) throw error;
       setSuccess(true);
       setTimeout(() => navigate('/login'), 3000);

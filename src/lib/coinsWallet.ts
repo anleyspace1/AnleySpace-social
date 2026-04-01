@@ -47,3 +47,35 @@ export async function deductCoins(userId: string, amount: number): Promise<numbe
 
   return newCoins;
 }
+
+export type PlatformSpendTarget = 'boost' | 'ads';
+
+/** Deduct user coins, credit platform wallet, insert transactions row (type spend + target). Uses RPC. */
+export async function platformSpendCoins(
+  userId: string,
+  amount: number,
+  target: PlatformSpendTarget
+): Promise<{ ok: boolean; newBalance?: number; error?: string }> {
+  if (!isSupabaseConfigured || !userId || amount <= 0) {
+    return { ok: false, error: 'invalid' };
+  }
+  const { data, error } = await supabase.rpc('platform_spend_coins', {
+    p_user_id: userId,
+    p_amount: Math.floor(amount),
+    p_target: target,
+  });
+  if (error) {
+    return { ok: false, error: error.message || 'rpc_error' };
+  }
+  const d = data as { ok?: boolean; error?: string; new_balance?: number } | null;
+  if (!d?.ok) {
+    return { ok: false, error: d?.error || 'failed' };
+  }
+  return { ok: true, newBalance: d.new_balance };
+}
+
+/** Reverse platform_wallet credit when refunding a user after a failed follow-up step (e.g. insert). */
+export async function revertPlatformSpend(amount: number): Promise<void> {
+  if (!isSupabaseConfigured || amount <= 0) return;
+  await supabase.rpc('revert_platform_spend', { p_amount: Math.floor(amount) });
+}

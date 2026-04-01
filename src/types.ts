@@ -102,7 +102,7 @@ export type Post = {
 
 export type Transaction = {
   id: string;
-  type: 'earn' | 'send' | 'receive' | 'withdraw' | 'exchange';
+  type: 'earn' | 'send' | 'receive' | 'withdraw' | 'exchange' | 'spend';
   amount: number;
   description: string;
   timestamp: string;

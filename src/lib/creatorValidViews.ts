@@ -2,7 +2,6 @@ import { supabase } from './supabase';
 
 const MIN_VALID_VIEW_SECONDS = 7;
 const watchStartMap = new Map<string, number>();
-const sessionSent = new Set<string>();
 
 const keyFor = (viewerId: string, postId: string) => `${viewerId}:${postId}`;
 
@@ -25,15 +24,31 @@ export async function stopCreatorValidViewWatch(viewerId: string, postId: string
 
   const watchedSeconds = Math.floor((Date.now() - startedAt) / 1000);
   if (watchedSeconds < MIN_VALID_VIEW_SECONDS) return;
-  if (sessionSent.has(key)) return;
-  sessionSent.add(key);
+
+  console.log('TRACK VIEW START', {
+    postId: p,
+    viewerId: v,
+    watchSeconds: watchedSeconds,
+  });
 
   const { data, error } = await supabase.rpc('reward_creator_valid_view', {
     p_post_id: p,
     p_viewer_id: v,
     p_watch_seconds: watchedSeconds,
   });
+  console.log('TRACK VIEW RESULT', { data, error });
   if (error) {
+    console.log('TRACK VIEW RESULT FULL:', JSON.stringify(error));
+    const errObj = error as { message?: string; code?: string; details?: string; hint?: string };
+    console.log(
+      'TRACK VIEW RESULT FULL (fields):',
+      JSON.stringify({
+        message: errObj.message,
+        code: errObj.code,
+        details: errObj.details,
+        hint: errObj.hint,
+      })
+    );
     console.warn('[creatorValidViews] reward_creator_valid_view failed:', error.message);
     return;
   }

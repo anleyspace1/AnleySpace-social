@@ -41,8 +41,8 @@ export default function Sidebar({
   const groupUnread = groupNotif?.unreadCount ?? 0;
   const isAdmin = user?.email === 'anleyspace@gmail.com';
   const [displayUser, setDisplayUser] = useState({
-    displayName: 'User',
-    username: 'user',
+    displayName: '',
+    username: '',
     avatar: MOCK_USER.avatar as string,
   });
 
@@ -65,25 +65,28 @@ export default function Sidebar({
 
       const { data: profileRow, error } = await supabase
         .from('profiles')
-        .select('username, avatar_url')
+        .select('username, avatar_url, display_name')
         .eq('id', uid)
         .maybeSingle();
 
       if (cancelled) return;
 
       if (error || !profileRow) {
+        const fb = uid ? `user_${uid.slice(0, 6)}` : 'user';
         setDisplayUser({
           displayName: 'User',
-          username: uid ? `user_${uid.slice(0, 6)}` : 'user',
+          username: fb,
           avatar: MOCK_USER.avatar as string,
         });
         return;
       }
 
-      const uname = (profileRow.username || '').trim() || (uid ? `user_${uid.slice(0, 6)}` : 'user');
+      const handle =
+        (profileRow.username || '').trim() || (uid ? `user_${uid.slice(0, 6)}` : 'user');
+      const label = String(profileRow.display_name || '').trim() || handle;
       setDisplayUser({
-        displayName: uname,
-        username: uname,
+        displayName: label,
+        username: handle,
         avatar: profileRow.avatar_url || (MOCK_USER.avatar as string),
       });
     };

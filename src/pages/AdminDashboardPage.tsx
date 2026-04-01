@@ -4,6 +4,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { apiUrl } from '../lib/apiOrigin';
 import { getBearerAuthHeaders } from '../lib/supabaseAuthHeaders';
 import { supabase } from '../lib/supabase';
+import { boostPostAction, BOOST_COST } from '../lib/boostPost';
 
 type WithdrawRequest = {
   id: string;
@@ -67,6 +68,13 @@ type TopEarningUser = {
   user_id: string;
   username: string | null;
   coins_earned: number;
+  monetization_disabled: boolean;
+};
+
+type SuspiciousPost = {
+  post_id: string;
+  reports_count: number;
+  user_id: string | null;
 };
 
 const ADMIN_EMAIL = 'anleyspace@gmail.com';
@@ -106,6 +114,23 @@ export default function AdminDashboardPage() {
     totalCreatorPayouts: 0,
     totalValidViews: 0,
     topEarningUsers: [] as TopEarningUser[],
+    totalLikes: 0,
+    totalComments: 0,
+    adsSummary: {
+      totalAds: 0,
+      activeAds: 0,
+      totalClicks: 0,
+      totalImpressions: 0,
+      avgCtrPct: 0,
+    },
+    suspiciousPosts: [] as SuspiciousPost[],
+    platformWalletCoins: 0,
+    platformRevenueUsd: 0,
+    todayRevenueCoins: 0,
+    todayRevenueUsd: 0,
+    netProfitCoins: 0,
+    netProfitUsd: 0,
+    totalPayoutsCost: 0,
   });
   const [loading, setLoading] = useState<boolean>(true);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -157,9 +182,18 @@ export default function AdminDashboardPage() {
           .from('posts')
           .select('*', { count: 'exact', head: true });
 
-        const { data: viewsData } = await supabase
+        const { data: posts } = await supabase
           .from('posts')
-          .select('views, view_count');
+          .select('view_count, views, valid_views');
+
+        let totalViews = 0;
+        let totalValidViews = 0;
+        (posts || []).forEach((p) => {
+          const row = p as { view_count?: number | null; views?: number | null; valid_views?: number | null };
+          totalViews += Number(row.view_count || row.views || 0) || 0;
+          totalValidViews += Number(row.valid_views || 0) || 0;
+        });
+        console.log('ADMIN VIEWS DEBUG:', (posts || []).slice(0, 5));
 
         const { count: activeToday } = await supabase
           .from('profiles')
@@ -188,22 +222,10 @@ export default function AdminDashboardPage() {
             0
           );
 
-        const totalViews = (viewsData || []).reduce(
-          (sum, p) =>
-            sum +
-            (Number((p as { views?: number | null }).views ?? 0) ||
-              Number((p as { view_count?: number | null }).view_count ?? 0) ||
-              0),
-          0
-        );
-
-        const { data: validViewsRows } = await supabase
-          .from('posts')
-          .select('valid_views');
-        const totalValidViews = (validViewsRows || []).reduce(
-          (sum, r) => sum + Number((r as { valid_views?: number | null }).valid_views || 0),
-          0
-        );
+        const [{ count: likesCount }, { count: commentsCount }] = await Promise.all([
+          supabase.from('likes').select('*', { count: 'exact', head: true }),
+          supabase.from('comments').select('*', { count: 'exact', head: true }),
+        ]);
 
         const { data: creatorDailyRows } = await supabase
           .from('creator_daily_view_earnings')
@@ -226,22 +248,72 @@ export default function AdminDashboardPage() {
           user_id: x.user_id,
           username: null,
           coins_earned: x.coins_earned,
+          monetization_disabled: false,
         }));
         if (rankedUsers.length > 0) {
           const ids = rankedUsers.map((x) => x.user_id);
           const { data: profs } = await supabase
             .from('profiles')
-            .select('id, username')
+            .select('id, username, monetization_disabled')
             .in('id', ids);
           const userMap = new Map((profs || []).map((p: any) => [String(p.id), p]));
           topEarningUsers = rankedUsers.map((x) => ({
             user_id: x.user_id,
             username: String((userMap.get(x.user_id) as { username?: string | null } | undefined)?.username || '').trim() || null,
             coins_earned: x.coins_earned,
+            monetization_disabled: !!(userMap.get(x.user_id) as { monetization_disabled?: boolean | null } | undefined)
+              ?.monetization_disabled,
           }));
         }
 
-        setStats({
+        const totalLikes = likesCount || 0;
+        const totalComments = commentsCount || 0;
+
+        const { data: pwData, error: pwErr } = await supabase
+          .from('platform_wallet')
+          .select('coins')
+          .limit(1)
+          .maybeSingle();
+        const platformWalletCoins = pwErr
+          ? 0
+          : Number((pwData as { coins?: number | null } | null)?.coins ?? 0) || 0;
+        console.log('PLATFORM WALLET:', platformWalletCoins);
+
+        const usd = platformWalletCoins / 100;
+        console.log('PLATFORM REVENUE USD:', usd);
+
+        const { data: todayTx } = await supabase
+          .from('transactions')
+          .select('amount, created_at, type')
+          .gte('created_at', today.toISOString())
+          .eq('type', 'spend');
+
+        const todayRevenueCoins = (todayTx || []).reduce(
+          (sum, tx) => sum + Number((tx as { amount?: number | null }).amount || 0),
+          0
+        );
+        const todayRevenueUSD = todayRevenueCoins / 100;
+        console.log('DAILY REVENUE:', {
+          coins: todayRevenueCoins,
+          usd: todayRevenueUSD,
+        });
+
+        const { data: payouts } = await supabase.from('creator_daily_view_earnings').select('coins');
+        const totalPayouts = (payouts || []).reduce(
+          (sum, p) => sum + Number((p as { coins?: number | null }).coins || 0),
+          0
+        );
+
+        const netCoins = platformWalletCoins - totalPayouts;
+        const netUSD = netCoins / 100;
+        console.log('PROFIT:', {
+          revenue: platformWalletCoins,
+          payouts: totalPayouts,
+          net: netCoins,
+          usd: netUSD,
+        });
+
+        setStats((prev) => ({
           totalUsers: usersCount || 0,
           totalPosts: postsCount || 0,
           totalViews,
@@ -252,7 +324,18 @@ export default function AdminDashboardPage() {
           totalCreatorPayouts,
           totalValidViews,
           topEarningUsers,
-        });
+          totalLikes,
+          totalComments,
+          platformWalletCoins,
+          platformRevenueUsd: usd,
+          todayRevenueCoins,
+          todayRevenueUsd: todayRevenueUSD,
+          netProfitCoins: netCoins,
+          netProfitUsd: netUSD,
+          totalPayoutsCost: totalPayouts,
+          adsSummary: prev.adsSummary,
+          suspiciousPosts: prev.suspiciousPosts,
+        }));
 
         console.log('ADMIN STATS:', {
           usersCount,
@@ -305,6 +388,35 @@ export default function AdminDashboardPage() {
       setReports(Array.isArray(data) ? (data as ReportItem[]) : []);
     })();
   }, [isAdmin, profile]);
+
+  useEffect(() => {
+    const adsSummary = (() => {
+      const totalAds = ads.length;
+      const activeAds = ads.filter((a) => !!a.is_active).length;
+      const totalClicks = ads.reduce((sum, a) => sum + Number(a.clicks || 0), 0);
+      const totalImpressions = ads.reduce((sum, a) => sum + Number(a.impressions || 0), 0);
+      const avgCtrPct = totalImpressions > 0 ? (totalClicks / totalImpressions) * 100 : 0;
+      return { totalAds, activeAds, totalClicks, totalImpressions, avgCtrPct };
+    })();
+
+    const reportsByPost = new Map<string, number>();
+    reports.forEach((r) => {
+      const pid = String(r.post_id || '').trim();
+      if (!pid) return;
+      reportsByPost.set(pid, (reportsByPost.get(pid) || 0) + 1);
+    });
+    const suspiciousPosts = [...reportsByPost.entries()]
+      .filter(([, count]) => count >= 2)
+      .map(([post_id, reports_count]) => ({
+        post_id,
+        reports_count,
+        user_id: adminPosts.find((p) => p.id === post_id)?.user_id || null,
+      }))
+      .sort((a, b) => b.reports_count - a.reports_count)
+      .slice(0, 10);
+
+    setStats((prev) => ({ ...prev, adsSummary, suspiciousPosts }));
+  }, [ads, reports]);
 
   useEffect(() => {
     if (!isAdmin) return;
@@ -468,6 +580,11 @@ export default function AdminDashboardPage() {
   };
 
   const handleBanToggle = async (targetUserId: string, nextBanned: boolean) => {
+    console.log('ADMIN ACTION:', {
+      action: 'ban_user',
+      adminId: user?.id,
+      targetUserId: targetUserId,
+    });
     const { data, error } = await supabase
       .from('profiles')
       .update({ is_banned: nextBanned })
@@ -484,6 +601,11 @@ export default function AdminDashboardPage() {
   };
 
   const handleAdminDeletePost = async (postId: string) => {
+    console.log('ADMIN ACTION:', {
+      action: 'delete_post',
+      adminId: user?.id,
+      postId: postId,
+    });
     const { data, error } = await supabase
       .from('posts')
       .delete()
@@ -498,6 +620,12 @@ export default function AdminDashboardPage() {
   };
 
   const handleAdToggle = async (adId: string, nextActive: boolean) => {
+    console.log('ADMIN ACTION:', {
+      action: 'toggle_ad',
+      adminId: user?.id,
+      adId: adId,
+      isActive: nextActive,
+    });
     const { data, error } = await supabase
       .from('ads')
       .update({ is_active: nextActive })
@@ -553,6 +681,56 @@ export default function AdminDashboardPage() {
     setAds((prev) => prev.filter((a) => a.id !== adId));
   };
 
+  const handleToggleCreatorMonetization = async (targetUserId: string, nextDisabled: boolean) => {
+    const { error } = await supabase
+      .from('profiles')
+      .update({ monetization_disabled: nextDisabled })
+      .eq('id', targetUserId);
+    if (error) {
+      alert(error.message || 'Failed to update monetization status');
+      return;
+    }
+    setStats((prev) => ({
+      ...prev,
+      topEarningUsers: prev.topEarningUsers.map((u) =>
+        u.user_id === targetUserId ? { ...u, monetization_disabled: nextDisabled } : u
+      ),
+    }));
+  };
+
+  const handleBoostTopPost = async (postId: string) => {
+    if (!user?.id) {
+      alert('Please login first');
+      return;
+    }
+    const res = await boostPostAction(postId, user.id);
+    if (!res.ok) {
+      alert(res.message || 'Boost failed');
+      return;
+    }
+    alert(`Post boosted (${BOOST_COST} coins)`);
+  };
+
+  useEffect(() => {
+    if (!isAdmin) return;
+    if (ads.length === 0) return;
+    void (async () => {
+      const candidates = ads.filter((a) => {
+        const clicks = Number(a.clicks || 0);
+        const impressions = Number(a.impressions || 0);
+        const ctr = impressions > 0 ? (clicks / impressions) * 100 : 0;
+        return impressions > 100 && ctr < 1 && !!a.is_active;
+      });
+      if (candidates.length === 0) return;
+      for (const ad of candidates) {
+        await supabase.from('ads').update({ is_active: false }).eq('id', ad.id);
+      }
+      setAds((prev) =>
+        prev.map((a) => (candidates.some((c) => c.id === a.id) ? { ...a, is_active: false } : a))
+      );
+    })();
+  }, [isAdmin, ads]);
+
   if (authLoading || waitingProfile) return null;
   if (!isAdmin) return <div className="p-6 text-red-500">Access denied</div>;
 
@@ -567,7 +745,7 @@ export default function AdminDashboardPage() {
 
       <div className="mb-8">
         <h2 className="text-lg font-bold mb-3">Platform Stats</h2>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
           <div className="rounded-xl border border-white/10 bg-black/20 p-4">
             <p className="text-xs text-gray-300">Users</p>
             <p className="text-2xl font-black">{stats.totalUsers}</p>
@@ -577,8 +755,81 @@ export default function AdminDashboardPage() {
             <p className="text-2xl font-black">{stats.totalPosts}</p>
           </div>
           <div className="rounded-xl border border-white/10 bg-black/20 p-4">
-            <p className="text-xs text-gray-300">Views</p>
-            <p className="text-2xl font-black">{stats.totalViews}</p>
+            <p className="text-sm text-gray-300">
+              Views:{' '}
+              <span className="text-2xl font-black text-white">{stats.totalViews.toLocaleString()}</span>
+            </p>
+            <p className="text-sm text-gray-300 mt-2">
+              Valid Views:{' '}
+              <span className="text-xl font-black text-white">{stats.totalValidViews.toLocaleString()}</span>
+            </p>
+          </div>
+          <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-4">
+            <p className="text-xs text-amber-200/90">Platform earnings (coins)</p>
+            <p className="text-2xl font-black text-amber-100">{stats.platformWalletCoins.toLocaleString()}</p>
+          </div>
+        </div>
+
+        <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div className="rounded-xl border border-emerald-500/25 bg-emerald-500/10 p-4">
+            <h3 className="text-sm font-bold text-emerald-100/95 mb-2">Platform Revenue</h3>
+            <p className="text-sm text-gray-200">
+              Coins: <span className="font-black text-white">{stats.platformWalletCoins.toLocaleString()}</span>
+            </p>
+            <p className="text-sm text-gray-200 mt-1">
+              USD:{' '}
+              <span className="font-black text-emerald-200">
+                $
+                {stats.platformRevenueUsd.toLocaleString(undefined, {
+                  minimumFractionDigits: 2,
+                  maximumFractionDigits: 2,
+                })}
+              </span>
+            </p>
+          </div>
+          <div className="rounded-xl border border-sky-500/25 bg-sky-500/10 p-4">
+            <h3 className="text-sm font-bold text-sky-100/95 mb-2">Today Revenue</h3>
+            <p className="text-sm text-gray-200">
+              Coins: <span className="font-black text-white">{stats.todayRevenueCoins.toLocaleString()}</span>
+            </p>
+            <p className="text-sm text-gray-200 mt-1">
+              USD:{' '}
+              <span className="font-black text-sky-200">
+                $
+                {stats.todayRevenueUsd.toLocaleString(undefined, {
+                  minimumFractionDigits: 2,
+                  maximumFractionDigits: 2,
+                })}
+              </span>
+            </p>
+          </div>
+        </div>
+
+        <div className="mt-4 rounded-xl border border-violet-500/25 bg-violet-500/10 p-4">
+          <h3 className="text-sm font-bold text-violet-100/95 mb-3">Profit</h3>
+          <div className="space-y-1.5 text-sm text-gray-200">
+            <p>
+              Revenue:{' '}
+              <span className="font-black text-white">{stats.platformWalletCoins.toLocaleString()}</span>
+            </p>
+            <p>
+              Payouts:{' '}
+              <span className="font-black text-white">{stats.totalPayoutsCost.toLocaleString()}</span>
+            </p>
+            <p>
+              Net:{' '}
+              <span className="font-black text-white">{stats.netProfitCoins.toLocaleString()}</span>
+            </p>
+            <p>
+              USD:{' '}
+              <span className="font-black text-violet-200">
+                $
+                {stats.netProfitUsd.toLocaleString(undefined, {
+                  minimumFractionDigits: 2,
+                  maximumFractionDigits: 2,
+                })}
+              </span>
+            </p>
           </div>
         </div>
       </div>
@@ -599,6 +850,13 @@ export default function AdminDashboardPage() {
                 <div key={post.id} className="text-sm border border-white/10 rounded-lg p-2">
                   <div className="text-gray-300">Post: {post.id}</div>
                   <div className="font-bold">Views: {Number(post.views || 0)}</div>
+                  <button
+                    type="button"
+                    onClick={() => void handleBoostTopPost(post.id)}
+                    className="mt-2 px-2 py-1 rounded bg-indigo-600 text-white font-bold text-xs"
+                  >
+                    Boost Post
+                  </button>
                 </div>
               ))}
             </div>
@@ -641,11 +899,73 @@ export default function AdminDashboardPage() {
                 <div key={u.user_id} className="text-sm border border-white/10 rounded-lg p-2">
                   <div className="text-gray-300">{u.username || u.user_id}</div>
                   <div className="font-bold">Coins earned: {u.coins_earned}</div>
+                  <button
+                    type="button"
+                    onClick={() => void handleToggleCreatorMonetization(u.user_id, !u.monetization_disabled)}
+                    className={`mt-2 px-2 py-1 rounded text-white font-bold text-xs ${
+                      u.monetization_disabled ? 'bg-emerald-600' : 'bg-rose-600'
+                    }`}
+                  >
+                    {u.monetization_disabled ? 'Enable monetization' : 'Disable monetization'}
+                  </button>
                 </div>
               ))}
             </div>
           )}
         </div>
+      </div>
+
+      <div className="mb-8 grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="rounded-xl border border-white/10 bg-black/20 p-4">
+          <h3 className="text-base font-bold mb-2">Engagement</h3>
+          <p className="text-sm text-gray-300">
+            Total likes: <span className="font-black text-white">{stats.totalLikes}</span>
+          </p>
+          <p className="text-sm text-gray-300 mt-1">
+            Total comments: <span className="font-black text-white">{stats.totalComments}</span>
+          </p>
+        </div>
+        <div className="rounded-xl border border-white/10 bg-black/20 p-4">
+          <h3 className="text-base font-bold mb-2">Ads Performance Summary</h3>
+          <p className="text-sm text-gray-300">Ads: <span className="font-black text-white">{stats.adsSummary.totalAds}</span></p>
+          <p className="text-sm text-gray-300">Active ads: <span className="font-black text-white">{stats.adsSummary.activeAds}</span></p>
+          <p className="text-sm text-gray-300">Clicks: <span className="font-black text-white">{stats.adsSummary.totalClicks}</span></p>
+          <p className="text-sm text-gray-300">Impressions: <span className="font-black text-white">{stats.adsSummary.totalImpressions}</span></p>
+          <p className="text-sm text-gray-300">Avg CTR: <span className="font-black text-white">{stats.adsSummary.avgCtrPct.toFixed(2)}%</span></p>
+        </div>
+      </div>
+
+      <div className="mb-8 rounded-xl border border-white/10 bg-black/20 p-4">
+        <h3 className="text-base font-bold mb-2">Suspicious Posts (simple filter)</h3>
+        {stats.suspiciousPosts.length === 0 ? (
+          <p className="text-sm text-gray-300">No suspicious posts found</p>
+        ) : (
+          <div className="space-y-2">
+            {stats.suspiciousPosts.map((sp) => (
+              <div key={sp.post_id} className="text-sm border border-white/10 rounded-lg p-2">
+                <div className="text-gray-300">Post: {sp.post_id}</div>
+                <div className="font-bold">Reports: {sp.reports_count}</div>
+                <div className="mt-2 flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void handleAdminDeletePost(sp.post_id)}
+                    className="px-2 py-1 rounded bg-red-600 text-white font-bold text-xs"
+                  >
+                    Delete
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!sp.user_id}
+                    onClick={() => sp.user_id && void handleBanToggle(sp.user_id, true)}
+                    className="px-2 py-1 rounded bg-rose-600 text-white font-bold text-xs disabled:opacity-50"
+                  >
+                    Ban User
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 mb-8">

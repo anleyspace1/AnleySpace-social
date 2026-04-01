@@ -89,6 +89,7 @@ export async function persistFollowEdge(opts: {
           .select('*', { count: 'exact', head: true })
           .eq('follower_id', followerId);
         if (typeof count === 'number' && count >= 3) {
+          console.log('REFERRAL TRIGGER: follow_3', followerId);
           await rewardInviter(followerId, 'follow_3', 10);
         }
         await trackUserBehavior({

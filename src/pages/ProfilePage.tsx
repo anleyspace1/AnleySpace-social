@@ -485,6 +485,7 @@ export default function ProfilePage() {
       const res = await fetch(apiUrl(`/api/user/${user.id}/verify`), { method: 'POST' });
       if (res.ok) {
         setIsVerified(true);
+        console.log('REFERRAL TRIGGER: verify', user.id);
         void rewardInviter(user.id, 'verify', 10);
         alert('Congratulations! Your profile is now verified. 🎖️');
       }

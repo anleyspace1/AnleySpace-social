@@ -67,28 +67,115 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         .eq('id', u.id)
         .maybeSingle();
 
-      // Preserve real username when it already exists; fallback is used only when missing.
-      const username = (existingProfile?.username || deriveUsername(u)).trim();
+      // Preserve real username when it already exists; never persist empty / whitespace-only.
+      const emailLocal =
+        String(u.email || '')
+          .split('@')[0]
+          ?.trim()
+          .toLowerCase()
+          .replace(/\s+/g, '_') || '';
+      let username = String(existingProfile?.username ?? '').trim();
+      if (!username) username = deriveUsername(u).trim();
+      if (!username && emailLocal) username = emailLocal;
+      if (!username) username = `user_${u.id.slice(0, 6)}`;
       const displayName =
         (existingProfile?.display_name ||
           existingProfile?.full_name ||
           String(u.user_metadata?.full_name || u.user_metadata?.display_name || '').trim()) || null;
       const avatarUrl =
         existingProfile?.avatar_url || String(u.user_metadata?.avatar_url || '').trim() || null;
+      const inviteCode = String(u.id).slice(0, 8).toUpperCase();
 
-      await supabase.from('profiles').upsert(
-        {
-          id: u.id,
-          username,
-          display_name: displayName,
-          full_name: displayName,
-          avatar_url: avatarUrl,
-        },
-        { onConflict: 'id' }
-      );
+      console.log('USERNAME SOURCE:', username);
+      console.log('PROFILE UPSERT DATA (ensureProfileExists):', {
+        id: u.id,
+        full_name: displayName,
+        display_name: displayName,
+        username,
+        sourceNote: 'full_name/display_name from existing row or auth user_metadata',
+      });
+      console.log('PROFILE INSERT DATA (ensureProfileExists upsert):', {
+        id: u.id,
+        username,
+        email: u.email,
+      });
+      if (!username) {
+        console.warn('USERNAME IS EMPTY OR NULL (ensureProfileExists)');
+      }
+
+      const { data: ensureProfileData, error: ensureProfileErr } = await supabase
+        .from('profiles')
+        .upsert(
+          {
+            id: u.id,
+            username,
+            display_name: displayName,
+            full_name: displayName,
+            avatar_url: avatarUrl,
+            invite_code: inviteCode,
+          },
+          { onConflict: 'id' }
+        )
+        .select('id, username')
+        .maybeSingle();
+
+      console.log('PROFILE INSERT RESULT (ensureProfileExists):', {
+        data: ensureProfileData,
+        error: ensureProfileErr,
+      });
     } catch (err) {
       console.warn('ensureProfileExists failed:', err);
     }
+  };
+
+  const tryApplyInviteFromStorage = async (profileRow: Record<string, unknown>, userId: string) => {
+    if (typeof window === 'undefined') return profileRow;
+    const raw = localStorage.getItem('invite_code');
+    const inviteCode = raw ? String(raw).trim().toUpperCase() : '';
+    if (!inviteCode || !profileRow || profileRow.referred_by) {
+      return profileRow;
+    }
+
+    console.log('APPLYING INVITE CODE:', inviteCode);
+
+    const { data: inviter, error: inviterErr } = await supabase
+      .from('profiles')
+      .select('id')
+      .eq('invite_code', inviteCode)
+      .maybeSingle();
+
+    if (inviterErr) {
+      console.warn('[invite] inviter lookup error:', inviterErr.message);
+      return profileRow;
+    }
+
+    const inviterId = String((inviter as { id?: string } | null)?.id || '').trim();
+    if (!inviterId) {
+      return profileRow;
+    }
+    if (inviterId === userId) {
+      localStorage.removeItem('invite_code');
+      return profileRow;
+    }
+
+    const { error: updateErr } = await supabase
+      .from('profiles')
+      .update({ referred_by: inviterId })
+      .eq('id', userId);
+
+    if (updateErr) {
+      console.warn('[invite] referred_by update failed:', updateErr.message);
+      return profileRow;
+    }
+
+    console.log('REFERRAL LINKED SUCCESS:', {
+      newUserId: userId,
+      inviterId,
+    });
+    localStorage.removeItem('invite_code');
+
+    const { data: refreshed } = await supabase.from('profiles').select('*').eq('id', userId).maybeSingle();
+    return refreshed || { ...profileRow, referred_by: inviterId };
   };
 
   const fetchProfile = async (userId: string) => {
@@ -117,14 +204,34 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
       }
       if (!profileRow) return;
+
+      if (!(profileRow as { username?: string | null }).username) {
+        console.warn('USERNAME MISSING:', profileRow.id);
+      }
+
+      profileRow = (await tryApplyInviteFromStorage(
+        profileRow as Record<string, unknown>,
+        userId
+      )) as typeof profileRow;
+
       if (profileRow?.is_banned) {
         alert('Your account has been banned');
         await supabase.auth.signOut();
         window.location.href = '/login';
         return;
       }
+      console.log('PROFILE LOADED:', profileRow);
+      console.log('DISPLAY NAME:', {
+        full_name: profileRow.full_name,
+        display_name: profileRow.display_name,
+        username: profileRow.username,
+      });
       setProfile(profileRow);
-      
+      console.log('REFERRAL LINKED:', {
+        newUserId: profileRow.id,
+        referredBy: (profileRow as { referred_by?: string | null }).referred_by ?? null,
+      });
+
       // Sync with local SQLite DB
       try {
         console.log(`AUTH: Syncing profile for ${profileRow.username} (${profileRow.id}) to local DB`);
@@ -155,6 +262,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const refreshProfile = async () => {
     if (user) await fetchProfile(user.id);
   };
+
+  useEffect(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const code = params.get('code');
+      if (code && String(code).trim().length > 0) {
+        const normalized = String(code).trim().toUpperCase();
+        localStorage.setItem('invite_code', normalized);
+        console.log('INVITE CODE SAVED:', normalized);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
 
   useEffect(() => {
     if (!isSupabaseConfigured) {

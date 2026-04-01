@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Wallet, 
@@ -9,7 +9,6 @@ import {
   Plus, 
   History,
   TrendingUp,
-  ChevronRight,
   Coins,
   CheckCircle2,
   Clock,
@@ -31,16 +30,115 @@ import { deductCoins } from '../lib/coinsWallet';
 const MIN_WITHDRAW = 1000;
 const COIN_TO_USD_RATE = 0.01;
 
+const TX_CREDIT_TYPES = new Set([
+  'credit',
+  'earn',
+  'receive',
+  'game_win',
+  'gift',
+  'support',
+  'deposit',
+  'refund',
+]);
+const TX_DEBIT_TYPES = new Set([
+  'debit',
+  'send',
+  'withdraw',
+  'game_loss',
+  'game_start',
+  'purchase',
+  'fee',
+  'spend',
+]);
+
+function aggregateWalletTransactions(rows: unknown[]): { earned: number; spent: number; purchased: number } {
+  let earned = 0;
+  let spent = 0;
+  let purchased = 0;
+  for (const item of rows) {
+    const tx = item as Record<string, unknown>;
+    const type = String(tx?.type ?? '').toLowerCase().trim();
+    const rawAmt = Number(tx?.amount);
+    const amt = Number.isFinite(rawAmt) ? Math.abs(rawAmt) : 0;
+    if (type === 'deposit') {
+      purchased += amt;
+      continue;
+    }
+    if (TX_CREDIT_TYPES.has(type)) {
+      earned += amt;
+    } else if (TX_DEBIT_TYPES.has(type)) {
+      spent += amt;
+    } else if (rawAmt > 0) {
+      earned += amt;
+    } else if (rawAmt < 0) {
+      spent += Math.abs(rawAmt);
+    }
+  }
+  return { earned, spent, purchased };
+}
+
+function transactionTypeLabel(tx: Transaction): string {
+  switch (tx.type) {
+    case 'earn':
+      return 'Earned';
+    case 'receive':
+      return 'Received';
+    case 'send':
+      return 'Sent';
+    case 'withdraw':
+      return 'Withdrawal';
+    case 'exchange':
+      return 'Exchange';
+    case 'spend':
+      return 'Platform spend';
+    default:
+      return 'Activity';
+  }
+}
+
+function groupTransactionsByDay(
+  items: { tx: Transaction; sortKey: number }[]
+): { label: string; sortKey: number; items: { tx: Transaction; sortKey: number }[] }[] {
+  const map = new Map<string, { label: string; sortKey: number; items: typeof items }>();
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
+  const startOfYesterday = new Date(startOfToday.getTime() - 86400000);
+
+  for (const row of items) {
+    const d = new Date(row.sortKey);
+    const dayStart = new Date(d);
+    dayStart.setHours(0, 0, 0, 0);
+    const key = dayStart.toISOString().slice(0, 10);
+    let label: string;
+    if (dayStart.getTime() === startOfToday.getTime()) {
+      label = 'Today';
+    } else if (dayStart.getTime() === startOfYesterday.getTime()) {
+      label = 'Yesterday';
+    } else {
+      label = d.toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+    }
+    if (!map.has(key)) {
+      map.set(key, { label, sortKey: dayStart.getTime(), items: [] });
+    }
+    map.get(key)!.items.push(row);
+  }
+  return Array.from(map.values()).sort((a, b) => b.sortKey - a.sortKey);
+}
+
 export default function WalletPage() {
-  const { user } = useAuth();
+  const { user, profile } = useAuth();
   const [balance, setBalance] = useState(MOCK_USER.coins);
   const [usdBalance, setUsdBalance] = useState(50.00);
-  const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [txList, setTxList] = useState<Array<{ tx: Transaction; sortKey: number }>>([]);
+  const [breakdown, setBreakdown] = useState({
+    earnedFromViews: 0,
+    earnedFromReferrals: 0,
+    purchasedCoins: 0,
+    spentCoins: 0,
+  });
   const [withdrawHistory, setWithdrawHistory] = useState<
     { id: string; coins: number; status: string; created_at: string }[]
   >([]);
-  const [isLoading, setIsLoading] = useState(true);
-
   useEffect(() => {
     const fetchData = async () => {
       if (!user) return;
@@ -51,25 +149,86 @@ export default function WalletPage() {
         ]);
         const userData = await userRes.json();
         const txData = await txRes.json();
-        
-        if (userData.coins !== undefined) setBalance(userData.coins);
-        setTransactions(txData.map((tx: any) => ({
-          id: tx.id,
-          type: tx.type === 'game_win' || tx.type === 'earn' ? 'earn' : 'send',
-          amount: Math.abs(tx.amount),
-          description: tx.description,
-          timestamp: new Date(tx.timestamp).toLocaleString(),
-          status: 'completed'
-        })));
+        const rawRows = Array.isArray(txData) ? txData : [];
+        const { spent, purchased } = aggregateWalletTransactions(rawRows);
+
+        if (typeof userData?.coins === 'number' && Number.isFinite(userData.coins)) {
+          setBalance(userData.coins);
+        } else if (profile?.coins != null) {
+          setBalance(Number(profile.coins));
+        }
+        setTxList(
+          rawRows.map((tx: { id?: string; type?: string; amount?: number; description?: string; timestamp?: string }) => {
+            const ts = tx.timestamp ? new Date(tx.timestamp).getTime() : Date.now();
+            const rawType = String(tx.type ?? '').toLowerCase();
+            let mappedType: Transaction['type'] = 'send';
+            if (rawType === 'game_win' || rawType === 'earn' || rawType === 'gift') {
+              mappedType = 'earn';
+            } else if (
+              rawType === 'deposit' ||
+              rawType === 'refund' ||
+              rawType === 'credit' ||
+              rawType === 'receive'
+            ) {
+              mappedType = 'receive';
+            } else if (rawType === 'withdraw') {
+              mappedType = 'withdraw';
+            } else if (rawType === 'exchange') {
+              mappedType = 'exchange';
+            } else if (rawType === 'spend') {
+              mappedType = 'spend';
+            }
+            const mapped: Transaction = {
+              id: String(tx.id ?? ''),
+              type: mappedType,
+              amount: Math.abs(Number(tx.amount) || 0),
+              description: String(tx.description ?? ''),
+              timestamp: tx.timestamp ? new Date(tx.timestamp).toLocaleString() : '',
+              status: 'completed',
+            };
+            return { tx: mapped, sortKey: ts };
+          })
+        );
+        setBreakdown((prev) => ({
+          ...prev,
+          purchasedCoins: purchased,
+          spentCoins: spent,
+        }));
       } catch (err) {
         console.error("Error fetching wallet data:", err);
-      } finally {
-        setIsLoading(false);
       }
     };
 
     fetchData();
-  }, []);
+  }, [user?.id, profile?.coins]);
+
+  useEffect(() => {
+    const loadBreakdown = async () => {
+      if (!user?.id || !isSupabaseConfigured) return;
+      try {
+        const [refRes, viewRes] = await Promise.all([
+          supabase.from('referral_rewards').select('coins').eq('inviter_id', user.id),
+          supabase.from('creator_daily_view_earnings').select('coins').eq('user_id', user.id),
+        ]);
+        const refSum = (refRes.data || []).reduce(
+          (s, r: { coins?: number | null }) => s + Number(r?.coins || 0),
+          0
+        );
+        const viewSum = (viewRes.data || []).reduce(
+          (s, r: { coins?: number | null }) => s + Number(r?.coins || 0),
+          0
+        );
+        setBreakdown((prev) => ({
+          ...prev,
+          earnedFromReferrals: refSum,
+          earnedFromViews: viewSum,
+        }));
+      } catch {
+        /* keep defaults */
+      }
+    };
+    void loadBreakdown();
+  }, [user?.id]);
 
   useEffect(() => {
     const fetchWithdrawHistory = async () => {
@@ -100,18 +259,28 @@ export default function WalletPage() {
   const [isExchangeModalOpen, setIsExchangeModalOpen] = useState(false);
   const [isStatsModalOpen, setIsStatsModalOpen] = useState(false);
 
+  /** Total coin balance (synced from API / profile on load; matches `profiles.coins` when fresh). */
+  const totalCoins = balance;
+  const coinsUsdApprox = totalCoins / 100;
+
+  const groupedTxSections = useMemo(
+    () => groupTransactionsByDay(txList),
+    [txList]
+  );
+
   const handleSendCoins = (recipient: string, amount: number) => {
     if (amount > balance) return;
     setBalance(prev => prev - amount);
+    const now = Date.now();
     const newTx: Transaction = {
-      id: `t${Date.now()}`,
+      id: `t${now}`,
       type: 'send',
       amount,
       description: `Sent to @${recipient}`,
       timestamp: 'Just now',
       status: 'completed'
     };
-    setTransactions([newTx, ...transactions]);
+    setTxList((prev) => [{ tx: newTx, sortKey: now }, ...prev]);
     setIsSendModalOpen(false);
     alert(`Successfully sent ${amount} coins to @${recipient}`);
   };
@@ -120,15 +289,16 @@ export default function WalletPage() {
     if (coins > balance) return;
     setBalance(prev => prev - coins);
     setUsdBalance(prev => prev + currency);
+    const now = Date.now();
     const newTx: Transaction = {
-      id: `t${Date.now()}`,
+      id: `t${now}`,
       type: 'exchange',
       amount: coins,
       description: `Exchanged ${coins} Coins for $${currency.toFixed(2)} USD`,
       timestamp: 'Just now',
       status: 'completed'
     };
-    setTransactions([newTx, ...transactions]);
+    setTxList((prev) => [{ tx: newTx, sortKey: now }, ...prev]);
     setIsExchangeModalOpen(false);
     alert(`Successfully exchanged ${coins} coins for $${currency.toFixed(2)}`);
   };
@@ -230,11 +400,14 @@ export default function WalletPage() {
           </div>
 
           <div className="mb-8">
-            <span className="text-sm opacity-80 mb-1 block">Total Balance</span>
-            <div className="flex items-end gap-3">
-              <h1 className="text-5xl font-bold">{balance.toLocaleString()}</h1>
-              <span className="text-xl font-bold mb-1 opacity-80">Coins</span>
+            <span className="text-sm opacity-80 mb-1 block">Total Coins</span>
+            <div className="flex items-end gap-3 flex-wrap">
+              <h1 className="text-5xl font-bold">{totalCoins.toLocaleString()}</h1>
+              <span className="text-xl font-bold mb-1 opacity-80">coins</span>
             </div>
+            <p className="text-sm font-semibold opacity-90 mt-2">
+              ≈ ${coinsUsdApprox.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            </p>
           </div>
 
           <div className="relative flex gap-3 overflow-visible">
@@ -344,51 +517,86 @@ export default function WalletPage() {
         />
       </motion.div>
 
-      {/* Earning Summary */}
+      {/* Balance breakdown */}
       <section className="mb-12 px-4 lg:px-0">
-        <h2 className="text-xl font-bold mb-6">Earning Summary</h2>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <SummaryCard label="Today" amount={276} color="text-green-500" />
-          <SummaryCard label="This Week" amount={1450} color="text-indigo-500" />
-          <SummaryCard label="This Month" amount={4980} color="text-purple-500" />
+        <h2 className="text-xl font-bold mb-4">Balance breakdown</h2>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <BreakdownRow label="Earned from views" value={breakdown.earnedFromViews} tone="emerald" />
+          <BreakdownRow label="Earned from referrals" value={breakdown.earnedFromReferrals} tone="violet" />
+          <BreakdownRow label="Purchased coins" value={breakdown.purchasedCoins} tone="indigo" />
+          <BreakdownRow label="Spent coins" value={breakdown.spentCoins} tone="rose" />
         </div>
       </section>
 
       {/* Recent Transactions */}
       <section className="px-4 lg:px-0">
         <div className="flex items-center justify-between mb-6">
-          <h2 className="text-xl font-bold">Recent Transactions</h2>
-          <button className="text-indigo-600 font-bold text-sm">View All</button>
+          <h2 className="text-xl font-bold">Transaction history</h2>
+          <button type="button" className="text-indigo-600 font-bold text-sm">View All</button>
         </div>
-        <div className="space-y-0 lg:space-y-4">
-          {transactions.map((tx) => (
-            <div key={tx.id} className="bg-white dark:bg-gray-900 p-4 rounded-none lg:rounded-2xl flex items-center justify-between border-b lg:border border-gray-100 dark:border-gray-800">
-              <div className="flex items-center gap-4">
-                <div className={cn(
-                  "w-12 h-12 rounded-xl flex items-center justify-center",
-                  tx.type === 'earn' || tx.type === 'receive' ? "bg-green-100 text-green-600 dark:bg-green-900/30" : "bg-red-100 text-red-600 dark:bg-red-900/30"
-                )}>
-                  {tx.type === 'earn' || tx.type === 'receive' ? <ArrowDownLeft size={24} /> : <ArrowUpRight size={24} />}
-                </div>
-                <div>
-                  <h4 className="font-bold">{tx.description}</h4>
-                  <p className="text-xs text-gray-500">{tx.timestamp}</p>
-                </div>
-              </div>
-              <div className="text-right">
-                <div className={cn(
-                  "font-bold text-lg",
-                  tx.type === 'earn' || tx.type === 'receive' ? "text-green-600" : "text-red-600"
-                )}>
-                  {tx.type === 'earn' || tx.type === 'receive' ? '+' : '-'}{tx.amount}
-                </div>
-                <div className="flex items-center justify-end gap-1 text-[10px] text-gray-500">
-                  {tx.status === 'completed' ? <CheckCircle2 size={10} className="text-green-500" /> : <Clock size={10} className="text-yellow-500" />}
-                  {tx.status}
-                </div>
-              </div>
+        <div className="space-y-6">
+          {groupedTxSections.length === 0 ? (
+            <div className="bg-white dark:bg-gray-900 p-4 rounded-none lg:rounded-2xl border border-gray-100 dark:border-gray-800 text-sm text-gray-500">
+              No transactions yet
             </div>
-          ))}
+          ) : (
+            groupedTxSections.map((section) => (
+              <div key={section.label}>
+                <h3 className="text-xs font-bold uppercase tracking-wider text-gray-500 mb-2 px-1">{section.label}</h3>
+                <div className="space-y-0 lg:space-y-2">
+                  {section.items.map(({ tx }, idx) => (
+                    <div
+                      key={`${section.label}-${tx.id}-${idx}`}
+                      className="bg-white dark:bg-gray-900 p-4 rounded-none lg:rounded-2xl flex items-center justify-between border-b lg:border border-gray-100 dark:border-gray-800"
+                    >
+                      <div className="flex items-center gap-4 min-w-0">
+                        <div
+                          className={cn(
+                            'w-12 h-12 rounded-xl flex items-center justify-center shrink-0',
+                            tx.type === 'earn' || tx.type === 'receive'
+                              ? 'bg-green-100 text-green-600 dark:bg-green-900/30'
+                              : 'bg-red-100 text-red-600 dark:bg-red-900/30'
+                          )}
+                        >
+                          {tx.type === 'earn' || tx.type === 'receive' ? (
+                            <ArrowDownLeft size={24} />
+                          ) : (
+                            <ArrowUpRight size={24} />
+                          )}
+                        </div>
+                        <div className="min-w-0">
+                          <p className="text-[10px] font-bold uppercase tracking-wide text-gray-400 mb-0.5">
+                            {transactionTypeLabel(tx)}
+                          </p>
+                          <h4 className="font-bold truncate">{tx.description || transactionTypeLabel(tx)}</h4>
+                          <p className="text-xs text-gray-500">{tx.timestamp}</p>
+                        </div>
+                      </div>
+                      <div className="text-right shrink-0">
+                        <div
+                          className={cn(
+                            'font-bold text-lg',
+                            tx.type === 'earn' || tx.type === 'receive' ? 'text-green-600' : 'text-red-600'
+                          )}
+                        >
+                          {tx.type === 'earn' || tx.type === 'receive' ? '+' : '-'}
+                          {tx.amount}
+                        </div>
+                        <div className="flex items-center justify-end gap-1 text-[10px] text-gray-500">
+                          {tx.status === 'completed' ? (
+                            <CheckCircle2 size={10} className="text-green-500" />
+                          ) : (
+                            <Clock size={10} className="text-yellow-500" />
+                          )}
+                          {tx.status}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))
+          )}
         </div>
       </section>
 
@@ -457,7 +665,7 @@ export default function WalletPage() {
         )}
         {isStatsModalOpen && (
           <StatsModal 
-            transactions={transactions}
+            transactions={txList.map((x) => x.tx)}
             onClose={() => setIsStatsModalOpen(false)} 
           />
         )}
@@ -595,24 +803,6 @@ function WithdrawModal({
         </div>
       </motion.div>
     </div>
-  );
-}
-
-function PaymentMethod({ icon, label }: { icon: React.ReactNode; label: string }) {
-  return (
-    <motion.button 
-      whileHover={{ scale: 1.02, backgroundColor: "rgba(79, 70, 229, 0.05)" }}
-      whileTap={{ scale: 0.98 }}
-      className="w-full flex items-center justify-between p-4 rounded-2xl border border-gray-100 dark:border-gray-800 hover:border-indigo-500 transition-all group"
-    >
-      <div className="flex items-center gap-3">
-        <div className="text-gray-400 group-hover:text-indigo-600 transition-colors">
-          {icon}
-        </div>
-        <span className="text-sm font-bold text-gray-600 dark:text-gray-400">{label}</span>
-      </div>
-      <div className="w-4 h-4 rounded-full border-2 border-gray-200 dark:border-gray-700 group-hover:border-indigo-500 transition-colors"></div>
-    </motion.button>
   );
 }
 
@@ -966,6 +1156,44 @@ function StatsModal({ transactions, onClose }: { transactions: Transaction[]; on
   );
 }
 
+function BreakdownRow({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: number;
+  tone: 'emerald' | 'violet' | 'indigo' | 'rose';
+}) {
+  const border =
+    tone === 'emerald'
+      ? 'border-emerald-100 dark:border-emerald-900/40'
+      : tone === 'violet'
+        ? 'border-violet-100 dark:border-violet-900/40'
+        : tone === 'indigo'
+          ? 'border-indigo-100 dark:border-indigo-900/40'
+          : 'border-rose-100 dark:border-rose-900/40';
+  const accent =
+    tone === 'emerald'
+      ? 'text-emerald-600 dark:text-emerald-400'
+      : tone === 'violet'
+        ? 'text-violet-600 dark:text-violet-400'
+        : tone === 'indigo'
+          ? 'text-indigo-600 dark:text-indigo-400'
+          : 'text-rose-600 dark:text-rose-400';
+
+  return (
+    <div className={cn('bg-white dark:bg-gray-900 p-4 rounded-2xl border', border)}>
+      <span className="text-xs font-bold text-gray-500 uppercase tracking-wide block mb-1">{label}</span>
+      <div className="flex items-center gap-2">
+        <Coins size={18} className="text-yellow-500 shrink-0" />
+        <span className={cn('text-xl font-bold tabular-nums', accent)}>{value.toLocaleString()}</span>
+        <span className="text-sm text-gray-500">coins</span>
+      </div>
+    </div>
+  );
+}
+
 function QuickAction({ icon, label, onClick }: { icon: React.ReactNode; label: string; onClick?: () => void }) {
   return (
     <motion.button 
@@ -992,22 +1220,3 @@ function QuickAction({ icon, label, onClick }: { icon: React.ReactNode; label: s
   );
 }
 
-function SummaryCard({ label, amount, color }: { label: string; amount: number; color: string }) {
-  return (
-    <motion.div 
-      whileHover={{ y: -4, shadow: "0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1)" }}
-      className="bg-white dark:bg-gray-900 p-5 rounded-2xl border border-gray-100 dark:border-gray-800 shadow-sm transition-shadow cursor-pointer"
-    >
-      <span className="text-sm text-gray-500 mb-2 block">{label}</span>
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <Coins size={20} className="text-yellow-500" />
-          <span className={cn("text-2xl font-bold", color)}>{amount.toLocaleString()}</span>
-        </div>
-        <div className="w-8 h-8 rounded-full bg-gray-50 dark:bg-gray-800 flex items-center justify-center">
-          <ChevronRight size={16} className="text-gray-400" />
-        </div>
-      </div>
-    </motion.div>
-  );
-}

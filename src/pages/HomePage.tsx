@@ -1183,6 +1183,7 @@ function CreatePostModal({
       }
 
       onClose();
+      console.log('REFERRAL TRIGGER: first_post', user.id);
       void rewardInviter(user.id, 'first_post', 15);
       onPostCreated?.();
     } catch (err: any) {
@@ -2282,6 +2283,9 @@ function PostItem({
       if (entry.isIntersecting) {
         void node.play().catch(() => {});
         const pid = post?.id != null ? String(post.id) : '';
+        if (pid) {
+          console.log('VIDEO VISIBLE:', pid);
+        }
         if (user?.id && pid) {
           startCreatorValidViewWatch(user.id, pid);
         }
@@ -2589,6 +2593,7 @@ function PostItem({
           targetId: String(post.id),
           category: String(post.category || (post.video_url ? 'video' : 'post')),
         });
+        console.log('REFERRAL TRIGGER: first_like', user.id);
         void rewardInviter(user.id, 'first_like', 5);
       }
 
@@ -2716,6 +2721,7 @@ function PostItem({
         targetId: String(post.id),
         category: String(post.category || (post.video_url ? 'video' : 'post')),
       });
+      console.log('REFERRAL TRIGGER: first_comment', user.id);
       void rewardInviter(user.id, 'first_comment', 5);
 
       const newCommentObj = {
@@ -2757,6 +2763,7 @@ function PostItem({
       console.log('VIRAL EVENT:', { event: 'share_post', postId: post.id, link });
     }
     if (user?.id) {
+      console.log('REFERRAL TRIGGER: first_share', user.id);
       void rewardInviter(user.id, 'first_share', 5);
     }
     setIsShareModalOpen(true);
