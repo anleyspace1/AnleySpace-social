@@ -77,6 +77,10 @@ export type Message = {
   /** Marketplace DM offer (from `messages.offer_price` / `offer_status`) */
   offer_price?: number;
   offer_status?: string;
+  /** Soft-delete marker (content hidden, row kept). */
+  is_deleted?: boolean;
+  /** Per-user hide list (delete-for-me). */
+  deleted_for?: string[];
 };
 
 export type Chat = {

@@ -109,6 +109,7 @@ function formatMessageFromDb(m: any): Message {
     Boolean(m.story_id) ||
     Boolean(m.story_media);
   if (isStoryReply) {
+    const hasIsDeleted = Object.prototype.hasOwnProperty.call(m, 'is_deleted');
     console.log('[Messages] story_reply row', { story_id: m.story_id, story_media: m.story_media });
     return {
       id: m.id,
@@ -122,6 +123,10 @@ function formatMessageFromDb(m: any): Message {
       storyMedia: m.story_media ?? undefined,
       storyMediaType: m.story_media_type ?? null,
       isSeen: m.is_seen === true,
+      is_deleted: hasIsDeleted ? m.is_deleted === true : undefined,
+      deleted_for: Array.isArray(m.deleted_for)
+        ? m.deleted_for.map((v: unknown) => String(v))
+        : [],
       ...parseOfferFields(m),
     };
   }
@@ -145,6 +150,7 @@ function formatMessageFromDb(m: any): Message {
   }
 
   const isAudioLike = resolvedType === 'audio' || resolvedType === 'voice' || isVoiceUrl;
+  const hasIsDeleted = Object.prototype.hasOwnProperty.call(m, 'is_deleted');
 
   return {
     id: m.id,
@@ -157,8 +163,29 @@ function formatMessageFromDb(m: any): Message {
     audioUrl: m.audio_url || (isAudioLike ? content : undefined),
     imageUrl: m.image_url || (!isAudioLike && resolvedType === 'image' && isImageUrl ? content : undefined),
     isSeen: m.is_seen === true,
+    is_deleted: hasIsDeleted ? m.is_deleted === true : undefined,
+    deleted_for: Array.isArray(m.deleted_for)
+      ? m.deleted_for.map((v: unknown) => String(v))
+      : [],
     ...parseOfferFields(m),
   };
+}
+
+function mergeMessagesPreservingDeletedFor(prev: Message[], incoming: Message[]): Message[] {
+  const prevMap = new Map(prev.map((m) => [m.id, m]));
+  return incoming.map((m) => {
+    const old = prevMap.get(m.id);
+    const incomingDeletedFor = Array.isArray(m.deleted_for) ? m.deleted_for : [];
+    const oldDeletedFor = Array.isArray(old?.deleted_for) ? old!.deleted_for! : [];
+    return {
+      ...old,
+      ...m,
+      deleted_for:
+        incomingDeletedFor.length > 0
+          ? incomingDeletedFor
+          : oldDeletedFor,
+    };
+  });
 }
 
 /** Nullable `messages.product_id` → normalized string or null (normal DM thread). Lowercase for stable keys. */
@@ -195,6 +222,7 @@ export default function MessagesPage() {
   const [message, setMessage] = useState('');
   const [offerDraft, setOfferDraft] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
+  const [openMessageMenuId, setOpenMessageMenuId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const hasLoadedChatsOnceRef = useRef(false);
   const [isRecording, setIsRecording] = useState(false);
@@ -203,6 +231,7 @@ export default function MessagesPage() {
   const audioChunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<any>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesListRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
   const productPrefillDoneRef = useRef(false);
@@ -642,7 +671,7 @@ export default function MessagesPage() {
       if (error) throw error;
 
       const formattedMessages: Message[] = (data || []).map(formatMessageFromDb);
-      setMessages(formattedMessages);
+      setMessages((prev) => mergeMessagesPreservingDeletedFor(prev, formattedMessages));
     } catch (err) {
       console.error('Error fetching messages:', err);
     }
@@ -726,6 +755,12 @@ export default function MessagesPage() {
         table: 'messages',
       }, (payload) => {
         const row = payload.new as Record<string, unknown>;
+        const rowId = String(row.id ?? '');
+        console.log('[messages:update] payload', {
+          id: rowId,
+          has_is_deleted: Object.prototype.hasOwnProperty.call(row, 'is_deleted'),
+          is_deleted: (row as { is_deleted?: boolean }).is_deleted,
+        });
         const selPid = normalizeDmProductId(selectedChat.product_id);
         const msgPid = normalizeDmProductId(row.product_id);
         if (selPid !== msgPid) return;
@@ -733,8 +768,24 @@ export default function MessagesPage() {
           (row.sender_id === user.id && row.receiver_id === selectedChat.user.id) ||
           (row.sender_id === selectedChat.user.id && row.receiver_id === user.id);
         if (isRelevant) {
+          const hasIsDeleted = Object.prototype.hasOwnProperty.call(row, 'is_deleted');
+          const payloadIsDeleted = (row as { is_deleted?: boolean }).is_deleted;
           setMessages(prev =>
-            prev.map(m => (m.id === row.id ? formatMessageFromDb(row) : m))
+            prev.map((m) => {
+              if (String(m.id) !== rowId) return m;
+              const next = formatMessageFromDb(row);
+              return {
+                ...m,
+                ...next,
+                ...(payloadIsDeleted !== undefined && hasIsDeleted
+                  ? { is_deleted: payloadIsDeleted === true }
+                  : {}),
+                deleted_for:
+                  Array.isArray(next.deleted_for) && next.deleted_for.length > 0
+                    ? next.deleted_for
+                    : (Array.isArray(m.deleted_for) ? m.deleted_for : []),
+              };
+            })
           );
         }
       })
@@ -749,6 +800,26 @@ export default function MessagesPage() {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  useEffect(() => {
+    const el = messagesListRef.current;
+    if (!el) return;
+
+    let fadeTimer: ReturnType<typeof setTimeout> | null = null;
+    const handleScroll = () => {
+      el.classList.add('is-scrolling');
+      if (fadeTimer) clearTimeout(fadeTimer);
+      fadeTimer = setTimeout(() => {
+        el.classList.remove('is-scrolling');
+      }, 700);
+    };
+
+    el.addEventListener('scroll', handleScroll, { passive: true });
+    return () => {
+      el.removeEventListener('scroll', handleScroll);
+      if (fadeTimer) clearTimeout(fadeTimer);
+    };
+  }, []);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -776,6 +847,10 @@ export default function MessagesPage() {
   const [callError, setCallError] = useState<string | null>(null);
   const [callStatus, setCallStatus] = useState<'calling' | 'ringing' | 'connected' | 'ended'>('calling');
   const [callDuration, setCallDuration] = useState(0);
+
+  const visibleMessages = messages.filter(
+    (m) => !(user?.id && Array.isArray(m.deleted_for) && m.deleted_for.includes(user.id))
+  );
 
   const socketRef = useRef<any>(null);
   const peersRef = useRef<any[]>([]);
@@ -1241,6 +1316,63 @@ export default function MessagesPage() {
     }
   };
 
+  const handleDeleteMessage = async (msg: Message) => {
+    if (!user?.id || !msg?.id) return;
+    const ok = window.confirm('Are you sure you want to delete this message?');
+    if (!ok) return;
+
+    try {
+      const { error } = await supabase
+        .from('messages')
+        .update({ is_deleted: true })
+        .eq('id', msg.id)
+        .eq('sender_id', user.id);
+
+      if (error) {
+        console.error('Delete message failed:', error);
+        alert(`Failed to delete message: ${error.message}`);
+        return;
+      }
+
+      setMessages((prev) =>
+        prev.map((m) => (m.id === msg.id ? { ...m, is_deleted: true, content: '' } : m))
+      );
+    } catch (err: any) {
+      console.error('Delete message error:', err);
+      alert(err?.message || 'Failed to delete message');
+    }
+  };
+
+  const handleDeleteForMe = async (msg: Message) => {
+    if (!user?.id || !msg?.id) return;
+    const ok = window.confirm('Are you sure you want to delete this message for you?');
+    if (!ok) return;
+
+    try {
+      const current = Array.isArray(msg.deleted_for) ? msg.deleted_for : [];
+      const nextDeletedFor = Array.from(new Set([...current, user.id]));
+
+      const { error } = await supabase
+        .from('messages')
+        .update({ deleted_for: nextDeletedFor })
+        .eq('id', msg.id);
+
+      if (error) {
+        console.error('Delete-for-me failed:', error);
+        alert(`Failed to delete for me: ${error.message}`);
+        return;
+      }
+
+      setOpenMessageMenuId(null);
+      setMessages((prev) =>
+        prev.map((m) => (m.id === msg.id ? { ...m, deleted_for: nextDeletedFor } : m))
+      );
+    } catch (err: any) {
+      console.error('Delete-for-me error:', err);
+      alert(err?.message || 'Failed to delete for me');
+    }
+  };
+
   const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !selectedChat) return;
@@ -1444,10 +1576,10 @@ export default function MessagesPage() {
   };
 
   return (
-    <div className="flex min-h-0 h-[calc(100vh-56px-72px)] sm:h-[calc(100vh-64px)] lg:h-[calc(100vh-4rem)] max-h-[calc(100vh-56px-72px)] sm:max-h-[calc(100vh-64px)] lg:max-h-[calc(100vh-4rem)] bg-gray-50 dark:bg-black text-gray-900 dark:text-gray-100 relative overflow-hidden items-stretch">
+    <div className="messages-root flex h-full min-h-0 w-full min-w-0 flex-1 bg-gray-50 dark:bg-black text-gray-900 dark:text-gray-100 relative items-stretch">
       {/* Chat List — fills row height; list scrolls inside (scrollbar hidden via no-scrollbar) */}
       <div className={cn(
-        "w-full md:w-80 md:max-w-[20rem] shrink-0 border-r border-gray-200 dark:border-gray-800 flex flex-col min-h-0 self-stretch overflow-hidden bg-white dark:bg-black",
+        "w-full md:w-96 md:max-w-[24rem] shrink-0 border-r border-gray-200 dark:border-gray-800 flex flex-col min-h-0 self-stretch overflow-hidden bg-white dark:bg-black",
         selectedChat && "hidden md:flex"
       )}>
         <div className="shrink-0 p-3 sm:p-4 border-b border-gray-200 dark:border-gray-800">
@@ -1510,29 +1642,34 @@ export default function MessagesPage() {
 
       {/* Conversation — fixed flex share; scroll only inside thread + input stays bottom */}
       <div className={cn(
-        "flex-1 flex flex-col min-h-0 min-w-0 overflow-hidden bg-white dark:bg-black",
+        "messages-main flex-1 flex flex-col min-h-0 min-w-0 overflow-hidden bg-white dark:bg-black",
         !selectedChat && "hidden md:flex items-center justify-center text-gray-500"
       )}>
         {selectedChat ? (
-          <>
-            <div className="shrink-0 p-3 sm:p-4 border-b border-gray-200 dark:border-gray-800 flex items-center justify-between">
-              <div className="flex items-center gap-2 sm:gap-3">
-                <button onClick={() => setSelectedChat(null as any)} className="md:hidden p-2 -ml-2">
+          <div className="flex flex-1 min-h-0 flex-col">
+            {/* Header: same flex row pattern as Group Chat — left block + right actions (justify-between). */}
+            <header className="messages-header shrink-0 border-b border-gray-200/90 dark:border-gray-800 bg-white/95 dark:bg-black/95 backdrop-blur-sm px-4 py-3 z-10">
+              <div className="flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
+                <button
+                  type="button"
+                  onClick={() => setSelectedChat(null as any)}
+                  className="md:hidden shrink-0 p-2 -ml-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-full transition-colors"
+                >
                   <ChevronLeft size={20} />
                 </button>
-                <div className="relative">
+                <div className="relative shrink-0">
                   <img 
                     src={selectedChat.user.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(selectedChat.user.displayName)}&background=random`} 
                     alt="" 
-                    className="w-8 h-8 sm:w-10 sm:h-10 rounded-full object-cover" 
+                    className="h-10 w-10 rounded-full object-cover" 
                   />
                   {selectedChat.online && <div className="absolute bottom-0 right-0 w-2 h-2 sm:w-2.5 sm:h-2.5 bg-green-500 border-2 border-white dark:border-black rounded-full"></div>}
                 </div>
-                <div>
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <h3 className="font-bold leading-none text-sm sm:text-base text-gray-900 dark:text-gray-100">{selectedChat.user.displayName}</h3>
+                <div className="min-w-0">
+                  <div className="flex min-w-0 flex-wrap items-center gap-2">
+                    <h3 className="truncate font-bold text-sm text-gray-900 dark:text-gray-100">{selectedChat.user.displayName}</h3>
                     {selectedChat.product_id ? (
-                      <span className="text-[9px] sm:text-[10px] font-semibold text-indigo-500 bg-indigo-500/15 dark:bg-indigo-500/20 px-1.5 py-0.5 rounded">
+                      <span className="shrink-0 text-[9px] sm:text-[10px] font-semibold text-indigo-500 bg-indigo-500/15 dark:bg-indigo-500/20 px-1.5 py-0.5 rounded">
                         Marketplace
                       </span>
                     ) : null}
@@ -1540,21 +1677,26 @@ export default function MessagesPage() {
                   <span className="text-[10px] sm:text-xs text-gray-500">{selectedChat.online ? 'Online' : 'Offline'}</span>
                 </div>
               </div>
-              <div className="flex items-center gap-1 sm:gap-2">
+              <div className="flex shrink-0 items-center gap-2">
                 <button 
+                  type="button"
                   onClick={() => handleStartCall('audio')}
-                  className="p-2 hover:bg-gray-100 dark:hover:bg-gray-900 rounded-full text-gray-600 dark:text-gray-400"
+                  className="p-2 hover:bg-gray-100 dark:hover:bg-gray-900 rounded-full transition-colors text-gray-600 dark:text-gray-400"
+                  aria-label="Voice call"
                 >
-                  <Phone size={18} />
+                  <Phone size={20} />
                 </button>
                 <button 
+                  type="button"
                   onClick={() => handleStartCall('video')}
-                  className="p-2 hover:bg-gray-100 dark:hover:bg-gray-900 rounded-full text-gray-600 dark:text-gray-400"
+                  className="p-2 hover:bg-gray-100 dark:hover:bg-gray-900 rounded-full transition-colors text-gray-600 dark:text-gray-400"
+                  aria-label="Video call"
                 >
-                  <Video size={18} />
+                  <Video size={20} />
                 </button>
                 {activeCall?.type === 'video' && activeCall.hostId === user?.id && !isLive && (
                   <button 
+                    type="button"
                     onClick={handleGoLive}
                     className="bg-red-600 hover:bg-red-700 text-white px-2 sm:px-3 py-1 sm:py-1.5 rounded-lg text-[10px] sm:text-xs font-bold flex items-center gap-1 sm:gap-2 transition-all shadow-lg shadow-red-600/20"
                   >
@@ -1564,16 +1706,18 @@ export default function MessagesPage() {
                   </button>
                 )}
                 <button 
+                  type="button"
                   onClick={() => setIsInfoOpen(!isInfoOpen)}
                   className={cn(
                     "p-2 rounded-full transition-colors",
                     isInfoOpen ? "bg-indigo-100 text-indigo-600" : "hover:bg-gray-100 dark:hover:bg-gray-900 text-gray-600 dark:text-gray-400"
                   )}
+                  aria-label="Chat info"
                 >
-                  <Info size={18} />
+                  <Info size={20} />
                 </button>
               </div>
-            </div>
+            </header>
 
             {headerMarketplaceProduct && (
               <div className="shrink-0 flex items-center gap-3 p-3 border-b border-gray-200 dark:border-gray-800 bg-white dark:bg-black">
@@ -1606,36 +1750,88 @@ export default function MessagesPage() {
               </div>
             )}
 
-            <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-3 sm:p-4 space-y-3 sm:space-y-4 bg-[#f5f7fb] dark:bg-[#111827]/80">
+            <div ref={messagesListRef} className="messages-list min-h-0 h-full flex-1 overflow-y-auto overscroll-contain scroll-smooth p-2 sm:p-3 lg:p-4 bg-[#f5f7fb] dark:bg-[#111827]/80">
+              <div className="w-full min-h-full flex flex-col justify-end space-y-2 sm:space-y-2.5">
               <div className="flex justify-center">
                 <span className="text-xs bg-white dark:bg-gray-800 text-gray-600 dark:text-gray-400 px-3 py-1 rounded-full border border-gray-200/80 dark:border-gray-700 shadow-sm">Today</span>
               </div>
               
-              {messages.map((msg) => {
+              {visibleMessages.map((msg) => {
                 console.log("Rendering message type:", msg.type);
                 return (
                 <div 
                   key={msg.id} 
                   className={cn(
-                    "flex items-end gap-2",
-                    msg.senderId === user?.id ? "justify-end" : "justify-start"
+                    "flex w-full items-end gap-2.5",
+                    msg.senderId === user?.id
+                      ? "justify-end pl-8 sm:pl-14"
+                      : "justify-start pr-8 sm:pr-14"
                   )}
                 >
                   {msg.senderId !== user?.id && (
                     <img 
                       src={selectedChat.user.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(selectedChat.user.displayName)}&background=random`} 
                       alt="" 
-                      className="w-8 h-8 rounded-full object-cover" 
+                      className="w-7 h-7 rounded-full object-cover" 
                     />
                   )}
                   <div className={cn(
-                    "p-3 rounded-xl max-w-[70%] min-w-[60px] shadow-[0_1px_3px_rgba(0,0,0,0.06)]",
+                    "group relative px-4 py-2.5 rounded-[1.35rem] max-w-[80%] lg:max-w-[75%] xl:max-w-[70%] min-w-0 leading-relaxed shadow-[0_1px_3px_rgba(15,23,42,0.06)] transition-transform duration-200 ease-out hover:scale-[1.01]",
                     msg.senderId === user?.id 
                       ? "bg-gradient-to-br from-indigo-600 to-violet-600 text-white shadow-[0_2px_10px_rgba(79,70,229,0.35)]" 
-                      : "bg-white text-[#0f172a] border border-gray-200/90 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 shadow-[0_1px_4px_rgba(15,23,42,0.06)]"
+                      : "bg-white text-[#0f172a] border border-gray-200/90 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 shadow-[0_1px_4px_rgba(15,23,42,0.07)]"
                   )}>
+                    {msg.senderId === user?.id ? (
+                      <div className="absolute right-1.5 top-1.5 z-10">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setOpenMessageMenuId((prev) => (prev === msg.id ? null : msg.id))
+                          }
+                          className="rounded-md p-1 text-white/65 hover:text-white hover:bg-white/15 opacity-0 group-hover:opacity-100 transition-opacity duration-200"
+                          title="Message actions"
+                          aria-label="Message actions"
+                        >
+                          <MoreVertical size={14} />
+                        </button>
+                        {openMessageMenuId === msg.id ? (
+                          <div className="absolute right-0 mt-1 w-36 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 shadow-lg overflow-hidden">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                void handleDeleteForMe(msg);
+                              }}
+                              className="w-full px-3 py-2 text-left text-xs font-medium text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
+                            >
+                              Delete for me
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setOpenMessageMenuId(null);
+                                void handleDeleteMessage(msg);
+                              }}
+                              className="w-full px-3 py-2 text-left text-xs font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
+                            >
+                              Delete for everyone
+                            </button>
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    {msg.is_deleted ? (
+                      <p
+                        className={cn(
+                          "text-sm italic break-words",
+                          msg.senderId === user?.id ? "text-white/90" : "text-gray-500 dark:text-gray-400"
+                        )}
+                      >
+                        This message was deleted
+                      </p>
+                    ) : (
+                    <>
                     {msg.offer_price != null && Number.isFinite(msg.offer_price) ? (
-                      <div className="space-y-2 min-w-[200px]">
+                      <div className="space-y-2 min-w-0">
                         <p
                           className={cn(
                             'text-sm font-semibold flex items-center gap-1.5',
@@ -1673,7 +1869,7 @@ export default function MessagesPage() {
                           )}
                       </div>
                     ) : msg.type === 'voice' || msg.type === 'audio' ? (
-                      <div className="flex items-center gap-3 min-w-[160px] py-1">
+                      <div className="flex items-center gap-3 min-w-0 py-1">
                         <button 
                           onClick={() => {
                             const audio = new Audio(msg.audioUrl || '');
@@ -1743,15 +1939,17 @@ export default function MessagesPage() {
                         <img 
                           src={msg.imageUrl || msg.content} 
                           alt="Shared image" 
-                          className="max-w-[250px] max-h-[250px] rounded-[12px] object-cover cursor-pointer hover:opacity-90 transition-opacity"
+                          className="max-w-[250px] max-h-[250px] rounded-2xl object-cover cursor-pointer transition-all duration-200 ease-out hover:opacity-90 hover:scale-[1.01]"
                           onClick={() => window.open(msg.imageUrl || msg.content, '_blank')}
                         />
                       </div>
                     ) : (
                       <p className={cn(
-                        "text-sm break-words",
+                        "text-sm break-words leading-relaxed",
                         msg.senderId === user?.id ? "text-white" : "text-[#0f172a] dark:text-gray-100"
                       )}>{msg.content}</p>
+                    )}
+                    </>
                     )}
                     {msg.senderId === user?.id ? (
                       <div
@@ -1779,9 +1977,11 @@ export default function MessagesPage() {
                 );
               })}
               <div ref={messagesEndRef} />
+              </div>
             </div>
 
-            <div className="shrink-0 p-2 sm:p-4 border-t border-[#e5e7eb] bg-white dark:bg-gray-950 dark:border-gray-800">
+            <div className="messages-composer shrink-0 p-2 sm:p-3 lg:p-4 border-t border-[#e5e7eb] bg-white/95 dark:bg-gray-950/95 dark:border-gray-800 backdrop-blur-sm shadow-[0_-1px_0_rgba(15,23,42,0.06)]">
+              <div className="w-full">
               {selectedChat?.product_id && !isRecording && (
                 <div className="mb-2 flex flex-wrap items-center gap-2 px-0.5">
                   <Coins className="text-amber-500 shrink-0" size={18} aria-hidden />
@@ -1837,7 +2037,7 @@ export default function MessagesPage() {
                   </div>
                 </div>
               ) : (
-                <div className="flex items-center gap-1 sm:gap-2 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-xl p-1.5 sm:p-2 shadow-sm">
+                <div className="flex items-center gap-1.5 sm:gap-2 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-2xl p-2 sm:p-2.5 shadow-[0_1px_6px_rgba(15,23,42,0.06)] transition-all duration-200 ease-out">
                   <input 
                     type="file" 
                     accept="image/*" 
@@ -1855,21 +2055,21 @@ export default function MessagesPage() {
                   />
                   <button 
                     onClick={() => cameraInputRef.current?.click()}
-                    className="p-1.5 sm:p-2 text-gray-600 hover:text-indigo-600"
+                    className="p-1.5 sm:p-2 text-gray-600 hover:text-indigo-600 rounded-xl hover:bg-indigo-50 dark:hover:bg-indigo-900/20 transition-all duration-200"
                     title="Take Photo"
                   >
                     <Camera size={20} />
                   </button>
                   <button 
                     onClick={() => fileInputRef.current?.click()}
-                    className="p-1.5 sm:p-2 text-gray-600 hover:text-indigo-600"
+                    className="p-1.5 sm:p-2 text-gray-600 hover:text-indigo-600 rounded-xl hover:bg-indigo-50 dark:hover:bg-indigo-900/20 transition-all duration-200"
                     title="Upload Image"
                   >
                     <ImageIcon size={20} />
                   </button>
                   <button 
                     onClick={startRecording}
-                    className="p-1.5 sm:p-2 text-gray-600 hover:text-indigo-600"
+                    className="p-1.5 sm:p-2 text-gray-600 hover:text-indigo-600 rounded-xl hover:bg-indigo-50 dark:hover:bg-indigo-900/20 transition-all duration-200"
                     title="Voice Message"
                   >
                     <Mic size={20} />
@@ -1880,7 +2080,7 @@ export default function MessagesPage() {
                     onChange={(e) => setMessage(e.target.value)}
                     onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
                     placeholder="Message..." 
-                    className="chat-message-input flex-1 min-w-0 w-full bg-white dark:bg-gray-100 !text-gray-900 placeholder:!text-gray-500 dark:placeholder:!text-gray-500 caret-gray-900 border border-gray-300 dark:border-gray-400 rounded-xl px-4 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm"
+                    className="chat-message-input flex-1 min-w-0 w-full bg-white dark:bg-gray-100 !text-gray-900 placeholder:!text-gray-500 dark:placeholder:!text-gray-500 caret-gray-900 border border-gray-300 dark:border-gray-400 rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm leading-relaxed transition-all duration-200"
                     style={{
                       color: '#111827',
                       WebkitTextFillColor: '#111827',
@@ -1889,16 +2089,19 @@ export default function MessagesPage() {
                   <button 
                     onClick={handleSendMessage}
                     className={cn(
-                      "p-1.5 sm:p-2 rounded-xl transition-all",
-                      message ? "bg-indigo-600 text-white shadow-lg" : "text-gray-400"
+                      "p-1.5 sm:p-2 rounded-xl transition-all duration-200 ease-out",
+                      message
+                        ? "bg-indigo-600 text-white shadow-lg hover:bg-indigo-700 hover:scale-[1.03]"
+                        : "text-gray-400"
                     )}
                   >
                     <Send size={20} />
                   </button>
                 </div>
               )}
+              </div>
             </div>
-          </>
+          </div>
         ) : (
           <div className="text-center">
             <div className="w-20 h-20 bg-indigo-100 dark:bg-indigo-900/30 rounded-full flex items-center justify-center text-indigo-600 mx-auto mb-4">

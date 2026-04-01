@@ -399,6 +399,11 @@ function AppContent() {
   const { user } = useAuth();
   const isReels = location.pathname === '/reels';
   const isCreateReel = location.pathname === '/reels/create';
+  const isMessages = location.pathname === '/messages';
+  const isGroupChat = /^\/groups\/[^/]+\/chat$/.test(location.pathname);
+  const isGroupsPage = location.pathname === '/groups';
+  /** `/groups/:id` — Feed / Members / About (not `/groups`, not `.../chat`). */
+  const isGroupDetailPage = /^\/groups\/[^/]+$/.test(location.pathname);
   const isHome = location.pathname === '/' && !isReels && !isCreateReel;
   const isAuthPage = location.pathname === '/login' || location.pathname === '/signup' || location.pathname === '/forgot-password' || location.pathname === '/reset-password';
   
@@ -416,6 +421,27 @@ function AppContent() {
     }
     localStorage.setItem('darkMode', darkMode.toString());
   }, [darkMode]);
+
+  useEffect(() => {
+    if (!isMessages && !isGroupChat) return;
+    const prevHtmlOverflow = document.documentElement.style.overflow;
+    const prevBodyOverflow = document.body.style.overflow;
+    const prevHtmlHeight = document.documentElement.style.height;
+    const prevBodyHeight = document.body.style.height;
+    const prevScrollbarGutter = (document.documentElement.style as CSSStyleDeclaration & { scrollbarGutter?: string }).scrollbarGutter;
+    document.documentElement.style.overflow = 'hidden';
+    document.body.style.overflow = 'hidden';
+    document.documentElement.style.height = '100%';
+    document.body.style.height = '100%';
+    (document.documentElement.style as CSSStyleDeclaration & { scrollbarGutter?: string }).scrollbarGutter = 'auto';
+    return () => {
+      document.documentElement.style.overflow = prevHtmlOverflow;
+      document.body.style.overflow = prevBodyOverflow;
+      document.documentElement.style.height = prevHtmlHeight;
+      document.body.style.height = prevBodyHeight;
+      (document.documentElement.style as CSSStyleDeclaration & { scrollbarGutter?: string }).scrollbarGutter = prevScrollbarGutter ?? '';
+    };
+  }, [isMessages, isGroupChat]);
 
   if (isAuthPage) {
     return (
@@ -436,6 +462,8 @@ function AppContent() {
           ? 'flex h-[100dvh] max-h-[100dvh] flex-col overflow-hidden bg-black text-white'
           : isHome
             ? 'bg-[#F5F6FA] text-gray-900 flex flex-col min-h-[100dvh] h-[100dvh] overflow-hidden'
+            : isMessages || isGroupChat
+              ? 'bg-gradient-to-br from-[#0f172a] via-[#1e1b4b] to-[#312e81] text-white flex flex-col min-h-[100dvh] h-[100dvh] overflow-hidden'
             : 'bg-gradient-to-br from-[#0f172a] via-[#1e1b4b] to-[#312e81] text-white'
       )}
     >
@@ -445,12 +473,16 @@ function AppContent() {
       
       <div
         className={cn(
-          'mx-auto flex',
+          isMessages || isGroupChat ? 'flex w-full' : 'mx-auto flex',
           isReels || isCreateReel
             ? 'max-w-none min-h-0 w-full flex-1 flex-col p-0'
+            : isMessages || isGroupChat
+              ? 'max-w-none w-full h-full flex-1 min-h-0 pt-14 sm:pt-16 px-0 lg:px-0 pb-0 overflow-hidden'
             : 'max-w-[1600px] pt-14 sm:pt-16 px-0 lg:px-6 pb-[72px] lg:pb-0',
           isHome
             ? 'flex-1 min-h-0 w-full gap-0 items-stretch overflow-hidden'
+            : isMessages || isGroupChat
+              ? 'flex-1 min-h-0 w-full gap-0 items-stretch'
             : !isReels && !isCreateReel
               ? 'gap-6'
               : ''
@@ -462,6 +494,14 @@ function AppContent() {
                 'hidden lg:block w-72 flex-shrink-0',
                 isHome
                   ? 'sticky top-14 sm:top-16 self-start h-[calc(100vh-3.5rem)] sm:h-[calc(100vh-4rem)] overflow-y-auto overflow-x-hidden no-scrollbar py-4 pl-3 pr-2 rounded-r-2xl bg-gradient-to-br from-[#0f172a] via-[#1e1b4b] to-[#312e81] text-white shadow-xl shadow-black/10'
+                  : isMessages
+                    ? 'sticky top-14 sm:top-16 self-start h-[calc(100dvh-3.5rem)] sm:h-[calc(100dvh-4rem)] overflow-y-auto overflow-x-hidden [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden [&::-webkit-scrollbar]:w-0 [&::-webkit-scrollbar]:h-0'
+                  : isGroupChat
+                    ? 'sticky top-14 sm:top-16 self-start h-[calc(100dvh-3.5rem)] sm:h-[calc(100dvh-4rem)] overflow-y-auto overflow-x-hidden [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden [&::-webkit-scrollbar]:w-0 [&::-webkit-scrollbar]:h-0'
+                  : isGroupsPage
+                    ? 'sticky top-14 sm:top-16 self-start h-[calc(100dvh-3.5rem)] sm:h-[calc(100dvh-4rem)] overflow-y-auto overflow-x-hidden [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden [&::-webkit-scrollbar]:w-0 [&::-webkit-scrollbar]:h-0'
+                  : isGroupDetailPage
+                    ? 'sticky top-14 sm:top-16 self-start h-[calc(100dvh-3.5rem)] sm:h-[calc(100dvh-4rem)] overflow-y-auto overflow-x-hidden [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden [&::-webkit-scrollbar]:w-0 [&::-webkit-scrollbar]:h-0'
                   : 'sticky top-[72px] h-fit'
               )}
             >
@@ -480,11 +520,16 @@ function AppContent() {
                 ? 'flex min-h-0 flex-1 flex-col overflow-hidden p-0'
                 : isHome
                   ? 'flex-1 min-h-0 h-full overflow-y-auto overflow-x-hidden home-feed-scroll bg-[#F5F6FA] px-3 sm:px-4 py-4 lg:py-6'
+                  : isMessages
+                    ? 'flex h-full min-h-0 flex-1 flex-col py-0 overflow-hidden'
+                  : isGroupChat
+                    ? 'flex h-full min-h-0 flex-1 w-full min-w-0 flex-col py-0 overflow-hidden'
                   : 'min-h-[calc(100vh-56px)] sm:min-h-[calc(100vh-64px)] py-0 lg:py-6'
             )}
           >
-            <AnimatePresence mode="wait">
-              <Routes>
+            <div className={cn((isMessages || isGroupChat) && 'h-full flex-1 min-h-0 w-full min-w-0')}>
+              <AnimatePresence mode="wait">
+                <Routes>
                 <Route path="/" element={<ProtectedRoute><HomePage /></ProtectedRoute>} />
                 <Route path="/explore" element={<ProtectedRoute><ExplorePage /></ProtectedRoute>} />
                 <Route path="/reels" element={<ProtectedRoute><ReelsPage /></ProtectedRoute>} />
@@ -521,11 +566,12 @@ function AppContent() {
                 <Route path="/ads/create" element={<ProtectedRoute><CreateAdPage /></ProtectedRoute>} />
                 <Route path="/notifications" element={<ProtectedRoute><NotificationsPage /></ProtectedRoute>} />
                 <Route path="/post/:id" element={<ProtectedRoute><PostDetailPage /></ProtectedRoute>} />
-              </Routes>
-            </AnimatePresence>
+                </Routes>
+              </AnimatePresence>
+            </div>
           </main>
 
-          {!isReels && (
+          {!isReels && !isMessages && (
             <div className="hidden xl:block">
               <Routes>
                 <Route path="/" element={<RightSidebar />} />

@@ -10,6 +10,9 @@
   html, body {
     @apply overflow-x-hidden;
   }
+  html, body, #root {
+    height: 100%;
+  }
   body {
     @apply bg-white text-gray-900 dark:bg-black dark:text-white transition-colors duration-200;
   }
@@ -50,6 +53,122 @@
 .scroll-hide {
   -ms-overflow-style: none;
   scrollbar-width: none;
+}
+
+/* Messages route root: fill the main column (like Group Chat). Do not use 100vh here — it is taller than the
+   scrollable area below the app header and gets clipped by overflow:hidden, hiding header actions or input. */
+.messages-root {
+  display: flex;
+  width: 100%;
+  max-width: 100%;
+  height: 100%;
+  min-height: 0;
+  flex: 1;
+  overflow-y: visible;
+  overflow-x: hidden;
+}
+
+.messages-main {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 100%;
+  height: 100%;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* DM conversation header: same flex row as Group Chat. No fixed height — a forced short height was clipping
+   labels and action buttons against .messages-main { overflow: hidden }. */
+.messages-header {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  position: relative;
+  z-index: 10;
+}
+
+.messages-list {
+  flex: 1;
+  min-height: 0;
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: block;
+  scroll-behavior: smooth;
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+  padding-right: 0;
+  margin-right: 0;
+}
+
+.messages-list::-webkit-scrollbar {
+  width: 6px;
+}
+
+.messages-list::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 9999px;
+  transition: background-color 220ms ease;
+}
+
+.messages-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.messages-list:hover {
+  scrollbar-color: rgba(0, 0, 0, 0.3) transparent;
+}
+
+.messages-list.is-scrolling {
+  scrollbar-color: rgba(0, 0, 0, 0.3) transparent;
+}
+
+.messages-list:hover::-webkit-scrollbar-thumb,
+.messages-list.is-scrolling::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.3);
+}
+
+.messages-composer {
+  flex-shrink: 0;
+}
+
+/* Group Chat page only — fills parent (not 100vh alone); only .group-messages scrolls. */
+.group-chat-page {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.group-chat-root,
+.group-chat-main {
+  overflow: hidden;
+}
+
+.group-messages,
+.group-chat-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.group-messages::-webkit-scrollbar,
+.group-chat-list::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 
 /* Home feed column: visible, light scrollbar */
