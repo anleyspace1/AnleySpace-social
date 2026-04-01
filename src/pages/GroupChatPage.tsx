@@ -1317,7 +1317,7 @@ export default function GroupChatPage() {
 
       <div className="group-chat-main flex min-h-0 flex-1 flex-col w-full min-w-0">
       {/* Messages Area */}
-      <div className="group-messages group-chat-list flex-1 min-h-0 w-full min-w-0 overscroll-contain scroll-smooth p-4 space-y-4">
+      <div className="group-messages group-chat-list flex-1 min-h-0 w-full min-w-0 overscroll-contain scroll-smooth p-4 space-y-4 max-lg:pb-[calc(5rem+env(safe-area-inset-bottom,0px))] lg:pb-4">
         {messagesQueryError && (
           <div className="mb-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100">
             <span className="font-bold">Could not load messages: </span>
@@ -1446,7 +1446,7 @@ export default function GroupChatPage() {
       </div>
 
       {/* Input Area */}
-      <div className="shrink-0 w-full min-w-0 p-4 bg-white dark:bg-gray-900 border-t border-gray-100 dark:border-gray-800 pb-12 lg:pb-4">
+      <div className="group-chat-composer shrink-0 w-full min-w-0 px-4 pt-4 bg-white dark:bg-gray-900 border-t border-gray-100 dark:border-gray-800 pb-[max(1rem,env(safe-area-inset-bottom))] lg:pb-4">
         {typingUsers.length > 0 && (
           <div className="typing-indicator mb-2 px-1 text-xs text-gray-500 dark:text-gray-400 italic">
             {typingUsers.map((t) => t.username).join(', ')} {typingUsers.length === 1 ? 'is' : 'are'} typing…

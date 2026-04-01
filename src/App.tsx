@@ -26,6 +26,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from './lib/utils';
+import { normalizeAppPathname } from './lib/route-path';
 import { ResponsiveImage } from './components/ResponsiveImage';
 
 // Pages
@@ -396,16 +397,20 @@ export default function App() {
 
 function AppContent() {
   const location = useLocation();
-  const { user } = useAuth();
-  const isReels = location.pathname === '/reels';
-  const isCreateReel = location.pathname === '/reels/create';
-  const isMessages = location.pathname === '/messages';
-  const isGroupChat = /^\/groups\/[^/]+\/chat$/.test(location.pathname);
-  const isGroupsPage = location.pathname === '/groups';
+  const path = normalizeAppPathname(location.pathname);
+  const isReels = path === '/reels';
+  const isCreateReel = path === '/reels/create';
+  const isMessages = path === '/messages';
+  const isGroupChat = /^\/groups\/[^/]+\/chat$/.test(path);
+  const isGroupsPage = path === '/groups';
   /** `/groups/:id` — Feed / Members / About (not `/groups`, not `.../chat`). */
-  const isGroupDetailPage = /^\/groups\/[^/]+$/.test(location.pathname);
-  const isHome = location.pathname === '/' && !isReels && !isCreateReel;
-  const isAuthPage = location.pathname === '/login' || location.pathname === '/signup' || location.pathname === '/forgot-password' || location.pathname === '/reset-password';
+  const isGroupDetailPage = /^\/groups\/[^/]+$/.test(path);
+  const isHome = path === '/' && !isReels && !isCreateReel;
+  const isAuthPage =
+    path === '/login' ||
+    path === '/signup' ||
+    path === '/forgot-password' ||
+    path === '/reset-password';
   
   const [darkMode, setDarkMode] = useState(() => {
     const saved = localStorage.getItem('darkMode');
@@ -424,22 +429,28 @@ function AppContent() {
 
   useEffect(() => {
     if (!isMessages && !isGroupChat) return;
-    const prevHtmlOverflow = document.documentElement.style.overflow;
-    const prevBodyOverflow = document.body.style.overflow;
-    const prevHtmlHeight = document.documentElement.style.height;
-    const prevBodyHeight = document.body.style.height;
-    const prevScrollbarGutter = (document.documentElement.style as CSSStyleDeclaration & { scrollbarGutter?: string }).scrollbarGutter;
-    document.documentElement.style.overflow = 'hidden';
-    document.body.style.overflow = 'hidden';
-    document.documentElement.style.height = '100%';
-    document.body.style.height = '100%';
-    (document.documentElement.style as CSSStyleDeclaration & { scrollbarGutter?: string }).scrollbarGutter = 'auto';
+    const html = document.documentElement;
+    const body = document.body;
+    html.classList.add('chat-route-active');
+    body.classList.add('chat-route-active');
+    const prevHtmlOverflow = html.style.overflow;
+    const prevBodyOverflow = body.style.overflow;
+    const prevHtmlHeight = html.style.height;
+    const prevBodyHeight = body.style.height;
+    const prevScrollbarGutter = (html.style as CSSStyleDeclaration & { scrollbarGutter?: string }).scrollbarGutter;
+    html.style.overflow = 'hidden';
+    body.style.overflow = 'hidden';
+    html.style.height = '100%';
+    body.style.height = '100%';
+    (html.style as CSSStyleDeclaration & { scrollbarGutter?: string }).scrollbarGutter = 'auto';
     return () => {
-      document.documentElement.style.overflow = prevHtmlOverflow;
-      document.body.style.overflow = prevBodyOverflow;
-      document.documentElement.style.height = prevHtmlHeight;
-      document.body.style.height = prevBodyHeight;
-      (document.documentElement.style as CSSStyleDeclaration & { scrollbarGutter?: string }).scrollbarGutter = prevScrollbarGutter ?? '';
+      html.classList.remove('chat-route-active');
+      body.classList.remove('chat-route-active');
+      html.style.overflow = prevHtmlOverflow;
+      body.style.overflow = prevBodyOverflow;
+      html.style.height = prevHtmlHeight;
+      body.style.height = prevBodyHeight;
+      (html.style as CSSStyleDeclaration & { scrollbarGutter?: string }).scrollbarGutter = prevScrollbarGutter ?? '';
     };
   }, [isMessages, isGroupChat]);
 
@@ -527,7 +538,12 @@ function AppContent() {
                   : 'min-h-[calc(100vh-56px)] sm:min-h-[calc(100vh-64px)] py-0 lg:py-6'
             )}
           >
-            <div className={cn((isMessages || isGroupChat) && 'h-full flex-1 min-h-0 w-full min-w-0')}>
+            <div
+              className={cn(
+                (isMessages || isGroupChat) &&
+                  'chat-route-content h-full flex-1 min-h-0 w-full min-w-0 max-h-[100dvh]'
+              )}
+            >
               <AnimatePresence mode="wait">
                 <Routes>
                 <Route path="/" element={<ProtectedRoute><HomePage /></ProtectedRoute>} />
@@ -581,7 +597,11 @@ function AppContent() {
             </div>
           )}
         </div>
-        <BottomNav isReels={isReels} isCreateReel={isCreateReel} />
+        <BottomNav
+          isReels={isReels}
+          isCreateReel={isCreateReel}
+          hideOnChat={isMessages || isGroupChat}
+        />
       </div>
   );
 }

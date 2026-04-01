@@ -55,17 +55,26 @@
   scrollbar-width: none;
 }
 
+/* Chat routes (DM + Group): single column flex shell so only the message list scrolls; 100dvh tracks mobile keyboard. */
+.chat-route-content {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
 /* Messages route root: fill the main column (like Group Chat). Do not use 100vh here — it is taller than the
    scrollable area below the app header and gets clipped by overflow:hidden, hiding header actions or input. */
 .messages-root {
   display: flex;
+  flex-direction: row;
   width: 100%;
   max-width: 100%;
   height: 100%;
   min-height: 0;
   flex: 1;
-  overflow-y: visible;
-  overflow-x: hidden;
+  overflow: hidden;
 }
 
 .messages-main {
@@ -139,15 +148,26 @@
 
 .messages-composer {
   flex-shrink: 0;
+  position: sticky;
+  bottom: 0;
+  z-index: 30;
 }
 
 /* Group Chat page only — fills parent (not 100vh alone); only .group-messages scrolls. */
 .group-chat-page {
   height: 100%;
   min-height: 0;
+  max-height: 100dvh;
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+.group-chat-composer {
+  flex-shrink: 0;
+  position: sticky;
+  bottom: 0;
+  z-index: 30;
 }
 
 .group-chat-root,
@@ -259,4 +279,12 @@
 .dark #root input.search-input[type="text"]:-webkit-autofill:hover,
 .dark #root input.search-input[type="text"]:-webkit-autofill:focus {
   -webkit-text-fill-color: #ffffff !important;
+}
+
+/* Stabilize viewport on DM / Group chat (class toggled from App.tsx). */
+html.chat-route-active,
+html.chat-route-active body {
+  height: 100%;
+  min-height: 100dvh;
+  overflow: hidden;
 }

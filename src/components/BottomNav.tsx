@@ -1,10 +1,22 @@
 import React from 'react';
-import { NavLink } from 'react-router-dom';
+import { NavLink, useLocation } from 'react-router-dom';
 import { Home, Compass, Plus, ShoppingBag, Bell, PlaySquare } from 'lucide-react';
 import { cn } from '../lib/utils';
+import { isChatRoutePath } from '../lib/route-path';
 
-export default function BottomNav({ isReels, isCreateReel }: { isReels?: boolean; isCreateReel?: boolean }) {
+export default function BottomNav({
+  isReels,
+  isCreateReel,
+  hideOnChat,
+}: {
+  isReels?: boolean;
+  isCreateReel?: boolean;
+  /** DM + Group chat use their own composer at the bottom; hiding avoids overlap with keyboard / fixed bar. */
+  hideOnChat?: boolean;
+}) {
+  const location = useLocation();
   if (isCreateReel) return null;
+  if (hideOnChat || isChatRoutePath(location.pathname)) return null;
 
   return (
     <nav className={cn(

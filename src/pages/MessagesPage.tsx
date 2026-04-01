@@ -1750,7 +1750,10 @@ export default function MessagesPage() {
               </div>
             )}
 
-            <div ref={messagesListRef} className="messages-list min-h-0 h-full flex-1 overflow-y-auto overscroll-contain scroll-smooth p-2 sm:p-3 lg:p-4 bg-[#f5f7fb] dark:bg-[#111827]/80">
+            <div
+              ref={messagesListRef}
+              className="messages-list min-h-0 h-full flex-1 overflow-y-auto overscroll-contain scroll-smooth p-2 sm:p-3 lg:p-4 max-lg:pb-[calc(5rem+env(safe-area-inset-bottom,0px))] bg-[#f5f7fb] dark:bg-[#111827]/80"
+            >
               <div className="w-full min-h-full flex flex-col justify-end space-y-2 sm:space-y-2.5">
               <div className="flex justify-center">
                 <span className="text-xs bg-white dark:bg-gray-800 text-gray-600 dark:text-gray-400 px-3 py-1 rounded-full border border-gray-200/80 dark:border-gray-700 shadow-sm">Today</span>
@@ -1980,7 +1983,7 @@ export default function MessagesPage() {
               </div>
             </div>
 
-            <div className="messages-composer shrink-0 p-2 sm:p-3 lg:p-4 border-t border-[#e5e7eb] bg-white/95 dark:bg-gray-950/95 dark:border-gray-800 backdrop-blur-sm shadow-[0_-1px_0_rgba(15,23,42,0.06)]">
+            <div className="messages-composer shrink-0 border-t border-[#e5e7eb] bg-white/95 dark:bg-gray-950/95 dark:border-gray-800 backdrop-blur-sm shadow-[0_-1px_0_rgba(15,23,42,0.06)] px-2 pt-2 sm:px-3 sm:pt-3 lg:px-4 lg:pt-4 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:pb-[max(0.75rem,env(safe-area-inset-bottom))] lg:pb-4">
               <div className="w-full">
               {selectedChat?.product_id && !isRecording && (
                 <div className="mb-2 flex flex-wrap items-center gap-2 px-0.5">
