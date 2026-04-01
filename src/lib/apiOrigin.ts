@@ -14,6 +14,7 @@ function warnMissingViteApiOriginInProdOnce(): void {
   if (!import.meta.env.PROD) return;
   const env =
     (import.meta.env.VITE_API_ORIGIN as string | undefined)?.trim() ||
+    (import.meta.env.VITE_API_URL as string | undefined)?.trim() ||
     (import.meta.env.NEXT_PUBLIC_API_ORIGIN as string | undefined)?.trim();
   if (!env) {
     console.error('Missing VITE_API_ORIGIN – calls will fail on Vercel');
@@ -29,6 +30,7 @@ warnMissingViteApiOriginInProdOnce();
 export function getApiBase(): string {
   const raw =
     (import.meta.env.VITE_API_ORIGIN as string | undefined)?.trim() ||
+    (import.meta.env.VITE_API_URL as string | undefined)?.trim() ||
     (import.meta.env.NEXT_PUBLIC_API_ORIGIN as string | undefined)?.trim() ||
     '';
   let fromEnv = raw.replace(/\/$/, '');

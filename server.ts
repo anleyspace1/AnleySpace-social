@@ -1072,7 +1072,11 @@ async function startServer() {
   app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
   app.post('/api/create-checkout-session', async (req, res) => {
-    console.log('API HIT');
+    console.log('[create-checkout-session] hit', {
+      origin: req.headers.origin,
+      host: req.headers.host,
+      hasAuth: !!req.headers.authorization,
+    });
     try {
       const stripeKeyPresent = !!(process.env.STRIPE_SECRET_KEY && String(process.env.STRIPE_SECRET_KEY).trim());
       if (!stripeKeyPresent || !stripeClient) {
