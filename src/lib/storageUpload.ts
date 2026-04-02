@@ -1,6 +1,6 @@
 /** Extension from filename; logs non–mp4/webm video extensions (upload still proceeds). */
 export function resolveStorageExtension(file: File): string {
-  const ext = file.name.split('.').pop()?.toLowerCase() || '';
+  const ext = (file.name ?? '').split('.').pop()?.toLowerCase() || '';
   const isVideo = file.type.startsWith('video');
   if (isVideo) {
     if (ext && !['mp4', 'webm'].includes(ext)) {

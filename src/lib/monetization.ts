@@ -1,6 +1,7 @@
-import { apiUrl } from './apiOrigin';
+import { apiUrl, responseLooksLikeJsonApi } from './apiOrigin';
 import { getBearerAuthHeaders } from './supabaseAuthHeaders';
 import { emitMonetizationRefresh, emitPostMonetizationRefresh } from './monetizationRealtime';
+import { isSupabaseConfigured, supabase } from './supabase';
 
 /** 1 coin = $0.01 USD */
 export const COIN_USD = 0.01;
@@ -70,15 +71,94 @@ export type MonetizationPostStatus = {
   creatorId?: string;
 };
 
-export async function fetchMonetizationPost(postId: string): Promise<MonetizationPostStatus | null> {
+/** Same mapping as `server.ts` GET /api/monetization/post/:postId — used when the API host is unavailable (e.g. Vercel static). */
+function monetizationStatusFromPostMonetizationRow(
+  row: {
+    creator_id?: string | null;
+    tier?: string | null;
+    max_boost_earnings_cents?: number | null;
+    boost_earnings_cents?: number | null;
+    organic_earnings_cents?: number | null;
+    expires_at?: string | null;
+  } | null
+): MonetizationPostStatus {
+  if (!row) {
+    return {
+      ok: true,
+      unlocked: false,
+      monetizationLocked: true,
+      tier: null,
+      expiresAt: null,
+      boostEarningsCents: 0,
+      maxBoostEarningsCents: 0,
+      organicEarningsCents: 0,
+      boostProgress: 0,
+    };
+  }
+  const expiresAtMs = row.expires_at ? new Date(String(row.expires_at)).getTime() : 0;
+  const unlocked = expiresAtMs > Date.now();
+  const maxC = Number(row.max_boost_earnings_cents) || 0;
+  const boostC = Number(row.boost_earnings_cents) || 0;
+  const organicC = Number(row.organic_earnings_cents) || 0;
+  const boostProgress = maxC > 0 ? Math.min(1, boostC / maxC) : 0;
+  return {
+    ok: true,
+    unlocked,
+    monetizationLocked: !unlocked,
+    tier: row.tier ?? null,
+    expiresAt: row.expires_at != null ? String(row.expires_at) : null,
+    boostEarningsCents: boostC,
+    maxBoostEarningsCents: maxC,
+    organicEarningsCents: organicC,
+    boostProgress,
+    creatorId: row.creator_id ?? undefined,
+  };
+}
+
+/**
+ * Read monetization from Supabase (anon can SELECT per RLS). Used when `/api/monetization/post` is missing
+ * (static hosting) or returns non-JSON.
+ */
+async function fetchMonetizationPostFromSupabase(postId: string): Promise<MonetizationPostStatus | null> {
+  if (!isSupabaseConfigured) return null;
   try {
-    const res = await fetch(apiUrl(`/api/monetization/post/${encodeURIComponent(postId)}`));
-    const j = await res.json();
-    if (!res.ok) return null;
-    return j as MonetizationPostStatus;
+    const { data: row, error } = await supabase
+      .from('post_monetization')
+      .select(
+        'post_id, creator_id, tier, price_coins, max_boost_earnings_cents, boost_earnings_cents, organic_earnings_cents, expires_at, created_at'
+      )
+      .eq('post_id', postId)
+      .maybeSingle();
+    if (error) {
+      if (import.meta.env.DEV) console.warn('[monetization] Supabase post_monetization', error.message);
+      return null;
+    }
+    return monetizationStatusFromPostMonetizationRow(row);
   } catch {
     return null;
   }
+}
+
+function isMonetizationPostPayload(j: unknown): j is MonetizationPostStatus {
+  if (j == null || typeof j !== 'object') return false;
+  return typeof (j as Record<string, unknown>).unlocked === 'boolean';
+}
+
+/**
+ * Loads boost / unlock state for tips & gifts UI. Tries Express API first (local dev / deployed API);
+ * falls back to Supabase so Vercel static builds match local behavior without `VITE_API_ORIGIN`.
+ */
+export async function fetchMonetizationPost(postId: string): Promise<MonetizationPostStatus | null> {
+  try {
+    const res = await fetch(apiUrl(`/api/monetization/post/${encodeURIComponent(postId)}`));
+    if (responseLooksLikeJsonApi(res) && res.ok) {
+      const j: unknown = await res.json();
+      if (isMonetizationPostPayload(j)) return j;
+    }
+  } catch {
+    /* network or invalid JSON (e.g. HTML from SPA host) */
+  }
+  return fetchMonetizationPostFromSupabase(postId);
 }
 
 /** When Home post id ≠ reel row id, merge unlock signals so Tip/Gifts match Home. */

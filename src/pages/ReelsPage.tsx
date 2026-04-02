@@ -755,7 +755,9 @@ export default function ReelsPage() {
         {/* Reels Feed — sole vertical scroll + snap; avoid 100vh inline so it matches parent 100dvh flex */}
         <div
           className={cn(
-            'relative h-full min-h-0 w-full flex-1 snap-y snap-mandatory overflow-y-auto overscroll-y-contain no-scrollbar',
+            'relative h-full min-h-0 w-full flex-1 overflow-y-auto no-scrollbar',
+            'snap-y max-lg:snap-proximity lg:snap-mandatory',
+            'max-lg:overscroll-y-auto lg:overscroll-y-contain',
             '[-webkit-overflow-scrolling:touch] touch-pan-y',
             'lg:transition-all lg:duration-500 lg:ease-in-out lg:touch-auto',
             isCommentsOpen ? 'lg:mr-0' : ''
@@ -782,7 +784,7 @@ export default function ReelsPage() {
                     key={`ad-${entry.ad.id}-${index}`}
                     className={cn(
                       'relative box-border w-full shrink-0 snap-start p-0 m-0',
-                      'max-lg:h-[100dvh] max-lg:min-h-[100dvh] max-lg:max-h-[100dvh] max-lg:[scroll-snap-stop:always]',
+                      'max-lg:h-[100dvh] max-lg:min-h-[100dvh] max-lg:max-h-[100dvh] max-lg:[scroll-snap-stop:normal] max-lg:touch-pan-y',
                       'lg:h-full flex items-center justify-center bg-black'
                     )}
                     style={isTouchDevice ? { scrollSnapAlign: 'start', backgroundColor: '#000' } : undefined}
@@ -808,7 +810,7 @@ export default function ReelsPage() {
                   data-reel-id={video.id}
                   className={cn(
                     'relative box-border w-full shrink-0 snap-start p-0 m-0',
-                    'max-lg:h-[100dvh] max-lg:min-h-[100dvh] max-lg:max-h-[100dvh] max-lg:[scroll-snap-stop:always]',
+                    'max-lg:h-[100dvh] max-lg:min-h-[100dvh] max-lg:max-h-[100dvh] max-lg:[scroll-snap-stop:normal] max-lg:touch-pan-y',
                     'lg:h-full'
                   )}
                   style={isTouchDevice ? { scrollSnapAlign: 'start', backgroundColor: '#000' } : undefined}
@@ -2300,7 +2302,10 @@ function VideoPost({
   return (
     <div
       ref={reelContainerRef}
-      className="relative isolate h-full min-h-0 w-full flex-shrink-0 overflow-hidden bg-black group"
+      className={cn(
+        'relative isolate h-full min-h-0 w-full flex-shrink-0 overflow-hidden bg-black group',
+        isTouchDevice && 'touch-pan-y'
+      )}
     >
       {video.isViral && (
         <div className="pointer-events-none absolute top-2 left-2 z-[30] bg-orange-500 text-white text-xs px-2 py-1 rounded-full font-bold shadow-lg">
@@ -2336,7 +2341,12 @@ function VideoPost({
             style={{ backgroundColor: '#000' }}
           />
           {/* Main player — shrink-wrapped + centered so sides/top-bottom show blur, not black pillarbox */}
-          <div className="absolute inset-0 z-[10] flex h-full w-full min-h-0 min-w-0 items-center justify-center">
+          <div
+            className={cn(
+              'absolute inset-0 z-[10] flex h-full w-full min-h-0 min-w-0 items-center justify-center',
+              isTouchDevice && 'touch-pan-y'
+            )}
+          >
             <video
               key={video.id}
               ref={(el) => {
@@ -2347,6 +2357,7 @@ function VideoPost({
               poster={posterForPlayer}
               className={cn(
                 'relative z-[10] max-h-full max-w-full object-contain',
+                isTouchDevice && 'touch-pan-y',
                 !isReady && 'invisible'
               )}
               controls={!isTouchDevice}
@@ -2360,7 +2371,11 @@ function VideoPost({
               onPause={handleMainVideoPauseOrEnd}
               onEnded={handleMainVideoPauseOrEnd}
               onClick={handleVideoSurfaceTap}
-              style={isTouchDevice ? undefined : { cursor: 'pointer' }}
+              style={
+                isTouchDevice
+                  ? { touchAction: 'pan-y' as const }
+                  : { cursor: 'pointer' }
+              }
             />
           </div>
         </>
@@ -2516,8 +2531,8 @@ function VideoPost({
         />
       </div>
 
-      {/* Bottom Content Overlay */}
-      <div className="absolute bottom-12 left-6 right-20 z-[30] sm:bottom-24">
+      {/* Bottom Content Overlay — pointer-events-none so vertical swipes reach the feed scroller; actions stay on the right rail */}
+      <div className="pointer-events-none absolute bottom-12 left-6 right-20 z-[30] sm:bottom-24">
         <div className="flex flex-col gap-3">
           {monetizationUnlocked && monetization && (
             <div className="max-w-sm space-y-1.5 rounded-xl border border-emerald-500/30 bg-black/70 px-3 py-2">
@@ -2551,7 +2566,7 @@ function VideoPost({
                 <span className="text-white font-black text-sm tracking-tight">@{video.user.username}</span>
                 <BadgeCheck size={14} className="text-indigo-400 fill-indigo-400/20" />
               </div>
-              <p className="text-white text-xs font-medium mt-0.5">{video.caption.split('#')[0]}</p>
+              <p className="text-white text-xs font-medium mt-0.5">{(video.caption ?? '').split('#')[0]}</p>
             </div>
           </div>
 

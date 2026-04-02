@@ -48,11 +48,12 @@ export default function StoryEditor({ isOpen, onClose, onPublished, content }: S
       let finalImageUrl = content.image;
 
       // 1. If image is base64, upload to Supabase Storage
-      if (content.image.startsWith('data:')) {
+      const imageStr = String(content.image ?? '');
+      if (imageStr.startsWith('data:')) {
         try {
           // Convert base64 to Blob
-          const base64Data = content.image.split(',')[1];
-          const mimeType = content.image.split(',')[0].split(':')[1].split(';')[0];
+          const base64Data = imageStr.split(',')[1] ?? '';
+          const mimeType = (imageStr.split(',')[0] ?? '').split(':')[1]?.split(';')[0] ?? 'image/jpeg';
           const byteCharacters = atob(base64Data);
           const byteNumbers = new Array(byteCharacters.length);
           for (let i = 0; i < byteCharacters.length; i++) {
