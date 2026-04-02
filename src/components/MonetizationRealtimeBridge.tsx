@@ -4,6 +4,7 @@ import { isSupabaseConfigured } from '../lib/supabase';
 import {
   registerMonetizationRealtimeSubscriptions,
   emitMonetizationRefresh,
+  MONETIZATION_REFRESH_EVENT,
 } from '../lib/monetizationRealtime';
 
 const POLL_MS = 10_000;
@@ -39,6 +40,13 @@ export default function MonetizationRealtimeBridge() {
       window.clearInterval(poll);
     };
   }, [user?.id]);
+
+  /** After client-side gift/boost flows dispatch MONETIZATION_REFRESH_EVENT, reload profile immediately. */
+  useEffect(() => {
+    const fn = () => void refreshRef.current();
+    window.addEventListener(MONETIZATION_REFRESH_EVENT, fn);
+    return () => window.removeEventListener(MONETIZATION_REFRESH_EVENT, fn);
+  }, []);
 
   return null;
 }

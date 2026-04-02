@@ -4,6 +4,7 @@
  */
 import Stripe from 'stripe';
 import { createClient } from '@supabase/supabase-js';
+import { parseCheckoutCreditMetadata } from '../src/lib/stripeCheckoutMetadata';
 
 export default async function handler(request: Request): Promise<Response> {
   if (request.method !== 'POST') {
@@ -35,35 +36,64 @@ export default async function handler(request: Request): Promise<Response> {
 
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object as Stripe.Checkout.Session;
-    console.log(
-      '[stripe-webhook] checkout.session.completed',
-      'session_id:',
-      session.id,
-      'amount_total:',
-      session.amount_total,
-      'customer_email:',
-      session.customer_email
-    );
+    console.log('[stripe-webhook:vercel] checkout.session.completed', {
+      session_id: session.id,
+      mode: session.mode,
+      amount_total: session.amount_total,
+      payment_status: session.payment_status,
+      client_reference_id: session.client_reference_id,
+      metadata: session.metadata,
+    });
 
-    const meta = session.metadata ?? {};
-    const userId = typeof meta.user_id === 'string' ? meta.user_id.trim() : '';
-    const coinsRaw = typeof meta.coins === 'string' ? meta.coins.trim() : '';
-    const coins = coinsRaw ? parseInt(coinsRaw, 10) : NaN;
-
-    const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
-    const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-    if (userId && Number.isFinite(coins) && coins > 0 && supabaseUrl && serviceKey) {
-      const admin = createClient(supabaseUrl, serviceKey, {
-        auth: { persistSession: false, autoRefreshToken: false },
+    if (session.mode !== 'payment' || session.payment_status !== 'paid') {
+      console.warn('[stripe-webhook:vercel] skip credit — not a paid payment session', {
+        mode: session.mode,
+        payment_status: session.payment_status,
       });
-      const { error } = await admin.rpc('credit_wallet_coins', { p_user_id: userId, p_amount: coins });
-      if (error) {
-        console.error('[stripe-webhook] credit_wallet_coins failed', error);
+    } else {
+      const parsed = parseCheckoutCreditMetadata(session.metadata ?? undefined);
+      if (!parsed) {
+        console.error('[stripe-webhook:vercel] invalid or unsafe metadata — NOT crediting', {
+          session_id: session.id,
+          metadata: session.metadata,
+        });
+      } else if (session.client_reference_id && session.client_reference_id !== parsed.userId) {
+        console.error('[stripe-webhook:vercel] client_reference_id mismatch metadata.user_id — NOT crediting', {
+          session_id: session.id,
+          client_reference_id: session.client_reference_id,
+          metadata_user_id: parsed.userId,
+        });
+      } else {
+        const { userId, coins } = parsed;
+        const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+        const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+        if (!supabaseUrl || !serviceKey) {
+          console.error('[stripe-webhook:vercel] Supabase URL or SUPABASE_SERVICE_ROLE_KEY missing — NOT crediting');
+        } else {
+          const admin = createClient(supabaseUrl, serviceKey, {
+            auth: { persistSession: false, autoRefreshToken: false },
+          });
+          console.log('[stripe-webhook:vercel] crediting single user', {
+            session_id: session.id,
+            userId,
+            coins,
+          });
+          const { error } = await admin.rpc('credit_wallet_coins', {
+            p_user_id: userId,
+            p_amount: coins,
+            p_stripe_session_id: session.id,
+          });
+          if (error) {
+            console.error('[stripe-webhook:vercel] credit_wallet_coins failed', error);
+          } else {
+            console.log('[stripe-webhook:vercel] credit_wallet_coins success', { userId, coins, session_id: session.id });
+          }
+        }
       }
-    } else if (userId && Number.isFinite(coins) && coins > 0) {
-      console.warn('[stripe-webhook] Supabase service role or URL missing — wallet not credited');
     }
+  } else {
+    console.log('[stripe-webhook:vercel] event type (ignored for credit):', event.type);
   }
 
   return Response.json({ received: true }, { status: 200 });

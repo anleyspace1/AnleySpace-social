@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { motion } from 'motion/react';
 import { 
@@ -24,10 +24,10 @@ import {
   mapMarketplaceRowsToProducts,
 } from '../lib/marketplaceRemote';
 import { isProductSavedInMarketplace, setSavedMarketplaceProduct } from '../lib/savedMarketplace';
-import { BOOST_OPTIONS, boostMarketplaceProduct } from '../lib/marketplaceBoost';
-import { BOOST_COST, fetchOrCreateWalletBalance } from '../lib/marketplaceCoins';
+import { BOOST_COST, BOOST_OPTIONS, fetchOrCreateWalletBalance } from '../lib/marketplaceCoins';
 import { isMarketplaceEffectivelyFeatured } from '../lib/marketplaceFeatured';
 import { incrementMarketplaceView } from '../lib/incrementMarketplaceView';
+import { emitMonetizationRefresh } from '../lib/monetizationRealtime';
 import { isPlaceholderUsername } from '../lib/realDataGuards';
 import { toggleMarketplaceLike } from '../lib/toggleMarketplaceLike';
 import { isSupabaseConfigured, supabase } from '../lib/supabase';
@@ -92,7 +92,7 @@ export default function ProductDetailPage() {
   const { id } = useParams();
   console.log("ProductDetailPage mounted", { routeParamId: id });
   const navigate = useNavigate();
-  const { user } = useAuth();
+  const { user, refreshProfile } = useAuth();
   const [product, setProduct] = useState<Product | null>(null);
   const [loading, setLoading] = useState(true);
   const [buying, setBuying] = useState(false);
@@ -172,7 +172,7 @@ export default function ProductDetailPage() {
   }, [product?.id, user?.id]);
 
   useEffect(() => {
-    if (!user?.id || !product?.user_id || user.id !== product.user_id) {
+    if (!user?.id) {
       setWalletBalance(null);
       return;
     }
@@ -183,7 +183,7 @@ export default function ProductDetailPage() {
     return () => {
       cancelled = true;
     };
-  }, [user?.id, product?.user_id]);
+  }, [user?.id]);
 
   useEffect(() => {
     const pid = product?.id != null ? String(product.id).trim() : '';
@@ -372,6 +372,15 @@ export default function ProductDetailPage() {
       if (!user) alert('Please log in to buy items');
       return;
     }
+    const fresh = await fetchOrCreateWalletBalance(user.id);
+    if (fresh !== null) setWalletBalance(fresh);
+    const balance = Number(fresh ?? 0);
+    const price = Number(product.price);
+    console.log('balance:', balance, 'price:', price);
+    if (!Number.isFinite(balance) || !Number.isFinite(price) || balance < price) {
+      alert('Not enough coins');
+      return;
+    }
     setBuying(true);
     try {
       const res = await fetch(apiUrl('/api/marketplace/buy'), {
@@ -435,6 +444,65 @@ export default function ProductDetailPage() {
       return { ...prev, is_featured_raw: newRaw, is_featured: effective };
     });
   };
+
+  const handleBoost = useCallback(
+    async (days: number) => {
+      console.log('Boost clicked:', days);
+      if (!user?.id || !product?.id) {
+        alert('Please log in to boost your listing.');
+        return;
+      }
+      const userId = user.id;
+      const productId = String(product.id);
+      try {
+        const res = await fetch(apiUrl('/api/marketplace/boost'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId, productId, days }),
+        });
+        let payload: { error?: string; until?: string; success?: boolean } = {};
+        try {
+          payload = (await res.json()) as typeof payload;
+        } catch {
+          payload = {};
+        }
+        if (!res.ok) {
+          const msg =
+            typeof payload.error === 'string' && payload.error.trim()
+              ? payload.error
+              : 'Boost failed';
+          alert(msg);
+          return;
+        }
+        const untilStr =
+          typeof payload.until === 'string' && payload.until.trim()
+            ? payload.until
+            : new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+        setProduct((prev) =>
+          prev
+            ? {
+                ...prev,
+                is_featured_raw: true,
+                is_featured: isMarketplaceEffectivelyFeatured({
+                  is_featured: true,
+                  featured_until: untilStr,
+                }),
+                featured_until: untilStr,
+              }
+            : prev
+        );
+        const b = await fetchOrCreateWalletBalance(userId);
+        if (b !== null) setWalletBalance(b);
+        void refreshProfile();
+        emitMonetizationRefresh();
+        alert('Listing boosted successfully!');
+      } catch (e) {
+        console.error('[ProductDetail] boost', e);
+        alert(e instanceof Error ? e.message : 'Boost failed');
+      }
+    },
+    [user?.id, product?.id, refreshProfile]
+  );
 
   const handleGoToSellerProfile = () => {
     if (!product) return;
@@ -648,7 +716,8 @@ export default function ProductDetailPage() {
                 <span className="group-hover:underline">{product.location}</span>
               </div>
             </div>
-            {user?.id === product?.user_id && (
+            {user?.id &&
+            (user.id === product.user_id || user.id === product.seller?.id) && (
               <div style={{ marginTop: '12px' }} className="mb-3">
                 {walletBalance !== null && (
                   <p className="mb-2 text-sm font-semibold text-gray-800 dark:text-gray-200">
@@ -661,40 +730,7 @@ export default function ProductDetailPage() {
                     <button
                       key={opt.days}
                       type="button"
-                      onClick={async () => {
-                        const res = await boostMarketplaceProduct(product.id, opt.days);
-
-                        if (!res.ok) {
-                          const err = res.error;
-                          const msg =
-                            typeof err === 'string'
-                              ? err
-                              : err && typeof err === 'object' && 'message' in err
-                                ? String((err as { message?: string }).message)
-                                : 'Boost failed';
-                          alert(msg);
-                          return;
-                        }
-
-                        const untilStr = res.until.toISOString();
-                        setProduct((prev) =>
-                          prev
-                            ? {
-                                ...prev,
-                                is_featured_raw: true,
-                                is_featured: isMarketplaceEffectivelyFeatured({
-                                  is_featured: true,
-                                  featured_until: untilStr,
-                                }),
-                                featured_until: untilStr,
-                              }
-                            : prev
-                        );
-                        if (user?.id) {
-                          const b = await fetchOrCreateWalletBalance(user.id);
-                          if (b !== null) setWalletBalance(b);
-                        }
-                      }}
+                      onClick={() => void handleBoost(opt.days)}
                       className="rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-1.5 text-xs font-semibold text-indigo-800 hover:bg-indigo-100 dark:border-indigo-800 dark:bg-indigo-950/50 dark:text-indigo-200 dark:hover:bg-indigo-900/50"
                     >
                       {opt.label}{' '}

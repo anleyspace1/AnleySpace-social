@@ -5,10 +5,6 @@ import {
   Gift,
   Coins,
   Sparkles,
-  Eye,
-  Heart,
-  MessageCircle,
-  Share2,
   CheckCircle2,
   Lock,
   Shield,
@@ -17,12 +13,9 @@ import { useAuth } from '../../contexts/AuthContext';
 import { assetsApi, type RewardState } from '../api';
 import { cn } from '../../lib/utils';
 import {
-  compositeActivityPercent,
-  estimatedRewardCoins,
   getRewardsTierProgress,
   MIN_REWARD_ELIGIBILITY_POINTS,
   formatClaimAvailabilityNote,
-  stableActivityBreakdown,
 } from '../../lib/rewardsDashboard';
 import { rewardTierForPoints } from '../../lib/monetization';
 import { subscribeMonetizationRefresh } from '../../lib/monetizationRealtime';
@@ -46,45 +39,34 @@ export default function RewardsPage() {
     return subscribeMonetizationRefresh(() => void load());
   }, [load]);
 
-  /** Supabase gift_points (monetization) + assets SQLite user_points — show the higher so both systems stay visible. */
+  /**
+   * Headline points: Supabase monetization only (gift_points + points).
+   * Do not merge assets mock/reward.points — that layer used a 6400 demo default and is unrelated to gifts/boosts.
+   */
   const points = useMemo(() => {
-    const assetPts = Number(reward?.points ?? 0);
-    const gp = profile?.gift_points;
-    if (gp != null && gp !== undefined) return Math.max(Number(gp), assetPts);
-    return assetPts;
-  }, [reward?.points, profile?.gift_points]);
+    const gp = Number(profile?.gift_points ?? 0);
+    const pp = Number(profile?.points ?? 0);
+    const v = Math.max(Number.isFinite(gp) ? gp : 0, Number.isFinite(pp) ? pp : 0);
+    return Math.max(0, v);
+  }, [profile?.gift_points, profile?.points]);
   /** Source of truth: points ≥ 10k (aligned with server rules). */
   const isEligible = points >= MIN_REWARD_ELIGIBILITY_POINTS;
 
   const tierProgress = useMemo(() => getRewardsTierProgress(points), [points]);
 
-  const activityParts = useMemo(() => {
-    if (
-      reward?.activity_watch_pct != null &&
-      reward?.activity_likes_pct != null &&
-      reward?.activity_comments_pct != null &&
-      reward?.activity_shares_pct != null
-    ) {
-      return {
-        watch_pct: reward.activity_watch_pct,
-        likes_pct: reward.activity_likes_pct,
-        comments_pct: reward.activity_comments_pct,
-        shares_pct: reward.activity_shares_pct,
-      };
-    }
-    return stableActivityBreakdown(userId);
-  }, [reward, userId]);
+  /** 10,000 points = 100% activity (same scale as eligibility). */
+  const activityPct = useMemo(
+    () => Math.min(100, Math.max(0, (points / MIN_REWARD_ELIGIBILITY_POINTS) * 100)),
+    [points]
+  );
 
-  const compositePct = useMemo(() => {
-    if (reward?.activity_composite_pct != null) return Math.min(100, reward.activity_composite_pct);
-    return Math.round(compositeActivityPercent(activityParts));
-  }, [reward?.activity_composite_pct, activityParts]);
+  const hasActivity = points > 0;
+
+  /** 100 coins at max points (10k); linear: 1 coin per 100 points. */
+  const rewardCoins = useMemo(() => Math.floor(points / 100), [points]);
 
   const tierMeta = rewardTierForPoints(points);
   const displayMultiplier = tierMeta?.multiplier ?? reward?.tier_multiplier ?? 1;
-
-  const formulaEstimated = estimatedRewardCoins(compositePct, points);
-  const displayEstimated = Number(reward?.estimated_reward ?? formulaEstimated);
 
   const handleClaimReward = async () => {
     if (claiming || !isEligible) return;
@@ -103,7 +85,7 @@ export default function RewardsPage() {
 
   const r = 52;
   const c = 2 * Math.PI * r;
-  const dashOffset = c - (c * Math.min(100, compositePct)) / 100;
+  const dashOffset = c - (c * Math.min(100, activityPct)) / 100;
 
   return (
     <motion.div
@@ -121,7 +103,9 @@ export default function RewardsPage() {
           <p className="text-white/50 text-sm mt-1">Assets · Monthly rewards & tier progress</p>
         </div>
 
-        {!reward ? (
+        {!user ? (
+          <p className="text-white/60 text-sm">Sign in to view rewards.</p>
+        ) : !reward ? (
           <div className="h-48 rounded-2xl bg-white/5 border border-white/10 animate-pulse" />
         ) : (
           <>
@@ -272,18 +256,34 @@ export default function RewardsPage() {
                     </defs>
                   </svg>
                   <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
-                    <span className="text-2xl font-black text-white tabular-nums">{compositePct}%</span>
+                    <span className="text-2xl font-black text-white tabular-nums">
+                      {Math.round(activityPct)}%
+                    </span>
                     <span className="text-[10px] text-white/50 font-bold uppercase tracking-wider">Activity</span>
                   </div>
                 </div>
                 <div className="flex-1 space-y-2 w-full">
                   <p className="text-white font-black text-sm mb-2">This month&apos;s activity</p>
-                  <ActivityRow icon={<Eye size={14} />} label="Watch time" value={activityParts.watch_pct} />
-                  <ActivityRow icon={<Heart size={14} />} label="Likes" value={activityParts.likes_pct} />
-                  <ActivityRow icon={<MessageCircle size={14} />} label="Comments" value={activityParts.comments_pct} />
-                  <ActivityRow icon={<Share2 size={14} />} label="Shares" value={activityParts.shares_pct} />
-                  {compositePct >= 70 && (
-                    <p className="text-[11px] font-bold text-emerald-400/90 pt-1">High engagement! 🔥</p>
+                  {!hasActivity ? (
+                    <p className="text-[13px] text-white/50 leading-relaxed">
+                      No activity yet. Earn points from gifts and boosts — your ring fills as you reach 10,000 points
+                      (100%).
+                    </p>
+                  ) : (
+                    <>
+                      <ActivityRow
+                        icon={<Sparkles size={14} />}
+                        label="Points progress"
+                        value={activityPct}
+                      />
+                      <p className="text-[12px] text-white/45 leading-relaxed">
+                        Activity matches your reward points: {Math.floor(points).toLocaleString()} /{' '}
+                        {MIN_REWARD_ELIGIBILITY_POINTS.toLocaleString()} toward full activity.
+                      </p>
+                      {activityPct >= 70 && (
+                        <p className="text-[11px] font-bold text-emerald-400/90 pt-1">High engagement! 🔥</p>
+                      )}
+                    </>
                   )}
                 </div>
               </div>
@@ -295,7 +295,7 @@ export default function RewardsPage() {
                   <p className="text-white/55 text-xs font-bold uppercase tracking-widest mb-2">Estimated reward</p>
                   <div className="flex items-baseline gap-2 flex-wrap">
                     <span className="text-4xl font-black text-amber-300 tabular-nums">
-                      {displayEstimated.toFixed(2)}
+                      {rewardCoins.toFixed(2)}
                     </span>
                     <span className="inline-flex items-center gap-1 text-amber-200/90 text-sm font-bold">
                       <Coins size={16} className="text-amber-400" />
@@ -303,8 +303,9 @@ export default function RewardsPage() {
                     </span>
                   </div>
                   <div className="mt-3 rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-[11px] text-white/55 font-mono leading-relaxed">
-                    Formula: {compositePct}% × 100 × {displayMultiplier}x
-                    {tierMeta ? ` (${tierProgress.currentTierLabel})` : ''}
+                    Formula: ⌊points ÷ 100⌋ = {rewardCoins} coins · activity{' '}
+                    {Math.round(activityPct)}% (10k pts = 100% · 10k pts = 100 coins max)
+                    {tierMeta ? ` · tier ×${displayMultiplier}` : ''}
                   </div>
                 </div>
                 <div className="mt-6 relative z-10">

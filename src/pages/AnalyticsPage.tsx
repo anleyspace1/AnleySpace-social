@@ -24,7 +24,7 @@ import {
 } from 'recharts';
 import { useNavigate } from 'react-router-dom';
 import { cn } from '../lib/utils';
-import { supabase } from '../lib/supabase';
+import { isSupabaseConfigured, supabase } from '../lib/supabase';
 import { apiUrl } from '../lib/apiOrigin';
 import { useAuth } from '../contexts/AuthContext';
 
@@ -36,6 +36,34 @@ function isNonGroupPost(p: { category?: string | null }): boolean {
 function num(v: unknown): number {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
+}
+
+/** One view total per post (view_count, views, valid_views may overlap — take max). */
+function postDisplayViews(row: Record<string, unknown>): number {
+  return Math.max(num(row.view_count), num(row.views), num(row.valid_views));
+}
+
+const ANALYTICS_IN_CHUNK = 60;
+
+async function countTableRowsByPostIds(
+  table: 'likes' | 'comments',
+  postIds: string[]
+): Promise<{ count: number; ok: boolean }> {
+  if (postIds.length === 0) return { count: 0, ok: true };
+  let total = 0;
+  for (let i = 0; i < postIds.length; i += ANALYTICS_IN_CHUNK) {
+    const slice = postIds.slice(i, i + ANALYTICS_IN_CHUNK);
+    const { count, error } = await supabase
+      .from(table)
+      .select('*', { count: 'exact', head: true })
+      .in('post_id', slice);
+    if (error) {
+      console.warn(`[Analytics] ${table} count batch failed`, error);
+      return { count: 0, ok: false };
+    }
+    total += num(count);
+  }
+  return { count: total, ok: true };
 }
 
 function startOfMonth(d: Date): Date {
@@ -77,7 +105,7 @@ function buildViewsByDayFromPosts(posts: unknown[]): { date: string; views: numb
     const row = p as Record<string, unknown>;
     const key = toLocalDateKey(row.created_at);
     if (!key) continue;
-    const v = num(row.view_count ?? row.views);
+    const v = postDisplayViews(row);
     bucket.set(key, (bucket.get(key) ?? 0) + v);
   }
   return Array.from(bucket.entries())
@@ -102,7 +130,7 @@ function pickViralPosts(posts: unknown[], now: Date): ViralPostRow[] {
   const rows: ViralPostRow[] = [];
   for (const p of posts) {
     const row = p as Record<string, unknown>;
-    const views = num(row.view_count ?? row.views);
+    const views = postDisplayViews(row);
     if (views < VIRAL_VIEWS_MIN) continue;
 
     const createdRaw = row.created_at;
@@ -164,7 +192,7 @@ function buildAiInsights(posts: unknown[], viralCount: number): string[] {
     const d = new Date(String(created));
     if (!Number.isFinite(d.getTime())) continue;
     const h = d.getHours();
-    const v = num(row.view_count ?? row.views);
+    const v = postDisplayViews(row);
     const cur = hourBuckets.get(h) ?? { sum: 0, n: 0 };
     cur.sum += v;
     cur.n += 1;
@@ -195,7 +223,7 @@ function buildAiInsights(posts: unknown[], viralCount: number): string[] {
   let imageN = 0;
   for (const p of posts) {
     const row = p as Record<string, unknown>;
-    const v = num(row.view_count ?? row.views);
+    const v = postDisplayViews(row);
     if (isVideoPostRow(row)) {
       videoSum += v;
       videoN += 1;
@@ -288,8 +316,8 @@ const EMPTY_STATS: AnalyticsStats = {
   comments: 0,
   shares: 0,
   followers: 0,
-  postsTrend: '—',
-  viewsTrend: '—',
+  postsTrend: '0 this month',
+  viewsTrend: 'No views yet',
 };
 
 type TopPostSummary = {
@@ -360,7 +388,7 @@ export default function AnalyticsPage() {
         return;
       }
 
-      const uid = String(user.id).trim();
+      const uid = String(user.id).trim().toLowerCase();
       if (!uid) {
         if (!cancelled) {
           setStats(EMPTY_STATS);
@@ -377,36 +405,57 @@ export default function AnalyticsPage() {
       if (!cancelled) setLoading(true);
 
       try {
-        const { data: rows, error } = await supabase
+        let rows: unknown[] = [];
+
+        const { data: directRows, error: directErr } = await supabase
           .from('posts')
           .select('*')
           .eq('user_id', uid);
 
-        if (error) {
-          console.warn('[Analytics] posts select:', error);
-          if (!cancelled) {
-            setStats(EMPTY_STATS);
-            setTopPost(null);
-            setFollowersThisWeek(0);
-            setViewsTimeSeries([]);
-            setViralPosts([]);
-            setAiInsights([]);
-            setLoading(false);
+        if (directErr) {
+          console.warn('[Analytics] posts select:', directErr);
+          if (isSupabaseConfigured) {
+            try {
+              const res = await fetch(apiUrl('/api/posts'));
+              const all = await res.json().catch(() => null);
+              if (Array.isArray(all)) {
+                rows = all.filter((p: Record<string, unknown>) => {
+                  const pid = String(p.user_id ?? '').trim().toLowerCase();
+                  return pid === uid && isNonGroupPost(p);
+                });
+              }
+            } catch (apiErr) {
+              console.warn('[Analytics] /api/posts fallback failed', apiErr);
+            }
           }
-          return;
+          if (rows.length === 0) {
+            if (!cancelled) {
+              setStats(EMPTY_STATS);
+              setTopPost(null);
+              setFollowersThisWeek(0);
+              setViewsTimeSeries([]);
+              setViralPosts([]);
+              setAiInsights([]);
+              setLoading(false);
+            }
+            return;
+          }
+        } else {
+          rows = Array.isArray(directRows) ? directRows : [];
         }
 
-        const posts = (rows || []).filter(isNonGroupPost);
+        const posts = rows.filter(isNonGroupPost);
         const viewsByDay = buildViewsByDayFromPosts(posts);
         const postIds = posts.map((p: { id?: string }) => p?.id).filter(Boolean) as string[];
 
-        const safeViews = (p: Record<string, unknown>) =>
-          num(p.views ?? p.view_count);
         const safeSharesCol = (p: Record<string, unknown>) =>
-          num(p.shares_count ?? p.shares);
+          num(p.shares_count ?? p.share_count ?? p.shares);
 
         const totalPosts = posts.length;
-        const totalViews = posts.reduce((s, p) => s + safeViews(p as Record<string, unknown>), 0);
+        const totalViews = posts.reduce(
+          (s, p) => s + postDisplayViews(p as Record<string, unknown>),
+          0
+        );
         const sharesFromPosts = posts.reduce((s, p) => s + safeSharesCol(p as Record<string, unknown>), 0);
 
         const now = new Date();
@@ -424,19 +473,16 @@ export default function AnalyticsPage() {
 
         const viewsThisMonth = posts
           .filter((p: { created_at?: string }) => inRange(p.created_at, curStart, curEnd))
-          .reduce((s, p) => s + safeViews(p as Record<string, unknown>), 0);
+          .reduce((s, p) => s + postDisplayViews(p as Record<string, unknown>), 0);
         const viewsLastMonth = posts
           .filter((p: { created_at?: string }) => inRange(p.created_at, prevStart, prevEnd))
-          .reduce((s, p) => s + safeViews(p as Record<string, unknown>), 0);
+          .reduce((s, p) => s + postDisplayViews(p as Record<string, unknown>), 0);
 
-        const [likesRes, commentsRes, followersRes] = await Promise.all([
-          postIds.length > 0
-            ? supabase.from('likes').select('*', { count: 'exact', head: true }).in('post_id', postIds)
-            : Promise.resolve({ count: 0 as number | null, error: null }),
-          postIds.length > 0
-            ? supabase.from('comments').select('*', { count: 'exact', head: true }).in('post_id', postIds)
-            : Promise.resolve({ count: 0 as number | null, error: null }),
+        const [likesCounted, commentsCounted, followersRes, profileRow] = await Promise.all([
+          postIds.length > 0 ? countTableRowsByPostIds('likes', postIds) : Promise.resolve({ count: 0, ok: true }),
+          postIds.length > 0 ? countTableRowsByPostIds('comments', postIds) : Promise.resolve({ count: 0, ok: true }),
           supabase.from('follows').select('*', { count: 'exact', head: true }).eq('following_id', uid),
+          supabase.from('profiles').select('followers_count').eq('id', uid).maybeSingle(),
         ]);
 
         const likesFromPosts = posts.reduce(
@@ -448,9 +494,17 @@ export default function AnalyticsPage() {
           0
         );
 
-        const likes = likesRes.error ? likesFromPosts : num(likesRes.count);
-        const comments = commentsRes.error ? commentsFromPosts : num(commentsRes.count);
-        const followers = followersRes.error ? 0 : num(followersRes.count);
+        const likes = likesCounted.ok
+          ? Math.max(likesCounted.count, likesFromPosts)
+          : likesFromPosts;
+        const comments = commentsCounted.ok
+          ? Math.max(commentsCounted.count, commentsFromPosts)
+          : commentsFromPosts;
+        const followersFromFollows = followersRes.error ? 0 : num(followersRes.count);
+        const followersFromProfile = num(
+          (profileRow.data as { followers_count?: unknown } | null)?.followers_count
+        );
+        const followers = Math.max(followersFromFollows, followersFromProfile);
 
         let top: TopPostSummary | null = null;
         if (posts.length > 0) {
@@ -458,7 +512,7 @@ export default function AnalyticsPage() {
           let bestViews = -1;
           for (const p of posts) {
             const row = p as Record<string, unknown>;
-            const v = num(row.view_count ?? row.views);
+            const v = postDisplayViews(row);
             if (v > bestViews) {
               bestViews = v;
               bestRow = row;
@@ -498,18 +552,13 @@ export default function AnalyticsPage() {
 
         const engagementNumerator = likes + comments + sharesTotal;
         const engagementRate =
-          totalViews > 0 ? Math.round((engagementNumerator / totalViews) * 1000) / 10 : 0;
+          totalViews > 0
+            ? Math.min(999.9, Math.round((engagementNumerator / totalViews) * 1000) / 10)
+            : 0;
 
-        let postsTrend = '—';
-        if (postsThisMonth > 0) {
-          postsTrend = `+${postsThisMonth} this month`;
-        } else if (postsLastMonth > 0) {
-          postsTrend = '0 this month';
-        } else {
-          postsTrend = 'No posts this month';
-        }
+        const postsTrend = `${postsThisMonth} this month`;
 
-        let viewsTrend = '—';
+        let viewsTrend = 'No views yet';
         if (viewsLastMonth > 0) {
           const pct = Math.round(((viewsThisMonth - viewsLastMonth) / viewsLastMonth) * 100);
           viewsTrend = `${pct >= 0 ? '+' : ''}${pct}% vs last month`;
@@ -565,7 +614,11 @@ export default function AnalyticsPage() {
   }, [user?.id]);
 
   const engagementTrend =
-    stats.engagementRate >= 5 ? 'Above average' : stats.totalPosts > 0 ? 'Keep growing' : '—';
+    stats.engagementRate >= 5
+      ? 'Above average'
+      : stats.totalPosts > 0
+        ? 'Keep growing'
+        : 'Post to start tracking';
 
   return (
     <motion.div 
@@ -865,9 +918,11 @@ function StatCard({ icon, label, value, trend, color }: { icon: React.ReactNode;
   const displayMain =
     typeof value === 'string'
       ? value
-      : typeof value === 'number' && value >= 1000
-        ? `${(value / 1000).toFixed(1)}K`
-        : value;
+      : typeof value === 'number' && Number.isFinite(value)
+        ? value >= 1000
+          ? `${(value / 1000).toFixed(1)}K`
+          : String(value)
+        : '0';
 
   return (
     <div className="bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-800 p-6 rounded-3xl hover:shadow-lg transition-shadow">

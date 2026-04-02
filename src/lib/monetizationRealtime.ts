@@ -1,6 +1,8 @@
 import { supabase, isSupabaseConfigured } from './supabase';
 
-const REFRESH_EVENT = 'anley-monetization-refresh';
+/** Window event name for broad monetization UI refresh (profile points, rewards, etc.). */
+export const MONETIZATION_REFRESH_EVENT = 'anley-monetization-refresh';
+const REFRESH_EVENT = MONETIZATION_REFRESH_EVENT;
 const POST_EVENT = 'anley-monetization-post';
 
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;

@@ -6,6 +6,12 @@ export const BOOST_COST: Record<number, number> = {
   30: 50,
 };
 
+export const BOOST_OPTIONS = [
+  { label: '⭐ 3 days', days: 3 },
+  { label: '🔥 7 days', days: 7 },
+  { label: '🚀 30 days', days: 30 },
+] as const;
+
 /** Load balance or create a zero wallet row (RLS: own user only). */
 export async function fetchOrCreateWalletBalance(userId: string): Promise<number | null> {
   const { data: row, error } = await supabase

@@ -12,6 +12,7 @@ import fs from 'fs';
 import multer from 'multer';
 import { registerAssetsSystem } from './assets_system/registerAssetsSystem.ts';
 import { isMarketplaceEffectivelyFeatured } from './src/lib/marketplaceFeatured.ts';
+import { parseCheckoutCreditMetadata } from './src/lib/stripeCheckoutMetadata.ts';
 
 dotenv.config();
 
@@ -92,6 +93,63 @@ function supabaseForGroupSync(): any {
 /** Service role only — required for `groups` / `group_members` writes so RLS is bypassed and user_id is never lost. */
 function groupPersistenceClient(): any {
   return supabaseAdmin;
+}
+
+/**
+ * Increments profiles.gift_points + profiles.points via RPC.
+ * Logs full `{ data, error }`; after migration 20260404120000, `data` is rows updated (expect 1).
+ * Warns on 0 rows (no matching profiles.id) or if RPC still returns void (null data — migration not applied).
+ */
+async function rpcIncrementProfileActivityPoints(
+  admin: any,
+  userId: string,
+  delta: number,
+  context: string
+): Promise<void> {
+  if (!admin || !userId) return;
+  const d = Math.trunc(Number(delta));
+  if (!Number.isFinite(d) || d === 0) return;
+  const uid = String(userId).trim().toLowerCase();
+  const { data, error } = await admin.rpc("increment_profile_activity_points", {
+    p_user_id: uid,
+    p_delta: d,
+  });
+  console.log(`[increment_profile_activity_points] rpc result [${context}]`, {
+    data,
+    error: error ?? null,
+    userId: uid,
+    delta: d,
+  });
+  if (error) {
+    console.warn(`[increment_profile_activity_points] RPC error [${context}]`, uid, d, error);
+    return;
+  }
+  if (data === null || data === undefined) {
+    console.warn(
+      `[increment_profile_activity_points] RPC returned no data (void?). Apply migration 20260404120000_increment_profile_activity_points_rowcount.sql — otherwise 0-row UPDATEs are invisible. [${context}]`
+    );
+    return;
+  }
+  const rows = Number(data);
+  if (!Number.isFinite(rows)) {
+    console.warn(`[increment_profile_activity_points] unexpected data type [${context}]`, { data, userId: uid });
+    return;
+  }
+  if (rows !== 1) {
+    console.warn(
+      `[increment_profile_activity_points] expected 1 row updated, got ${rows} — ${rows === 0 ? "no profiles row for id (UUID mismatch or missing profile)" : "unexpected"} [${context}]`,
+      { userId: uid, delta: d }
+    );
+    const { count, error: countErr } = await admin
+      .from("profiles")
+      .select("id", { count: "exact", head: true })
+      .eq("id", uid);
+    console.warn("[increment_profile_activity_points] profiles id exists?", {
+      userId: uid,
+      count: count ?? null,
+      countError: countErr?.message,
+    });
+  }
 }
 
 type GroupSyncResult = { ok: true } | { ok: false; error: string; code?: string };
@@ -1033,32 +1091,54 @@ async function startServer() {
         const session = event.data.object as Stripe.Checkout.Session;
         console.log('[stripe-webhook] checkout.session.completed', {
           id: session.id,
+          mode: session.mode,
           amount_total: session.amount_total,
           currency: session.currency,
           customer_email: session.customer_email,
           payment_status: session.payment_status,
+          client_reference_id: session.client_reference_id,
           metadata: session.metadata,
-          mode: session.mode,
         });
-        const meta = session.metadata ?? {};
-        const userId = typeof meta.user_id === 'string' ? meta.user_id.trim() : '';
-        const coinsRaw = typeof meta.coins === 'string' ? meta.coins.trim() : '';
-        const coins = coinsRaw ? parseInt(coinsRaw, 10) : NaN;
 
-        if (!userId || !Number.isFinite(coins) || coins <= 0) {
-          console.warn('[stripe-webhook] checkout.session.completed missing or invalid metadata', {
-            hasUserId: !!userId,
-            coinsRaw,
+        if (session.mode !== 'payment' || session.payment_status !== 'paid') {
+          console.warn('[stripe-webhook] skip credit — not a paid payment session', {
+            mode: session.mode,
+            payment_status: session.payment_status,
           });
-        } else if (!supabaseAdmin) {
-          console.error('[stripe-webhook] SUPABASE_SERVICE_ROLE_KEY missing — cannot credit wallet');
         } else {
-          const { error: creditErr } = await supabaseAdmin.rpc('credit_wallet_coins', {
-            p_user_id: userId,
-            p_amount: coins,
-          });
-          if (creditErr) {
-            console.error('[stripe-webhook] credit_wallet_coins failed', creditErr);
+          const parsed = parseCheckoutCreditMetadata(session.metadata ?? undefined);
+          if (!parsed) {
+            console.error('[stripe-webhook] invalid or unsafe metadata — NOT crediting', {
+              session_id: session.id,
+              metadata: session.metadata,
+            });
+          } else if (session.client_reference_id && session.client_reference_id !== parsed.userId) {
+            console.error('[stripe-webhook] client_reference_id mismatch metadata.user_id — NOT crediting', {
+              session_id: session.id,
+              client_reference_id: session.client_reference_id,
+              metadata_user_id: parsed.userId,
+            });
+          } else if (!supabaseAdmin) {
+            console.error('[stripe-webhook] SUPABASE_SERVICE_ROLE_KEY missing — cannot credit wallet');
+          } else {
+            const { userId, coins } = parsed;
+            console.log('[stripe-webhook] crediting single user', { session_id: session.id, userId, coins });
+            const { error: creditErr } = await supabaseAdmin.rpc('credit_wallet_coins', {
+              p_user_id: userId,
+              p_amount: coins,
+              p_stripe_session_id: session.id,
+            });
+            if (creditErr) {
+              console.error('[stripe-webhook] credit_wallet_coins failed', creditErr);
+            } else {
+              console.log('[stripe-webhook] credit_wallet_coins success', { userId, coins, session_id: session.id });
+              void rpcIncrementProfileActivityPoints(
+                supabaseAdmin,
+                userId,
+                Math.floor(Number(coins)) || 0,
+                "stripe-webhook"
+              );
+            }
           }
         }
       }
@@ -1104,8 +1184,10 @@ async function startServer() {
       const base = baseRaw.replace(/\/$/, '') || 'http://localhost:5173';
 
       try {
+        console.log('[create-checkout-session] Stripe metadata', { user_id: userId, coins: pkgKey });
         const session = await stripeClient.checkout.sessions.create({
           mode: 'payment',
+          client_reference_id: userId,
           line_items: [
             {
               price_data: {
@@ -1123,7 +1205,7 @@ async function startServer() {
             coins: String(pkgKey),
           },
         });
-        console.log('Stripe session created:', session.id);
+        console.log('Stripe session created:', session.id, { client_reference_id: userId });
         if (!session.url) {
           return res.status(500).json({ error: 'No checkout URL from Stripe' });
         }
@@ -1464,6 +1546,23 @@ async function startServer() {
       };
     } catch (countErr) {
       logToFile(`SERVER: /api/user/${req.params.id} follows-count fallback error: ${countErr}`);
+    }
+
+    // profiles.coins is updated by Stripe webhook (credit_wallet_coins); prefer it over SQLite cache.
+    if (supabase && user && (user as { id?: string }).id) {
+      try {
+        const { data: coinRow } = await supabase
+          .from('profiles')
+          .select('coins')
+          .eq('id', req.params.id)
+          .maybeSingle();
+        const c = (coinRow as { coins?: unknown } | null)?.coins;
+        if (coinRow != null && typeof c === 'number' && Number.isFinite(c)) {
+          user = { ...(user as Record<string, unknown>), coins: c } as typeof user;
+        }
+      } catch (coinErr) {
+        logToFile(`SERVER: /api/user/${req.params.id} coins merge skipped: ${coinErr}`);
+      }
     }
 
     res.json(user);
@@ -2379,6 +2478,16 @@ async function startServer() {
     return user?.id ? String(user.id) : null;
   }
 
+  /** Rewards dashboard: increment profiles.gift_points + profiles.points (same delta). Non-fatal on failure. */
+  async function incrementProfileActivityPoints(
+    userId: string,
+    delta: number,
+    context = "monetization"
+  ): Promise<void> {
+    if (!supabaseAdmin) return;
+    await rpcIncrementProfileActivityPoints(supabaseAdmin, userId, delta, context);
+  }
+
   /** 1 coin = $0.01; prices in coins; max boost-tracked creator earnings in USD cents. */
   const MONETIZATION_TIER_DEF = {
     basic: { priceCoins: 200, maxBoostEarningsCents: 760 },
@@ -2511,6 +2620,7 @@ async function startServer() {
         await supabaseAdmin.from("profiles").update({ coins: cur }).eq("id", userId);
         return res.status(500).json({ ok: false, error: upsertErr.message || "Failed to save boost" });
       }
+      await incrementProfileActivityPoints(userId, def.priceCoins, "monetization-boost");
       const { error: boostInsErr } = await supabaseAdmin.from("post_boosts").insert({
         post_id: postId,
         user_id: userId,
@@ -2621,6 +2731,16 @@ async function startServer() {
         console.error("[monetization] gift credit creator", JSON.stringify(addCreatorErr));
         return res.status(500).json({ ok: false, error: addCreatorErr.message });
       }
+      console.log("[monetization] gift increment_profile_activity_points (creator)", {
+        creatorId,
+        coins,
+      });
+      await incrementProfileActivityPoints(creatorId, coins, "gift-creator");
+      console.log("[monetization] gift increment_profile_activity_points (sender)", {
+        senderId,
+        pointsToSender,
+      });
+      await incrementProfileActivityPoints(senderId, pointsToSender, "gift-sender");
       const { data: poolRow } = await supabaseAdmin
         .from("influencer_pool_balance")
         .select("balance_coins")
@@ -2630,16 +2750,6 @@ async function startServer() {
       await supabaseAdmin
         .from("influencer_pool_balance")
         .upsert({ id: "default", balance_coins: poolBal + poolCoins }, { onConflict: "id" });
-      const { data: sendProf } = await supabaseAdmin
-        .from("profiles")
-        .select("gift_points")
-        .eq("id", senderId)
-        .maybeSingle();
-      const prevPts = Number((sendProf as { gift_points?: number })?.gift_points) || 0;
-      await supabaseAdmin
-        .from("profiles")
-        .update({ gift_points: prevPts + pointsToSender })
-        .eq("id", senderId);
       await supabaseAdmin.from("post_monetization").update({
         boost_earnings_cents: boostEarned + toBoost,
         organic_earnings_cents: (Number(monRow.organic_earnings_cents) || 0) + toOrganic,
@@ -4106,9 +4216,24 @@ async function startServer() {
 
       if (!buyer) return res.status(404).json({ error: 'Buyer not found' });
 
-      // Check coins (assuming coins are in profiles or users)
-      const buyerCoins = buyer.coins || 0;
-      if (buyerCoins < product.price) {
+      const price = Number(product.price);
+      let balance = 0;
+      const walletClient = supabaseAdmin || supabase;
+      if (walletClient) {
+        const { data: walletRow } = await walletClient
+          .from('user_wallets')
+          .select('balance')
+          .eq('user_id', buyerId)
+          .maybeSingle();
+        balance = Number(walletRow?.balance ?? 0);
+      } else {
+        balance = Number((buyer as { coins?: unknown }).coins ?? 0);
+      }
+      console.log('[marketplace/buy] balance:', balance, 'price:', price, 'buyerId:', buyerId);
+      if (!Number.isFinite(price) || price < 0) {
+        return res.status(400).json({ error: 'Invalid product price' });
+      }
+      if (!Number.isFinite(balance) || balance < price) {
         return res.status(400).json({ error: 'Insufficient coins' });
       }
 
@@ -4170,6 +4295,196 @@ async function startServer() {
     } catch (err) {
       logToFile(`SERVER: Buy error: ${err}`);
       res.status(500).json({ error: 'Failed to process purchase' });
+    }
+  });
+
+  /** Marketplace listing boost: deduct from user_wallets.balance (same source of truth as /api/marketplace/buy check). */
+  const MARKETPLACE_BOOST_COST: Record<number, number> = {
+    3: 10,
+    7: 20,
+    30: 50,
+  };
+
+  app.post("/api/marketplace/boost", async (req, res) => {
+    try {
+      const userIdRaw = String(req.body?.userId || "").trim();
+      const productId = String(req.body?.productId || "").trim();
+      const days = Number(req.body?.days);
+      const userId = userIdRaw.toLowerCase();
+
+      if (!userIdRaw || !productId || !Number.isFinite(days)) {
+        return res.status(400).json({
+          error: "Missing or invalid body: need string userId, string productId, and numeric days",
+        });
+      }
+
+      const boostCostRaw = MARKETPLACE_BOOST_COST[days];
+      if (boostCostRaw === undefined) {
+        return res.status(400).json({ error: `Invalid boost duration: ${days} (allowed: 3, 7, 30)` });
+      }
+
+      const cost = Number(boostCostRaw);
+      if (!Number.isFinite(cost) || cost <= 0) {
+        return res.status(400).json({ error: "Invalid boost cost" });
+      }
+
+      console.log("[marketplace/boost] POST", { productId, userId, days, cost });
+
+      if (!supabaseAdmin) {
+        return res.status(503).json({
+          error: "Marketplace boost unavailable: SUPABASE_SERVICE_ROLE_KEY is not configured on the API server",
+        });
+      }
+      const walletClient = supabaseAdmin;
+
+      const { data: product, error: prodErr } = await walletClient
+        .from("marketplace")
+        .select("id, user_id")
+        .eq("id", productId)
+        .maybeSingle();
+
+      if (prodErr) {
+        console.error("[marketplace/boost] marketplace select error", prodErr);
+        return res.status(500).json({
+          error: "Could not load listing from database",
+          detail: prodErr.message || String(prodErr),
+        });
+      }
+      if (!product) {
+        return res.status(404).json({
+          error: "Product not found — no marketplace row for this productId",
+          detail: { productId },
+        });
+      }
+
+      const sellerId = String((product as { user_id?: string }).user_id || "").trim();
+      const sellerIdNorm = sellerId.toLowerCase();
+      if (!sellerId || sellerIdNorm !== userId) {
+        console.warn("[marketplace/boost] owner mismatch", {
+          productId,
+          listingOwnerId: sellerId,
+          requestUserId: userIdRaw,
+        });
+        return res.status(403).json({
+          error: "Only the listing owner can boost",
+          detail: {
+            listingOwnerId: sellerId || null,
+            requestUserId: userIdRaw,
+            hint: "Ensure you are logged in as the seller and productId matches this listing",
+          },
+        });
+      }
+
+      const { data: walletRow } = await walletClient
+        .from("user_wallets")
+        .select("balance")
+        .eq("user_id", userId)
+        .maybeSingle();
+
+      const balance = Number(walletRow?.balance ?? 0);
+      console.log(
+        "[marketplace/boost] balance:",
+        balance,
+        "cost:",
+        cost,
+        "userId:",
+        userId,
+        "productId:",
+        productId
+      );
+
+      if (!Number.isFinite(balance)) {
+        return res.status(400).json({ error: "Invalid wallet balance (could not read user_wallets.balance)" });
+      }
+      if (balance < cost) {
+        return res.status(400).json({
+          error: "Not enough coins",
+          detail: { balance, cost, userId },
+        });
+      }
+
+      const { data: deductJson, error: rpcErr } = await walletClient.rpc("deduct_user_wallet_by_id", {
+        p_user_id: userId,
+        p_cost: Math.floor(cost),
+      });
+
+      if (rpcErr) {
+        const msg = String(rpcErr.message || rpcErr);
+        const rpcCode = String((rpcErr as { code?: string }).code || "");
+        console.error("[marketplace/boost] deduct_user_wallet_by_id RPC failed", rpcErr);
+        const missingFn =
+          rpcCode === "PGRST202" ||
+          (/Could not find the function/i.test(msg) && /deduct_user_wallet_by_id/i.test(msg)) ||
+          (/does not exist/i.test(msg) && /deduct_user_wallet_by_id/i.test(msg));
+        if (missingFn) {
+          return res.status(503).json({
+            error:
+              "Wallet RPC missing: apply migration 20260402120000_deduct_user_wallet_by_id.sql (creates public.deduct_user_wallet_by_id and grants EXECUTE to service_role)",
+            detail: msg,
+          });
+        }
+        return res.status(500).json({
+          error: "Wallet deduction failed (deduct_user_wallet_by_id)",
+          detail: msg,
+        });
+      }
+
+      const d = deductJson as { ok?: boolean; error?: string } | null;
+      if (!d?.ok) {
+        const why = d && typeof d.error === "string" ? d.error : "unknown";
+        return res.status(400).json({
+          error:
+            why === "insufficient"
+              ? "Not enough coins (wallet changed during request — try again)"
+              : `Wallet deduction refused: ${why}`,
+          detail: deductJson,
+        });
+      }
+
+      const until = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+      const { error: boostErr } = await walletClient
+        .from("marketplace")
+        .update({
+          is_featured: true,
+          featured_until: until,
+        })
+        .eq("id", productId);
+
+      if (boostErr) {
+        console.warn("[marketplace/boost] listing update failed, refunding", boostErr);
+        try {
+          await walletClient.rpc("credit_wallet_coins", {
+            p_user_id: userId,
+            p_amount: Math.floor(cost),
+          });
+        } catch (reErr) {
+          console.error("[marketplace/boost] refund credit_wallet_coins failed", reErr);
+        }
+        return res.status(500).json({
+          error: "Boost payment was taken but updating the listing failed; coins were refunded",
+          detail: boostErr.message || String(boostErr),
+        });
+      }
+
+      try {
+        await walletClient.from("wallet_events").insert({
+          user_id: userId,
+          event_type: "boost_success",
+          reason: "ok",
+          amount: Math.floor(cost),
+        });
+      } catch {
+        /* non-fatal */
+      }
+
+      await incrementProfileActivityPoints(userId, Math.floor(cost), "marketplace-boost");
+
+      console.log("[marketplace/boost] OK", { productId, userId, until });
+      return res.json({ success: true, until });
+    } catch (e: unknown) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      console.error("[marketplace/boost] unexpected", e);
+      return res.status(500).json({ error: "Boost failed (unexpected server error)", detail: errMsg });
     }
   });
 

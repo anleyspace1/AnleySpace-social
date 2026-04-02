@@ -140,7 +140,7 @@ function mockActivityForUser(userId: string) {
 
 function ensureReward(userId: string): RewardState {
   if (!mockDb.rewards[userId]) {
-    const pts = 6400;
+    const pts = 0;
     const act = mockActivityForUser(userId);
     const composite =
       act.activity_watch_pct * 0.4 +

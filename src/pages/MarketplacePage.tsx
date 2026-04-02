@@ -36,6 +36,7 @@ import { isDemoOrPlaceholderImageUrl, isPlaceholderUsername } from '../lib/realD
 import { fetchSavedMarketplaceProductIds, setSavedMarketplaceProduct } from '../lib/savedMarketplace';
 import { ResponsiveImage } from '../components/ResponsiveImage';
 import { validateNewListingFields } from '../lib/marketplaceListingValidation';
+import { fetchOrCreateWalletBalance } from '../lib/marketplaceCoins';
 
 /** After mapping: drop rows that cannot render as valid listings (never stored in `products` state). */
 function cleanMarketplaceProducts(products: Product[]): Product[] {
@@ -386,7 +387,28 @@ export default function MarketplacePage() {
       alert('Please log in to buy items');
       return;
     }
-    if (userCoins < product.price) {
+    let balance = Number(userCoins);
+    const price = Number(product.price);
+    if (isSupabaseConfigured) {
+      const fresh = await fetchOrCreateWalletBalance(user.id);
+      if (fresh !== null) {
+        balance = Number(fresh);
+        setUserCoins(fresh);
+      }
+    } else {
+      try {
+        const res = await fetch(apiUrl(`/api/user/${user.id}`));
+        const data = await res.json();
+        if (typeof data?.coins === 'number' && Number.isFinite(Number(data.coins))) {
+          balance = Number(data.coins);
+          setUserCoins(balance);
+        }
+      } catch {
+        /* keep balance */
+      }
+    }
+    console.log('balance:', balance, 'price:', price);
+    if (!Number.isFinite(balance) || !Number.isFinite(price) || balance < price) {
       setBuyStatus('error');
       return;
     }

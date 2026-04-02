@@ -5,6 +5,7 @@
 import Stripe from 'stripe';
 import { createClient } from '@supabase/supabase-js';
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { STRIPE_CHECKOUT_COIN_PACKAGES } from '../src/lib/stripeCheckoutMetadata';
 
 const STRIPE_COIN_PACKAGES: Record<number, { cents: number }> = {
   100: { cents: 500 },
@@ -103,7 +104,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
     }
 
     const pkg = STRIPE_COIN_PACKAGES[pkgKey];
-    if (!pkg || ![100, 250, 700].includes(pkgKey)) {
+    if (!pkg || !STRIPE_CHECKOUT_COIN_PACKAGES.includes(pkgKey as (typeof STRIPE_CHECKOUT_COIN_PACKAGES)[number])) {
       res.status(400).json({ error: 'Invalid coins package' });
       return;
     }
@@ -117,8 +118,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
     const base = baseRaw.replace(/\/$/, '') || 'http://localhost:5173';
 
     try {
+      console.log('[create-checkout-session:vercel] Stripe metadata', { user_id: userId, coins: pkgKey });
       const session = await stripe.checkout.sessions.create({
         mode: 'payment',
+        client_reference_id: userId,
         line_items: [
           {
             price_data: {
@@ -136,7 +139,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
           coins: String(pkgKey),
         },
       });
-      console.log('[create-checkout-session:vercel] Stripe session created:', session.id);
+      console.log('[create-checkout-session:vercel] Stripe session created:', session.id, {
+        client_reference_id: userId,
+      });
       if (!session.url) {
         res.status(500).json({ error: 'No checkout URL from Stripe' });
         return;

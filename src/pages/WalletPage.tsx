@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Wallet, 
@@ -20,6 +20,7 @@ import {
 import { MOCK_USER } from '../constants';
 import { cn } from '../lib/utils';
 import { Transaction } from '../types';
+import { useSearchParams } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { apiUrl } from '../lib/apiOrigin';
 import { BuyCoinsMenu } from '../components/BuyCoinsMenu';
@@ -126,7 +127,8 @@ function groupTransactionsByDay(
 }
 
 export default function WalletPage() {
-  const { user, profile } = useAuth();
+  const { user, profile, refreshProfile } = useAuth();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [balance, setBalance] = useState(MOCK_USER.coins);
   const [usdBalance, setUsdBalance] = useState(50.00);
   const [txList, setTxList] = useState<Array<{ tx: Transaction; sortKey: number }>>([]);
@@ -139,68 +141,89 @@ export default function WalletPage() {
   const [withdrawHistory, setWithdrawHistory] = useState<
     { id: string; coins: number; status: string; created_at: string }[]
   >([]);
-  useEffect(() => {
-    const fetchData = async () => {
-      if (!user) return;
-      try {
-        const [userRes, txRes] = await Promise.all([
-          fetch(apiUrl(`/api/user/${user.id}`)),
-          fetch(apiUrl(`/api/transactions/${user.id}`))
-        ]);
-        const userData = await userRes.json();
-        const txData = await txRes.json();
-        const rawRows = Array.isArray(txData) ? txData : [];
-        const { spent, purchased } = aggregateWalletTransactions(rawRows);
+  const fetchWalletData = useCallback(async () => {
+    if (!user) return;
+    try {
+      const [userRes, txRes] = await Promise.all([
+        fetch(apiUrl(`/api/user/${user.id}`)),
+        fetch(apiUrl(`/api/transactions/${user.id}`)),
+      ]);
+      const userData = await userRes.json();
+      const txData = await txRes.json();
+      const rawRows = Array.isArray(txData) ? txData : [];
+      const { spent, purchased } = aggregateWalletTransactions(rawRows);
 
-        if (typeof userData?.coins === 'number' && Number.isFinite(userData.coins)) {
-          setBalance(userData.coins);
-        } else if (profile?.coins != null) {
-          setBalance(Number(profile.coins));
-        }
-        setTxList(
-          rawRows.map((tx: { id?: string; type?: string; amount?: number; description?: string; timestamp?: string }) => {
-            const ts = tx.timestamp ? new Date(tx.timestamp).getTime() : Date.now();
-            const rawType = String(tx.type ?? '').toLowerCase();
-            let mappedType: Transaction['type'] = 'send';
-            if (rawType === 'game_win' || rawType === 'earn' || rawType === 'gift') {
-              mappedType = 'earn';
-            } else if (
-              rawType === 'deposit' ||
-              rawType === 'refund' ||
-              rawType === 'credit' ||
-              rawType === 'receive'
-            ) {
-              mappedType = 'receive';
-            } else if (rawType === 'withdraw') {
-              mappedType = 'withdraw';
-            } else if (rawType === 'exchange') {
-              mappedType = 'exchange';
-            } else if (rawType === 'spend') {
-              mappedType = 'spend';
-            }
-            const mapped: Transaction = {
-              id: String(tx.id ?? ''),
-              type: mappedType,
-              amount: Math.abs(Number(tx.amount) || 0),
-              description: String(tx.description ?? ''),
-              timestamp: tx.timestamp ? new Date(tx.timestamp).toLocaleString() : '',
-              status: 'completed',
-            };
-            return { tx: mapped, sortKey: ts };
-          })
-        );
-        setBreakdown((prev) => ({
-          ...prev,
-          purchasedCoins: purchased,
-          spentCoins: spent,
-        }));
-      } catch (err) {
-        console.error("Error fetching wallet data:", err);
+      if (typeof userData?.coins === 'number' && Number.isFinite(userData.coins)) {
+        setBalance(userData.coins);
+      } else if (profile?.coins != null) {
+        setBalance(Number(profile.coins));
       }
-    };
+      setTxList(
+        rawRows.map((tx: { id?: string; type?: string; amount?: number; description?: string; timestamp?: string }) => {
+          const ts = tx.timestamp ? new Date(tx.timestamp).getTime() : Date.now();
+          const rawType = String(tx.type ?? '').toLowerCase();
+          let mappedType: Transaction['type'] = 'send';
+          if (rawType === 'game_win' || rawType === 'earn' || rawType === 'gift') {
+            mappedType = 'earn';
+          } else if (
+            rawType === 'deposit' ||
+            rawType === 'refund' ||
+            rawType === 'credit' ||
+            rawType === 'receive'
+          ) {
+            mappedType = 'receive';
+          } else if (rawType === 'withdraw') {
+            mappedType = 'withdraw';
+          } else if (rawType === 'exchange') {
+            mappedType = 'exchange';
+          } else if (rawType === 'spend') {
+            mappedType = 'spend';
+          }
+          const mapped: Transaction = {
+            id: String(tx.id ?? ''),
+            type: mappedType,
+            amount: Math.abs(Number(tx.amount) || 0),
+            description: String(tx.description ?? ''),
+            timestamp: tx.timestamp ? new Date(tx.timestamp).toLocaleString() : '',
+            status: 'completed',
+          };
+          return { tx: mapped, sortKey: ts };
+        })
+      );
+      setBreakdown((prev) => ({
+        ...prev,
+        purchasedCoins: purchased,
+        spentCoins: spent,
+      }));
+    } catch (err) {
+      console.error('Error fetching wallet data:', err);
+    }
+  }, [user, profile?.coins]);
 
-    fetchData();
-  }, [user?.id, profile?.coins]);
+  useEffect(() => {
+    void fetchWalletData();
+  }, [fetchWalletData]);
+
+  useEffect(() => {
+    if (searchParams.get('purchase') !== 'success' || !user?.id) return;
+    let cancelled = false;
+    const t = window.setTimeout(async () => {
+      await refreshProfile();
+      if (!cancelled) void fetchWalletData();
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.delete('purchase');
+          return next;
+        },
+        { replace: true }
+      );
+    }, 1200);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(t);
+    };
+  }, [searchParams, user?.id, refreshProfile, fetchWalletData, setSearchParams]);
 
   useEffect(() => {
     const loadBreakdown = async () => {
