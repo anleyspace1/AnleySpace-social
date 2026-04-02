@@ -14,12 +14,18 @@ interface ShareModalProps {
   onClose: () => void;
   onAddStory: () => void;
   postUrl?: string;
+  /** Optional: called when user successfully copies link or uses native share (rewards / analytics). */
+  onShareRecorded?: () => void;
 }
 
-export default function ShareModal({ isOpen, onClose, onAddStory, postUrl }: ShareModalProps) {
+export default function ShareModal({ isOpen, onClose, onAddStory, postUrl, onShareRecorded }: ShareModalProps) {
   const handleCopyLink = () => {
     const url = postUrl || window.location.href;
     navigator.clipboard.writeText(url).then(() => {
+      if (import.meta.env.DEV) {
+        console.log('[ShareModal][userBehavior] share recorded (copy link)');
+      }
+      onShareRecorded?.();
       alert('Link copied to clipboard!');
       onClose();
     });
@@ -57,6 +63,11 @@ export default function ShareModal({ isOpen, onClose, onAddStory, postUrl }: Sha
           navigator.share({
             title: 'Check out this post!',
             url: postUrl || window.location.href
+          }).then(() => {
+            if (import.meta.env.DEV) {
+              console.log('[ShareModal][userBehavior] share recorded (native share)');
+            }
+            onShareRecorded?.();
           }).catch(console.error);
         } else {
           alert('Sharing to other apps...'); 

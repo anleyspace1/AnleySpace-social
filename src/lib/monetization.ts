@@ -81,6 +81,24 @@ export async function fetchMonetizationPost(postId: string): Promise<Monetizatio
   }
 }
 
+/** When Home post id ≠ reel row id, merge unlock signals so Tip/Gifts match Home. */
+export function mergeMonetizationPostStatus(
+  a: MonetizationPostStatus | null,
+  b: MonetizationPostStatus | null
+): MonetizationPostStatus | null {
+  if (!a && !b) return null;
+  if (!a) return b;
+  if (!b) return a;
+  const unlocked = !!(a.unlocked || b.unlocked);
+  return {
+    ...a,
+    ...b,
+    unlocked,
+    ok: !!(a.ok || b.ok),
+    monetizationLocked: unlocked ? false : !!(a.monetizationLocked || b.monetizationLocked),
+  };
+}
+
 export async function purchaseMonetizationBoost(postId: string, tier: BoostTierId): Promise<{ ok: boolean; error?: string }> {
   const headers = await getBearerAuthHeaders();
   if (!headers) return { ok: false, error: 'Not signed in' };

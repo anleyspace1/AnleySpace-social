@@ -48,7 +48,7 @@ export async function deductCoins(userId: string, amount: number): Promise<numbe
   return newCoins;
 }
 
-export type PlatformSpendTarget = 'boost' | 'ads';
+export type PlatformSpendTarget = 'boost' | 'ads' | 'monetization_boost';
 
 /** Deduct user coins, credit platform wallet, insert transactions row (type spend + target). Uses RPC. */
 export async function platformSpendCoins(

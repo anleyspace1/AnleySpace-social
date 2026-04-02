@@ -102,6 +102,8 @@ export type Post = {
   comments: number;
   shares: number;
   timestamp: string;
+  /** Boosted post flag when present on `posts` (see `normalizePostRowIsFeatured` / `isPostBoostedForTips`). */
+  is_featured?: boolean;
 };
 
 export type Transaction = {

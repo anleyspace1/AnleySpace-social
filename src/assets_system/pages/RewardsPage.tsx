@@ -16,15 +16,56 @@ import {
   getRewardsTierProgress,
   MIN_REWARD_ELIGIBILITY_POINTS,
   formatClaimAvailabilityNote,
+  compositeActivityPercent,
 } from '../../lib/rewardsDashboard';
 import { rewardTierForPoints } from '../../lib/monetization';
-import { subscribeMonetizationRefresh } from '../../lib/monetizationRealtime';
+import { emitMonetizationRefresh, subscribeMonetizationRefresh } from '../../lib/monetizationRealtime';
+import { supabase } from '../../lib/supabase';
+import { apiUrl } from '../../lib/apiOrigin';
+import { getBearerAuthHeaders } from '../../lib/supabaseAuthHeaders';
+
+/** When true, POST /api/rewards/claim (Supabase RPC) is used instead of legacy assets/SQLite claim. */
+const USE_SUPABASE_REWARDS_CLAIM = String(import.meta.env.VITE_USE_SUPABASE_REWARDS_CLAIM || '').toLowerCase() === 'true';
+
+type MonthlyActivity = {
+  watchCount: number;
+  likesCount: number;
+  commentsCount: number;
+  sharesCount: number;
+  watchPct: number;
+  likesPct: number;
+  commentsPct: number;
+  sharesPct: number;
+  compositePct: number;
+};
+
+const MONTHLY_ACTIVITY_TARGETS = {
+  watch: 1000,
+  likes: 250,
+  comments: 80,
+  shares: 60,
+} as const;
 
 export default function RewardsPage() {
   const { user, profile } = useAuth();
   const userId = user?.id || 'u1';
   const [reward, setReward] = useState<RewardState | null>(null);
   const [claiming, setClaiming] = useState(false);
+  const [profilePointsSnapshot, setProfilePointsSnapshot] = useState<{ points: number; giftPoints: number }>({
+    points: 0,
+    giftPoints: 0,
+  });
+  const [monthlyActivity, setMonthlyActivity] = useState<MonthlyActivity>({
+    watchCount: 0,
+    likesCount: 0,
+    commentsCount: 0,
+    sharesCount: 0,
+    watchPct: 0,
+    likesPct: 0,
+    commentsPct: 0,
+    sharesPct: 0,
+    compositePct: 0,
+  });
 
   const load = useCallback(
     () => assetsApi.getRewards(userId).then(setReward).catch(() => setReward(null)),
@@ -39,6 +80,119 @@ export default function RewardsPage() {
     return subscribeMonetizationRefresh(() => void load());
   }, [load]);
 
+  const loadProfilePoints = useCallback(async () => {
+    if (!user?.id) {
+      setProfilePointsSnapshot({ points: 0, giftPoints: 0 });
+      return;
+    }
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('points, gift_points')
+      .eq('id', user.id)
+      .maybeSingle();
+    if (error) {
+      const missingGiftPoints =
+        String((error as { code?: string }).code || '') === '42703' &&
+        /gift_points/i.test(String((error as { message?: string }).message || ''));
+      if (!missingGiftPoints) {
+        console.warn('[Rewards] profile points load failed', error);
+        return;
+      }
+      const { data: pointsOnly, error: pointsErr } = await supabase
+        .from('profiles')
+        .select('points')
+        .eq('id', user.id)
+        .maybeSingle();
+      if (pointsErr) {
+        console.warn('[Rewards] profile points fallback failed', pointsErr);
+        return;
+      }
+      setProfilePointsSnapshot({
+        points: Number((pointsOnly as { points?: number } | null)?.points ?? 0) || 0,
+        giftPoints: 0,
+      });
+      return;
+    }
+    setProfilePointsSnapshot({
+      points: Number((data as { points?: number } | null)?.points ?? 0) || 0,
+      giftPoints: Number((data as { gift_points?: number } | null)?.gift_points ?? 0) || 0,
+    });
+  }, [user?.id]);
+
+  useEffect(() => {
+    void loadProfilePoints();
+  }, [loadProfilePoints]);
+
+  useEffect(() => {
+    return subscribeMonetizationRefresh(() => void loadProfilePoints());
+  }, [loadProfilePoints]);
+
+  const loadMonthlyActivity = useCallback(async () => {
+    if (!user?.id) {
+      setMonthlyActivity({
+        watchCount: 0,
+        likesCount: 0,
+        commentsCount: 0,
+        sharesCount: 0,
+        watchPct: 0,
+        likesPct: 0,
+        commentsPct: 0,
+        sharesPct: 0,
+        compositePct: 0,
+      });
+      return;
+    }
+    const monthStart = new Date();
+    monthStart.setDate(1);
+    monthStart.setHours(0, 0, 0, 0);
+    const { data, error } = await supabase
+      .from('user_behavior')
+      .select('action_type')
+      .eq('user_id', user.id)
+      .gte('created_at', monthStart.toISOString());
+    if (error) {
+      console.warn('[Rewards] monthly activity load failed', error);
+      return;
+    }
+    const rows = (data || []) as Array<{ action_type?: string | null }>;
+    if (import.meta.env.DEV) {
+      console.log('[Rewards][dev] user_behavior rows this month', { count: rows.length });
+    }
+    const watchCount = rows.filter((x) => x.action_type === 'view').length;
+    const likesCount = rows.filter((x) => x.action_type === 'like').length;
+    const commentsCount = rows.filter((x) => x.action_type === 'comment').length;
+    const sharesCount = rows.filter((x) => x.action_type === 'share').length;
+    const watchPct = Math.min(100, (watchCount / MONTHLY_ACTIVITY_TARGETS.watch) * 100);
+    const likesPct = Math.min(100, (likesCount / MONTHLY_ACTIVITY_TARGETS.likes) * 100);
+    const commentsPct = Math.min(100, (commentsCount / MONTHLY_ACTIVITY_TARGETS.comments) * 100);
+    const sharesPct = Math.min(100, (sharesCount / MONTHLY_ACTIVITY_TARGETS.shares) * 100);
+    const compositePct = compositeActivityPercent({
+      watch_pct: watchPct,
+      likes_pct: likesPct,
+      comments_pct: commentsPct,
+      shares_pct: sharesPct,
+    });
+    setMonthlyActivity({
+      watchCount,
+      likesCount,
+      commentsCount,
+      sharesCount,
+      watchPct,
+      likesPct,
+      commentsPct,
+      sharesPct,
+      compositePct,
+    });
+  }, [user?.id]);
+
+  useEffect(() => {
+    void loadMonthlyActivity();
+  }, [loadMonthlyActivity]);
+
+  useEffect(() => {
+    return subscribeMonetizationRefresh(() => void loadMonthlyActivity());
+  }, [loadMonthlyActivity]);
+
   /**
    * Headline points: Supabase monetization only (gift_points + points).
    * Do not merge assets mock/reward.points — that layer used a 6400 demo default and is unrelated to gifts/boosts.
@@ -46,21 +200,29 @@ export default function RewardsPage() {
   const points = useMemo(() => {
     const gp = Number(profile?.gift_points ?? 0);
     const pp = Number(profile?.points ?? 0);
-    const v = Math.max(Number.isFinite(gp) ? gp : 0, Number.isFinite(pp) ? pp : 0);
+    const sp = Number(profilePointsSnapshot.points ?? 0);
+    const sgp = Number(profilePointsSnapshot.giftPoints ?? 0);
+    const v = Math.max(
+      Number.isFinite(gp) ? gp : 0,
+      Number.isFinite(pp) ? pp : 0,
+      Number.isFinite(sp) ? sp : 0,
+      Number.isFinite(sgp) ? sgp : 0
+    );
     return Math.max(0, v);
-  }, [profile?.gift_points, profile?.points]);
+  }, [profile?.gift_points, profile?.points, profilePointsSnapshot.giftPoints, profilePointsSnapshot.points]);
   /** Source of truth: points ≥ 10k (aligned with server rules). */
   const isEligible = points >= MIN_REWARD_ELIGIBILITY_POINTS;
 
   const tierProgress = useMemo(() => getRewardsTierProgress(points), [points]);
 
-  /** 10,000 points = 100% activity (same scale as eligibility). */
-  const activityPct = useMemo(
-    () => Math.min(100, Math.max(0, (points / MIN_REWARD_ELIGIBILITY_POINTS) * 100)),
-    [points]
-  );
+  const activityPct = useMemo(() => monthlyActivity.compositePct, [monthlyActivity.compositePct]);
 
-  const hasActivity = points > 0;
+  const hasActivity =
+    monthlyActivity.watchCount +
+      monthlyActivity.likesCount +
+      monthlyActivity.commentsCount +
+      monthlyActivity.sharesCount >
+    0;
 
   /** 100 coins at max points (10k); linear: 1 coin per 100 points. */
   const rewardCoins = useMemo(() => Math.floor(points / 100), [points]);
@@ -72,8 +234,22 @@ export default function RewardsPage() {
     if (claiming || !isEligible) return;
     try {
       setClaiming(true);
-      await assetsApi.claimRewards(userId);
+      if (USE_SUPABASE_REWARDS_CLAIM) {
+        const headers = await getBearerAuthHeaders();
+        if (!headers) throw new Error('Sign in required');
+        const res = await fetch(apiUrl('/api/rewards/claim'), {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ activity_percent: activityPct }),
+        });
+        const j = (await res.json()) as { ok?: boolean; error?: string };
+        if (!res.ok || !j.ok) throw new Error(j?.error || 'Claim failed');
+        emitMonetizationRefresh();
+      } else {
+        await assetsApi.claimRewards(userId);
+      }
       await load();
+      await loadProfilePoints();
     } catch (e) {
       console.error('[Rewards] claim failed', e);
       const msg = e instanceof Error ? e.message : 'Could not claim reward. Try again.';
@@ -266,19 +442,33 @@ export default function RewardsPage() {
                   <p className="text-white font-black text-sm mb-2">This month&apos;s activity</p>
                   {!hasActivity ? (
                     <p className="text-[13px] text-white/50 leading-relaxed">
-                      No activity yet. Earn points from gifts and boosts — your ring fills as you reach 10,000 points
-                      (100%).
+                      No activity yet. Start watching, liking, commenting, and sharing — each action increases points
+                      and fills your activity ring.
                     </p>
                   ) : (
                     <>
                       <ActivityRow
                         icon={<Sparkles size={14} />}
-                        label="Points progress"
-                        value={activityPct}
+                        label={`Watch time (${monthlyActivity.watchCount})`}
+                        value={monthlyActivity.watchPct}
+                      />
+                      <ActivityRow
+                        icon={<Sparkles size={14} />}
+                        label={`Likes (${monthlyActivity.likesCount})`}
+                        value={monthlyActivity.likesPct}
+                      />
+                      <ActivityRow
+                        icon={<Sparkles size={14} />}
+                        label={`Comments (${monthlyActivity.commentsCount})`}
+                        value={monthlyActivity.commentsPct}
+                      />
+                      <ActivityRow
+                        icon={<Sparkles size={14} />}
+                        label={`Shares (${monthlyActivity.sharesCount})`}
+                        value={monthlyActivity.sharesPct}
                       />
                       <p className="text-[12px] text-white/45 leading-relaxed">
-                        Activity matches your reward points: {Math.floor(points).toLocaleString()} /{' '}
-                        {MIN_REWARD_ELIGIBILITY_POINTS.toLocaleString()} toward full activity.
+                        Activity updates from this month&apos;s tracked actions and contributes to rewards in real time.
                       </p>
                       {activityPct >= 70 && (
                         <p className="text-[11px] font-bold text-emerald-400/90 pt-1">High engagement! 🔥</p>

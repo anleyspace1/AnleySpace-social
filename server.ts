@@ -105,10 +105,10 @@ async function rpcIncrementProfileActivityPoints(
   userId: string,
   delta: number,
   context: string
-): Promise<void> {
-  if (!admin || !userId) return;
+): Promise<number | null> {
+  if (!admin || !userId) return null;
   const d = Math.trunc(Number(delta));
-  if (!Number.isFinite(d) || d === 0) return;
+  if (!Number.isFinite(d) || d === 0) return null;
   const uid = String(userId).trim().toLowerCase();
   const { data, error } = await admin.rpc("increment_profile_activity_points", {
     p_user_id: uid,
@@ -121,19 +121,68 @@ async function rpcIncrementProfileActivityPoints(
     delta: d,
   });
   if (error) {
+    const errCode = String((error as { code?: string })?.code || "");
+    const errMsg = String((error as { message?: string })?.message || "");
+    const missingGiftPointsColumn =
+      errCode === "42703" && /gift_points/i.test(errMsg) && /does not exist/i.test(errMsg);
+    if (missingGiftPointsColumn) {
+      console.warn(
+        `[increment_profile_activity_points] fallback activated: profiles.gift_points missing; incrementing profiles.points only [${context}]`,
+        { userId: uid, delta: d }
+      );
+      const { data: row, error: rowErr } = await admin
+        .from("profiles")
+        .select("id, points")
+        .eq("id", uid)
+        .maybeSingle();
+      if (rowErr) {
+        console.warn("[increment_profile_activity_points] fallback profile read failed", {
+          userId: uid,
+          error: rowErr.message,
+        });
+        return null;
+      }
+      if (!row?.id) {
+        console.warn("[increment_profile_activity_points] fallback found no profile row", { userId: uid });
+        return 0;
+      }
+      const curPoints = Number((row as { points?: number }).points) || 0;
+      const nextPoints = curPoints + d;
+      const { data: upd, error: updErr } = await admin
+        .from("profiles")
+        .update({ points: nextPoints })
+        .eq("id", uid)
+        .select("id");
+      if (updErr) {
+        console.warn("[increment_profile_activity_points] fallback points update failed", {
+          userId: uid,
+          error: updErr.message,
+        });
+        return null;
+      }
+      const rows = Array.isArray(upd) ? upd.length : 0;
+      console.log(`[increment_profile_activity_points] fallback result [${context}]`, {
+        rows,
+        userId: uid,
+        delta: d,
+        pointsBefore: curPoints,
+        pointsAfter: nextPoints,
+      });
+      return rows;
+    }
     console.warn(`[increment_profile_activity_points] RPC error [${context}]`, uid, d, error);
-    return;
+    return null;
   }
   if (data === null || data === undefined) {
     console.warn(
       `[increment_profile_activity_points] RPC returned no data (void?). Apply migration 20260404120000_increment_profile_activity_points_rowcount.sql — otherwise 0-row UPDATEs are invisible. [${context}]`
     );
-    return;
+    return null;
   }
   const rows = Number(data);
   if (!Number.isFinite(rows)) {
     console.warn(`[increment_profile_activity_points] unexpected data type [${context}]`, { data, userId: uid });
-    return;
+    return null;
   }
   if (rows !== 1) {
     console.warn(
@@ -150,6 +199,63 @@ async function rpcIncrementProfileActivityPoints(
       countError: countErr?.message,
     });
   }
+  return rows;
+}
+
+function mapRewardContextToSource(context: string): string {
+  const c = String(context || "").toLowerCase();
+  if (c.includes("gift")) return "gift";
+  if (c.includes("activity-view")) return "view";
+  if (c.includes("activity-like")) return "like";
+  if (c.includes("activity-comment")) return "comment";
+  if (c.includes("activity-share")) return "share";
+  if (c.includes("activity-follow")) return "follow";
+  if (c.includes("monetization") || c.includes("boost")) return "boost";
+  return "other";
+}
+
+/** Append-only audit for profile point deltas (non-fatal if table missing). */
+async function insertUserPointsHistoryRow(
+  admin: any,
+  userId: string,
+  pointsDelta: number,
+  context: string
+): Promise<void> {
+  if (!admin || !userId) return;
+  const d = Math.trunc(Number(pointsDelta));
+  if (!Number.isFinite(d) || d === 0) return;
+  const uid = String(userId).trim().toLowerCase();
+  const source = mapRewardContextToSource(context);
+  try {
+    const { error } = await admin.from("user_points_history").insert({
+      user_id: uid,
+      source,
+      points: d,
+    });
+    if (error) {
+      console.warn("[user_points_history] insert skipped", { uid, source, err: error.message });
+    }
+  } catch (e: any) {
+    console.warn("[user_points_history] insert skipped", e?.message || e);
+  }
+}
+
+async function ensureProfileRowForUser(admin: any, userId: string): Promise<boolean> {
+  if (!admin || !userId) return false;
+  const uid = String(userId).trim().toLowerCase();
+  const { data: existing, error: readErr } = await admin.from("profiles").select("id").eq("id", uid).maybeSingle();
+  if (readErr) {
+    console.warn("[ensureProfileRowForUser] profile lookup failed", { userId: uid, error: readErr.message });
+    return false;
+  }
+  if (existing?.id) return true;
+  const { error: insertErr } = await admin.from("profiles").insert({ id: uid });
+  if (insertErr) {
+    console.warn("[ensureProfileRowForUser] profile insert failed", { userId: uid, error: insertErr.message });
+    return false;
+  }
+  console.warn("[ensureProfileRowForUser] created missing profile row", { userId: uid });
+  return true;
 }
 
 type GroupSyncResult = { ok: true } | { ok: false; error: string; code?: string };
@@ -1150,6 +1256,24 @@ async function startServer() {
   // JSON/urlencoded parsers — must be registered before any route that reads req.body (e.g. POST /api/story-replies).
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ limit: '10mb', extended: true }));
+
+  if (supabaseAdmin) {
+    void (async () => {
+      try {
+        const { error: gpErr } = await supabaseAdmin.from("profiles").select("gift_points").limit(1);
+        if (gpErr) {
+          console.warn("[startup] profiles.gift_points schema check failed", {
+            code: gpErr.code,
+            message: gpErr.message,
+          });
+        } else {
+          console.log("[startup] profiles.gift_points schema check OK");
+        }
+      } catch (e: any) {
+        console.warn("[startup] profiles schema check exception", e?.message || e);
+      }
+    })();
+  }
 
   app.post('/api/create-checkout-session', async (req, res) => {
     console.log('[create-checkout-session] hit', {
@@ -2483,10 +2607,142 @@ async function startServer() {
     userId: string,
     delta: number,
     context = "monetization"
-  ): Promise<void> {
-    if (!supabaseAdmin) return;
-    await rpcIncrementProfileActivityPoints(supabaseAdmin, userId, delta, context);
+  ): Promise<number | null> {
+    if (!supabaseAdmin) return null;
+    const first = await rpcIncrementProfileActivityPoints(supabaseAdmin, userId, delta, context);
+    if (first !== 0) {
+      if (first === 1) {
+        void insertUserPointsHistoryRow(supabaseAdmin, userId, delta, context);
+      }
+      return first;
+    }
+    console.warn("[incrementProfileActivityPoints] first increment returned 0, attempting profile repair", {
+      userId,
+      delta,
+      context,
+    });
+    const repaired = await ensureProfileRowForUser(supabaseAdmin, userId);
+    if (!repaired) return first;
+    const second = await rpcIncrementProfileActivityPoints(supabaseAdmin, userId, delta, `${context}:retry`);
+    if (second === 1) {
+      void insertUserPointsHistoryRow(supabaseAdmin, userId, delta, context);
+    }
+    return second;
   }
+
+  /**
+   * Authenticated reward activity event -> points increment.
+   * Keeps existing behavior tracking untouched and only links tracked activity to points.
+   */
+  app.post("/api/rewards/activity-event", async (req, res) => {
+    try {
+      const actorId = await getBearerUserId(req);
+      if (!actorId) return res.status(401).json({ ok: false, error: "Unauthorized" });
+
+      const userId = String(req.body?.userId || "").trim().toLowerCase();
+      const actionType = String(req.body?.actionType || "").trim().toLowerCase();
+      const targetId = String(req.body?.targetId || "").trim();
+
+      if (!userId || !actionType || !targetId) {
+        return res.status(400).json({ ok: false, error: "Missing userId, actionType, or targetId" });
+      }
+      if (userId !== actorId.toLowerCase()) {
+        return res.status(403).json({ ok: false, error: "Forbidden: user mismatch" });
+      }
+
+      const ACTIVITY_POINTS: Record<string, number> = {
+        view: 1,
+        like: 3,
+        comment: 5,
+        share: 4,
+        follow: 2,
+      };
+      const delta = Math.trunc(Number(ACTIVITY_POINTS[actionType] ?? 0));
+      if (!delta) return res.json({ ok: true, skipped: true, reason: "unsupported_action" });
+
+      const rowsUpdated = await incrementProfileActivityPoints(userId, delta, `activity-${actionType}`);
+      if (rowsUpdated !== 1) {
+        console.warn("[rewards/activity-event] increment failed", {
+          userId,
+          actionType,
+          targetId,
+          delta,
+          rowsUpdated,
+        });
+        return res.status(409).json({
+          ok: false,
+          error: "points_increment_failed",
+          detail: "Could not update profile activity points (rowsUpdated != 1)",
+          rowsUpdated: rowsUpdated ?? null,
+        });
+      }
+      console.log("[rewards/activity-event] points increment", {
+        userId,
+        actionType,
+        targetId,
+        delta,
+        rowsUpdated,
+      });
+      return res.json({ ok: true, delta, rowsUpdated });
+    } catch (e: any) {
+      console.error("[rewards/activity-event] failed", e);
+      return res.status(500).json({ ok: false, error: e?.message || "Failed to register activity event" });
+    }
+  });
+
+  /**
+   * Supabase monthly reward claim (RPC claim_monthly_reward). Requires migration 20260403120000.
+   * Set VITE_USE_SUPABASE_REWARDS_CLAIM on the client to use this instead of legacy assets claim.
+   */
+  app.post("/api/rewards/claim", async (req, res) => {
+    try {
+      const token =
+        typeof req.headers.authorization === "string" && req.headers.authorization.startsWith("Bearer ")
+          ? req.headers.authorization.slice(7).trim()
+          : "";
+      if (!token) return res.status(401).json({ ok: false, error: "Unauthorized" });
+      if (!supabaseUrl || !supabaseAnonKey) {
+        return res.status(503).json({ ok: false, error: "Supabase not configured" });
+      }
+      const userClient = createClient(supabaseUrl, supabaseAnonKey, {
+        global: { headers: { Authorization: `Bearer ${token}` } },
+      });
+      const activityPercent = Number(req.body?.activity_percent ?? req.body?.activityPercent ?? 0);
+      const monthRaw = req.body?.month;
+      const pMonth =
+        typeof monthRaw === "string" && monthRaw.trim() ? String(monthRaw).trim().slice(0, 10) : null;
+      const { data, error } = await userClient.rpc("claim_monthly_reward", {
+        p_activity_percent: Number.isFinite(activityPercent) ? activityPercent : 0,
+        p_month: pMonth,
+      });
+      if (error) {
+        console.error("[rewards/claim] RPC error", error);
+        return res.status(500).json({ ok: false, error: error.message || "Claim failed" });
+      }
+      const result = data as {
+        ok?: boolean;
+        error?: string;
+        reward_coins?: number;
+        claim_id?: string;
+        points_snapshot?: number;
+        month?: string;
+      } | null;
+      if (!result?.ok) {
+        const code = String(result?.error || "unknown");
+        const status =
+          code === "unauthorized"
+            ? 401
+            : code === "not_eligible" || code === "already_claimed" || code === "zero_reward"
+              ? 400
+              : 409;
+        return res.status(status).json({ ok: false, error: code });
+      }
+      return res.json(result);
+    } catch (e: any) {
+      console.error("[rewards/claim] failed", e);
+      return res.status(500).json({ ok: false, error: e?.message || "Failed" });
+    }
+  });
 
   /** 1 coin = $0.01; prices in coins; max boost-tracked creator earnings in USD cents. */
   const MONETIZATION_TIER_DEF = {
@@ -2554,6 +2810,8 @@ async function startServer() {
   });
 
   app.post("/api/monetization/boost", async (req, res) => {
+    /** DEV / non-production: trace boost → RPC → DB without changing behavior. */
+    const devMonetizationLog = process.env.NODE_ENV !== "production";
     try {
       const userId = await getBearerUserId(req);
       if (!userId) return res.status(401).json({ ok: false, error: "Unauthorized" });
@@ -2594,13 +2852,52 @@ async function startServer() {
         return res.status(400).json({ ok: false, error: `Need at least ${def.priceCoins} coins for ${tier} boost` });
       }
       const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-      const { error: deductErr } = await supabaseAdmin
-        .from("profiles")
-        .update({ coins: cur - def.priceCoins })
-        .eq("id", userId);
-      if (deductErr) {
-        console.error("[monetization] boost deduct", JSON.stringify(deductErr));
-        return res.status(500).json({ ok: false, error: deductErr.message || "Could not deduct coins" });
+      if (devMonetizationLog) {
+        console.log("[monetization][dev] POST /api/monetization/boost request", {
+          postId,
+          tier,
+          priceCoins: def.priceCoins,
+          userId,
+          coinsBefore: cur,
+        });
+      }
+      const { data: spendRpcData, error: spendRpcErr } = await supabaseAdmin.rpc("platform_spend_coins", {
+        p_user_id: userId,
+        p_amount: def.priceCoins,
+        p_target: "monetization_boost",
+      });
+      if (devMonetizationLog) {
+        console.log("[monetization][dev] platform_spend_coins RPC raw", {
+          rpcError: spendRpcErr ? String(spendRpcErr.message || spendRpcErr) : null,
+          rpcData: spendRpcData,
+        });
+      }
+      if (spendRpcErr) {
+        console.error("[monetization] boost platform_spend_coins", JSON.stringify(spendRpcErr));
+        return res.status(500).json({ ok: false, error: spendRpcErr.message || "Could not deduct coins" });
+      }
+      const spendResult = spendRpcData as { ok?: boolean; error?: string; new_balance?: number } | null;
+      if (devMonetizationLog) {
+        console.log("[monetization][dev] platform_spend_coins parsed", {
+          ok: spendResult?.ok === true,
+          error: spendResult?.error ?? null,
+          new_balance: spendResult?.new_balance,
+        });
+      }
+      if (!spendResult?.ok) {
+        const insuff = spendResult?.error === "insufficient_coins";
+        return res.status(insuff ? 400 : 500).json({
+          ok: false,
+          error: insuff
+            ? `Need at least ${def.priceCoins} coins for ${tier} boost`
+            : spendResult?.error || "Could not deduct coins",
+        });
+      }
+      if (devMonetizationLog) {
+        console.log("[monetization][dev] user coins after RPC (from RPC response)", {
+          expectedDeduction: def.priceCoins,
+          coinsAfter: spendResult.new_balance,
+        });
       }
       const { error: upsertErr } = await supabaseAdmin.from("post_monetization").upsert(
         {
@@ -2617,8 +2914,20 @@ async function startServer() {
       );
       if (upsertErr) {
         console.error("[monetization] boost upsert post_monetization", JSON.stringify(upsertErr));
+        if (devMonetizationLog) {
+          console.log("[monetization][dev] post_monetization upsert FAILED", { postId, message: upsertErr.message });
+        }
         await supabaseAdmin.from("profiles").update({ coins: cur }).eq("id", userId);
+        const { error: revErr } = await supabaseAdmin.rpc("revert_platform_spend", {
+          p_amount: def.priceCoins,
+        });
+        if (revErr) {
+          console.error("[monetization] boost revert_platform_spend after upsert failure", JSON.stringify(revErr));
+        }
         return res.status(500).json({ ok: false, error: upsertErr.message || "Failed to save boost" });
+      }
+      if (devMonetizationLog) {
+        console.log("[monetization][dev] post_monetization upsert OK", { postId, tier, expiresAt });
       }
       await incrementProfileActivityPoints(userId, def.priceCoins, "monetization-boost");
       const { error: boostInsErr } = await supabaseAdmin.from("post_boosts").insert({
@@ -2626,6 +2935,12 @@ async function startServer() {
         user_id: userId,
         boost_amount: def.priceCoins,
       });
+      if (devMonetizationLog) {
+        console.log("[monetization][dev] post_boosts insert result", {
+          ok: !boostInsErr,
+          error: boostInsErr ? String(boostInsErr.message || boostInsErr) : null,
+        });
+      }
       if (boostInsErr) {
         console.warn("[monetization] post_boosts insert (non-fatal)", JSON.stringify(boostInsErr));
       }
@@ -2702,6 +3017,9 @@ async function startServer() {
       const toBoost = Math.min(remaining, creatorShareCents);
       const toOrganic = Math.max(0, creatorShareCents - toBoost);
       const pointsToSender = Math.floor(coins * 0.5);
+      const giftType =
+        (typeof req.body?.giftType === "string" && req.body.giftType.trim()) ||
+        (coins >= 100 ? "Rocket" : coins >= 50 ? "Diamond" : coins >= 10 ? "Heart" : "Star");
       const delayDays = 7 + Math.floor(Math.random() * 4);
       const availableAt = new Date(Date.now() + delayDays * 24 * 60 * 60 * 1000).toISOString();
       const { error: deductErr } = await supabaseAdmin
@@ -2754,7 +3072,7 @@ async function startServer() {
         boost_earnings_cents: boostEarned + toBoost,
         organic_earnings_cents: (Number(monRow.organic_earnings_cents) || 0) + toOrganic,
       }).eq("post_id", postId);
-      const { error: giftInsErr } = await supabaseAdmin.from("gift_transactions").insert({
+      const giftInsertPayload = {
         post_id: postId,
         sender_id: senderId,
         creator_id: creatorId,
@@ -2763,13 +3081,33 @@ async function startServer() {
         platform_coins: platformCoins,
         pool_coins: poolCoins,
         points_to_sender: pointsToSender,
+        gift_type: giftType,
         boost_cents_applied: toBoost,
         organic_cents_applied: toOrganic,
         status: "completed",
         available_at: availableAt,
+      };
+      console.log("[monetization] gift_transactions insert payload", giftInsertPayload);
+      const { data: giftInsertData, error: giftInsErr } = await supabaseAdmin
+        .from("gift_transactions")
+        .insert(giftInsertPayload)
+        .select("id, sender_id, creator_id, coins, gift_type, created_at")
+        .maybeSingle();
+      // platform_coins → platform_wallet + transactions (earn / gift_platform_fee) is applied in the same DB transaction via trigger gift_transactions_platform_fee (see migration 20260402220000).
+      console.log("[monetization] gift_transactions insert result", {
+        data: giftInsertData ?? null,
+        error: giftInsErr ?? null,
       });
       if (giftInsErr) {
         console.error("[monetization] gift_transactions insert", JSON.stringify(giftInsErr));
+      } else if (!giftInsertData) {
+        console.warn("[monetization] gift_transactions insert returned no row", {
+          senderId,
+          creatorId,
+          postId,
+          coins,
+          giftType,
+        });
       }
       console.log("[monetization] gift OK", {
         postId,
@@ -2794,6 +3132,36 @@ async function startServer() {
     }
   });
 
+  /**
+   * Received gifts for the authenticated creator (service role — same rows as POST /gift inserts).
+   * Bypasses client RLS issues when the browser JWT role does not match policy expectations.
+   */
+  app.get("/api/monetization/gifts/received", async (req, res) => {
+    try {
+      const userId = await getBearerUserId(req);
+      if (!userId) return res.status(401).json({ ok: false, error: "Unauthorized" });
+      if (!supabaseAdmin) {
+        return res.status(503).json({ ok: false, error: "Server misconfigured (service role)" });
+      }
+      const { data, error } = await supabaseAdmin
+        .from("gift_transactions")
+        .select("id, post_id, sender_id, creator_id, coins, gift_type, created_at")
+        .eq("creator_id", userId)
+        .order("created_at", { ascending: false })
+        .limit(100);
+      if (error) {
+        console.error("[monetization] GET gifts/received", JSON.stringify(error));
+        return res.status(500).json({ ok: false, error: error.message || "Query failed" });
+      }
+      const rows = data || [];
+      console.log("[monetization] GET gifts/received", { userId, rowCount: rows.length });
+      return res.json({ ok: true, gifts: rows });
+    } catch (e: any) {
+      console.error("[monetization] GET /gifts/received", e);
+      return res.status(500).json({ ok: false, error: e?.message || "Failed" });
+    }
+  });
+
   async function getAdminAuth(req: Request): Promise<{ ok: true; userId: string; email: string } | { ok: false; error: string; status: number }> {
     const authHeader = req.headers.authorization;
     const token =
@@ -2809,6 +3177,222 @@ async function startServer() {
     if (!email || email !== adminEmail) return { ok: false, error: 'Forbidden', status: 403 };
     return { ok: true, userId: String(authUser.id), email };
   }
+
+  function adminNormalizeIsFeatured(row: { is_featured?: unknown; isFeatured?: unknown }): boolean {
+    const a = row.is_featured;
+    const b = row.isFeatured;
+    if (a === true || b === true) return true;
+    if (a === 'true' || b === 'true') return true;
+    if (a === 1 || b === 1) return true;
+    return false;
+  }
+
+  app.get("/api/admin/monetization/gifts", async (req, res) => {
+    try {
+      const adminCheck = await getAdminAuth(req);
+      if (!adminCheck.ok) return res.status(adminCheck.status).json({ error: adminCheck.error });
+      if (!supabaseAdmin) return res.status(503).json({ error: "SUPABASE_SERVICE_ROLE_KEY not configured on server" });
+
+      const { count: totalGifts, error: countErr } = await supabaseAdmin
+        .from("gift_transactions")
+        .select("*", { count: "exact", head: true });
+      if (countErr) return res.status(500).json({ ok: false, error: countErr.message || "Count failed" });
+
+      const { data: rows, error: rowsErr } = await supabaseAdmin
+        .from("gift_transactions")
+        .select("id, post_id, sender_id, creator_id, coins, creator_coins, gift_type, created_at");
+      if (rowsErr) return res.status(500).json({ ok: false, error: rowsErr.message || "Query failed" });
+
+      const list = rows || [];
+      let totalCoins = 0;
+      let totalCreatorCoins = 0;
+      const byCreator = new Map<string, number>();
+      for (const r of list) {
+        const c = Number(r.coins) || 0;
+        const cc = Number(r.creator_coins) || 0;
+        totalCoins += c;
+        totalCreatorCoins += cc;
+        const uid = String(r.creator_id || "");
+        if (!uid) continue;
+        byCreator.set(uid, (byCreator.get(uid) || 0) + cc);
+      }
+
+      let topReceivers = [...byCreator.entries()]
+        .map(([user_id, total_coins]) => ({ user_id, total_coins }))
+        .sort((a, b) => b.total_coins - a.total_coins)
+        .slice(0, 10);
+
+      const topIds = topReceivers.map((t) => t.user_id).filter(Boolean);
+      if (topIds.length > 0) {
+        const { data: profs } = await supabaseAdmin.from("profiles").select("id, username").in("id", topIds);
+        const uname = new Map((profs || []).map((p: { id: string; username: string | null }) => [p.id, p.username]));
+        topReceivers = topReceivers.map((t) => ({
+          ...t,
+          username: uname.get(t.user_id) ?? null,
+        }));
+      } else {
+        topReceivers = topReceivers.map((t) => ({ ...t, username: null as string | null }));
+      }
+
+      const { data: recent, error: recentErr } = await supabaseAdmin
+        .from("gift_transactions")
+        .select("id, post_id, sender_id, creator_id, coins, gift_type, created_at")
+        .order("created_at", { ascending: false })
+        .limit(50);
+      if (recentErr) return res.status(500).json({ ok: false, error: recentErr.message || "Recent query failed" });
+
+      return res.json({
+        ok: true,
+        totalGifts: totalGifts ?? list.length,
+        totalCoins,
+        totalCreatorCoins,
+        topReceivers,
+        recent: recent || [],
+      });
+    } catch (e: any) {
+      console.error("[admin] GET /api/admin/monetization/gifts", e);
+      return res.status(500).json({ ok: false, error: e?.message || "Failed" });
+    }
+  });
+
+  app.get("/api/admin/monetization/posts", async (req, res) => {
+    try {
+      const adminCheck = await getAdminAuth(req);
+      if (!adminCheck.ok) return res.status(adminCheck.status).json({ error: adminCheck.error });
+      if (!supabaseAdmin) return res.status(503).json({ error: "SUPABASE_SERVICE_ROLE_KEY not configured on server" });
+
+      const boostedOnly =
+        req.query.boostedOnly === "1" || String(req.query.boostedOnly || "").toLowerCase() === "true";
+
+      const { data: posts, error: pErr } = await supabaseAdmin
+        .from("posts")
+        .select("id, user_id, content, created_at, is_featured")
+        .order("created_at", { ascending: false })
+        .limit(200);
+      if (pErr) return res.status(500).json({ ok: false, error: pErr.message || "Posts query failed" });
+
+      const postList = posts || [];
+      const ids = postList.map((p: { id: string }) => p.id).filter(Boolean);
+      if (ids.length === 0) return res.json({ ok: true, posts: [] });
+
+      const { data: monRows, error: mErr } = await supabaseAdmin
+        .from("post_monetization")
+        .select("*")
+        .in("post_id", ids);
+      if (mErr) return res.status(500).json({ ok: false, error: mErr.message || "Monetization query failed" });
+
+      const monByPost = new Map<string, Record<string, unknown>>();
+      for (const m of monRows || []) {
+        const row = m as { post_id: string };
+        if (row.post_id) monByPost.set(String(row.post_id), m as Record<string, unknown>);
+      }
+
+      const { data: boostRows, error: bErr } = await supabaseAdmin
+        .from("post_boosts")
+        .select("post_id, user_id, boost_amount")
+        .in("post_id", ids);
+      if (bErr) return res.status(500).json({ ok: false, error: bErr.message || "post_boosts query failed" });
+
+      const legacyByPost = new Map<string, { count: number; totalAmount: number }>();
+      for (const b of boostRows || []) {
+        const pid = String((b as { post_id: string }).post_id);
+        if (!legacyByPost.has(pid)) legacyByPost.set(pid, { count: 0, totalAmount: 0 });
+        const agg = legacyByPost.get(pid)!;
+        agg.count += 1;
+        agg.totalAmount += Number((b as { boost_amount?: number }).boost_amount || 0);
+      }
+
+      const now = Date.now();
+      const merged = postList.map((p: { id: string; user_id: string; content: string | null; created_at: string; is_featured?: unknown }) => {
+        const mon = monByPost.get(String(p.id)) || null;
+        const exp = mon && typeof mon.expires_at === "string" ? new Date(mon.expires_at).getTime() : 0;
+        const monetizationActive = !!(mon && exp > now);
+        const featured = adminNormalizeIsFeatured(p);
+        const isBoostedOrMonetized = featured || monetizationActive;
+        const legacy = legacyByPost.get(String(p.id)) || { count: 0, totalAmount: 0 };
+        return {
+          id: p.id,
+          user_id: p.user_id,
+          content: p.content,
+          created_at: p.created_at,
+          is_featured: featured,
+          post_monetization: mon,
+          monetizationActive,
+          isBoostedOrMonetized,
+          legacyAdminBoosts: legacy,
+        };
+      });
+
+      let out = merged;
+      if (boostedOnly) out = merged.filter((x) => x.isBoostedOrMonetized);
+      return res.json({ ok: true, posts: out });
+    } catch (e: any) {
+      console.error("[admin] GET /api/admin/monetization/posts", e);
+      return res.status(500).json({ ok: false, error: e?.message || "Failed" });
+    }
+  });
+
+  app.get("/api/admin/rewards/overview", async (req, res) => {
+    try {
+      const adminCheck = await getAdminAuth(req);
+      if (!adminCheck.ok) return res.status(adminCheck.status).json({ error: adminCheck.error });
+      if (!supabaseAdmin) return res.status(503).json({ error: "SUPABASE_SERVICE_ROLE_KEY not configured on server" });
+
+      const { count: totalClaims, error: countErr } = await supabaseAdmin
+        .from("rewards_claims")
+        .select("*", { count: "exact", head: true });
+      if (countErr) return res.status(500).json({ error: countErr.message || "Count failed" });
+
+      const { data: claimRows, error: sumErr } = await supabaseAdmin.from("rewards_claims").select("reward_coins");
+      if (sumErr) return res.status(500).json({ error: sumErr.message || "Summary query failed" });
+      const totalCoinsDistributed = (claimRows || []).reduce(
+        (s, r) => s + Number((r as { reward_coins?: number }).reward_coins || 0),
+        0
+      );
+
+      const { data: recentClaims, error: recentErr } = await supabaseAdmin
+        .from("rewards_claims")
+        .select("id, user_id, points_snapshot, reward_coins, activity_percent, month, created_at")
+        .order("created_at", { ascending: false })
+        .limit(100);
+      if (recentErr) return res.status(500).json({ error: recentErr.message || "Claims query failed" });
+
+      const { data: profs, error: profErr } = await supabaseAdmin
+        .from("profiles")
+        .select("id, username, points, gift_points")
+        .limit(500);
+      if (profErr) return res.status(500).json({ error: profErr.message || "Profiles query failed" });
+
+      const topUsersByPoints = (profs || [])
+        .map((p: { id: string; username?: string | null; points?: number | null; gift_points?: number | null }) => {
+          const pts = Number(p.points || 0);
+          const gp = Number(p.gift_points || 0);
+          const effective_points = Math.max(pts, gp);
+          return {
+            user_id: p.id,
+            username: p.username ?? null,
+            points: pts,
+            gift_points: gp,
+            effective_points,
+          };
+        })
+        .sort((a, b) => b.effective_points - a.effective_points)
+        .slice(0, 20);
+
+      return res.json({
+        ok: true,
+        summary: {
+          totalClaims: totalClaims ?? 0,
+          totalCoinsDistributed,
+        },
+        recentClaims: recentClaims || [],
+        topUsersByPoints,
+      });
+    } catch (e: any) {
+      console.error("[admin] GET /api/admin/rewards/overview", e);
+      return res.status(500).json({ error: e?.message || "Failed" });
+    }
+  });
 
   app.get("/api/admin/withdraw-requests", async (req, res) => {
     try {
@@ -2992,22 +3576,29 @@ async function startServer() {
     const { id } = req.params;
     const { senderId, receiverId, coins } = req.body;
     try {
+      const giftCoins = Math.max(0, Math.trunc(Number(coins) || 0));
+      if (!giftCoins || !senderId || !receiverId) {
+        return res.status(400).json({ error: 'Invalid sender/receiver/coins' });
+      }
       // 1. Record gift
       await supabase.from('live_gifts').insert({
         live_id: id,
         sender_id: senderId,
         receiver_id: receiverId,
-        coins
+        coins: giftCoins
       });
 
       // 2. Update balances in local DB (and ideally Supabase)
-      db.prepare('UPDATE users SET coins = coins - ? WHERE id = ?').run(coins, senderId);
-      db.prepare('UPDATE users SET coins = coins + ? WHERE id = ?').run(coins, receiverId);
+      db.prepare('UPDATE users SET coins = coins - ? WHERE id = ?').run(giftCoins, senderId);
+      db.prepare('UPDATE users SET coins = coins + ? WHERE id = ?').run(giftCoins, receiverId);
+      const senderPoints = Math.floor(giftCoins * 0.5);
+      await incrementProfileActivityPoints(String(receiverId), giftCoins, "live-gift-receiver");
+      await incrementProfileActivityPoints(String(senderId), senderPoints, "live-gift-sender");
 
       try {
         if (receiverId && senderId && String(receiverId) !== String(senderId)) {
           const senderName = await fetchUsernameForUserId(String(senderId));
-          const c = Number(coins) || 0;
+          const c = giftCoins;
           insertNotificationWithRealtime({
             receiverId: String(receiverId),
             actorId: String(senderId),
@@ -4920,6 +5511,7 @@ async function startServer() {
         db.prepare('DELETE FROM reel_likes WHERE reel_id = ? AND user_id = ?').run(reelId, userId);
       } else {
         db.prepare('INSERT INTO reel_likes (reel_id, user_id) VALUES (?, ?)').run(reelId, userId);
+        await incrementProfileActivityPoints(String(userId), 3, "reel-like");
         if (reelOwner?.user_id && reelOwner.user_id !== userId) {
           await ensureLocalUserFromSupabaseProfile(userId);
           await ensureLocalUserFromSupabaseProfile(reelOwner.user_id);
@@ -4958,7 +5550,10 @@ async function startServer() {
         if (!userExists) {
           return res.status(404).json({ error: 'User not found' });
         }
-        db.prepare('INSERT OR IGNORE INTO reel_views (reel_id, user_id) VALUES (?, ?)').run(reelId, userId);
+        const viewInsert = db.prepare('INSERT OR IGNORE INTO reel_views (reel_id, user_id) VALUES (?, ?)').run(reelId, userId) as { changes?: number };
+        if (Number(viewInsert?.changes || 0) > 0) {
+          void incrementProfileActivityPoints(String(userId), 1, "reel-view");
+        }
       }
       const row = db.prepare('SELECT COUNT(*) as count FROM reel_views WHERE reel_id = ?').get(reelId) as any;
       res.json({ success: true, views: row?.count || 0 });
@@ -5046,6 +5641,7 @@ async function startServer() {
 
       db.prepare('INSERT INTO reel_comments (id, reel_id, user_id, text) VALUES (?, ?, ?, ?)')
         .run(id, reelId, userId, content.trim());
+      await incrementProfileActivityPoints(String(userId), 5, "reel-comment");
 
       const reelOwnerRow = db.prepare('SELECT user_id FROM reels WHERE id = ?').get(reelId) as { user_id: string } | undefined;
       if (reelOwnerRow?.user_id && reelOwnerRow.user_id !== userId) {

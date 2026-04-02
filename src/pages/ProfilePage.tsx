@@ -22,7 +22,8 @@ import {
   Heart,
   Send,
   MoreHorizontal,
-  Maximize2
+  Maximize2,
+  Sparkles
 } from 'lucide-react';
 import { NavLink, useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import { MOCK_USER } from '../constants';
@@ -41,6 +42,11 @@ import { fetchCommentsWithProfiles, type CommentForDisplay } from '../lib/postCo
 import { persistFollowEdge } from '../lib/followsClient';
 import { notifyLikeCommentFollowDm } from '../lib/supabaseNotifications';
 import { rewardInviter } from '../lib/referralRewards';
+import { fetchMonetizationPost, sendMonetizationGift, type MonetizationPostStatus } from '../lib/monetization';
+import { isPostBoostedForTips } from '../lib/monetizationFeaturedUi';
+import { subscribePostMonetization } from '../lib/monetizationRealtime';
+import { MonetizationTipPicker } from '../components/MonetizationTipPicker';
+import { TipSuccessOverlay, type TipSuccessFlash } from '../components/TipSuccessOverlay';
 
 function feedApiResponseIsJson(res: Response): boolean {
   const ct = res.headers.get('content-type') || '';
@@ -224,7 +230,8 @@ export default function ProfilePage() {
         likes: Number(p.likes_count) || 0,
         comments: Number(p.comments_count) || 0,
         shares: Number(p.shares_count) || 0,
-        timestamp: p.created_at ? new Date(p.created_at).toLocaleDateString() : ''
+        timestamp: p.created_at ? new Date(p.created_at).toLocaleDateString() : '',
+        is_featured: p.is_featured === true,
       }));
       setUserPosts(formattedPosts);
     } catch (err) {
@@ -1376,9 +1383,14 @@ function Tab({ icon, label, active, onClick }: { icon: React.ReactNode; label: s
 }
 
 function PostDetailModal({ post, onClose }: { post: Post; onClose: () => void }) {
+  const navigate = useNavigate();
   const { user, profile } = useAuth();
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
   const [isStoryEditorOpen, setIsStoryEditorOpen] = useState(false);
+  const [tipPickerOpen, setTipPickerOpen] = useState(false);
+  const [tipFlash, setTipFlash] = useState<TipSuccessFlash | null>(null);
+  const [monetizationPost, setMonetizationPost] = useState<MonetizationPostStatus | null>(null);
+  const [monetizationReady, setMonetizationReady] = useState(false);
   const [comments, setComments] = useState<CommentForDisplay[]>([]);
   const [loadingComments, setLoadingComments] = useState(true);
   const [newComment, setNewComment] = useState('');
@@ -1391,6 +1403,47 @@ function PostDetailModal({ post, onClose }: { post: Post; onClose: () => void })
     (post.videoUrl && isValidVideoUrl(String(post.videoUrl)) ? String(post.videoUrl) : '') ||
     'https://picsum.photos/seed/post/800/800';
   const likes = Number(post.likes ?? 0);
+  const ownerId = String((post.user as { id?: string } | undefined)?.id ?? (post as unknown as { user_id?: string })?.user_id ?? '').trim();
+  const isVideoPost = !!post.videoUrl && isValidVideoUrl(String(post.videoUrl));
+  const isBoosted = isPostBoostedForTips(post, monetizationPost);
+  const canGiftTip = isVideoPost && !!user?.id && !!ownerId && ownerId !== user.id && isBoosted;
+  const showBoostTipHint =
+    isVideoPost &&
+    !!user?.id &&
+    !!ownerId &&
+    ownerId !== user.id &&
+    monetizationReady &&
+    !isBoosted;
+
+  useEffect(() => {
+    const pid = String(post.id || '').trim();
+    if (!isVideoPost || !pid || !user?.id || !ownerId || ownerId === user.id) {
+      setMonetizationPost(null);
+      setMonetizationReady(true);
+      return;
+    }
+    setMonetizationReady(false);
+    let cancelled = false;
+    (async () => {
+      const s = await fetchMonetizationPost(pid);
+      if (!cancelled) {
+        setMonetizationPost(s);
+        setMonetizationReady(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [isVideoPost, post.id, user?.id, ownerId]);
+
+  useEffect(() => {
+    const pid = String(post.id || '').trim();
+    if (!pid || !isVideoPost) return;
+    return subscribePostMonetization((id) => {
+      if (id !== pid) return;
+      void fetchMonetizationPost(pid).then(setMonetizationPost);
+    });
+  }, [post.id, isVideoPost]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1409,6 +1462,12 @@ function PostDetailModal({ post, onClose }: { post: Post; onClose: () => void })
       cancelled = true;
     };
   }, [post.id]);
+
+  useEffect(() => {
+    if (!tipFlash) return;
+    const t = window.setTimeout(() => setTipFlash(null), 2600);
+    return () => window.clearTimeout(t);
+  }, [tipFlash]);
 
   const handleAddComment = async (e: FormEvent) => {
     e.preventDefault();
@@ -1493,6 +1552,30 @@ function PostDetailModal({ post, onClose }: { post: Post; onClose: () => void })
     }
   };
 
+  const handleSendTip = async (amount: number) => {
+    if (!user?.id) {
+      alert('Sign in to send gifts.');
+      return;
+    }
+    if (!isPostBoostedForTips(post, monetizationPost)) return;
+    if (!canGiftTip) return;
+    const bal = Number(profile?.coins) || 0;
+    if (bal < amount) {
+      alert(`You need at least ${amount} coins to tip.`);
+      return;
+    }
+    const res = await sendMonetizationGift(String(post.id), amount);
+    if (!res.ok) {
+      alert(res.error || 'Gift failed');
+      return;
+    }
+    const u = (profile?.username || user.email?.split('@')[0] || '').trim();
+    setTipFlash({
+      id: Date.now(),
+      text: u ? `${u} ${amount} Tip` : `+${amount} Tip`,
+    });
+  };
+
   return (
     <div className="fixed inset-0 z-[120] flex items-center justify-center p-0 md:p-4">
       <motion.div 
@@ -1516,8 +1599,9 @@ function PostDetailModal({ post, onClose }: { post: Post; onClose: () => void })
         </button>
 
         {/* Image Section */}
-        <div className="flex-1 bg-black flex items-center justify-center relative group">
+        <div className="relative group flex flex-1 items-center justify-center bg-black">
           <img src={imageSrc} alt="" className="max-w-full max-h-full object-contain" />
+          <TipSuccessOverlay flash={tipFlash} position="center" className="z-[15]" />
           <button className="absolute top-4 right-4 p-2 bg-black/40 text-white rounded-full opacity-0 group-hover:opacity-100 transition-opacity">
             <Maximize2 size={20} />
           </button>
@@ -1594,6 +1678,29 @@ function PostDetailModal({ post, onClose }: { post: Post; onClose: () => void })
                 <button type="button" className="hover:scale-110 transition-transform">
                   <MessageCircle size={24} />
                 </button>
+                {canGiftTip && (
+                  <button
+                    type="button"
+                    onClick={() => setTipPickerOpen(true)}
+                    className="hover:scale-110 transition-transform"
+                    title="Send Tip"
+                  >
+                    <Gift size={24} />
+                  </button>
+                )}
+                {showBoostTipHint && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClose();
+                      navigate(user?.id ? '/profile' : '/login');
+                    }}
+                    className="rounded-full border border-dashed border-amber-300/60 bg-amber-50/80 p-2 text-amber-700 transition-transform hover:scale-105 dark:border-amber-500/40 dark:bg-amber-950/40 dark:text-amber-200"
+                    title="Boost to receive tips"
+                  >
+                    <Sparkles size={22} />
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => setIsShareModalOpen(true)}
@@ -1631,6 +1738,16 @@ function PostDetailModal({ post, onClose }: { post: Post; onClose: () => void })
           </div>
         </div>
       </motion.div>
+
+      <MonetizationTipPicker
+        open={tipPickerOpen}
+        onClose={() => setTipPickerOpen(false)}
+        balanceCoins={profile?.coins != null ? Number(profile.coins) : undefined}
+        onPick={(amount) => {
+          setTipPickerOpen(false);
+          void handleSendTip(amount);
+        }}
+      />
 
       <ShareModal 
         isOpen={isShareModalOpen} 

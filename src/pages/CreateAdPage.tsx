@@ -19,14 +19,24 @@ function adCostForDays(days: number): number {
   return 50;
 }
 
+/** Comma-separated list: safe when value is undefined/null. */
+function splitCommaTags(value: string | null | undefined): string[] {
+  return (value ?? '')
+    .split(',')
+    .map((i) => i.trim())
+    .filter(Boolean);
+}
+
 export default function CreateAdPage() {
   const navigate = useNavigate();
-  const [title, setTitle] = useState('');
-  const [linkUrl, setLinkUrl] = useState('');
-  const [targetCountry, setTargetCountry] = useState('');
-  const [targetInterest, setTargetInterest] = useState('');
-  const [targetMinAge, setTargetMinAge] = useState('');
-  const [targetMaxAge, setTargetMaxAge] = useState('');
+  const [form, setForm] = useState({
+    title: '',
+    linkUrl: '',
+    targetCountry: '',
+    targetInterest: '',
+    targetMinAge: '',
+    targetMaxAge: '',
+  });
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [durationDays, setDurationDays] = useState<number>(1);
   const [submitting, setSubmitting] = useState(false);
@@ -35,8 +45,8 @@ export default function CreateAdPage() {
     e.preventDefault();
     if (submitting) return;
 
-    const safeTitle = title.trim();
-    const safeLink = linkUrl.trim();
+    const safeTitle = (form.title ?? '').trim();
+    const safeLink = (form.linkUrl ?? '').trim();
     if (!safeLink) {
       alert('Please add a link URL');
       return;
@@ -64,7 +74,7 @@ export default function CreateAdPage() {
       }
       deducted = true;
 
-      const ext = resolveStorageExtension(imageFile.name || imageFile.type || '', 'jpg');
+      const ext = resolveStorageExtension(imageFile);
       const path = `ads/${authUser.id}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
       const { error: uploadError } = await supabase.storage.from('posts').upload(path, imageFile, {
         upsert: false,
@@ -78,22 +88,28 @@ export default function CreateAdPage() {
       if (!imageUrl) throw new Error('Failed to build ad image URL');
 
       const endsAt = new Date(Date.now() + durationDays * 24 * 60 * 60 * 1000).toISOString();
+      const countryTags = splitCommaTags(form.targetCountry);
+      const interestTags = splitCommaTags(form.targetInterest);
+      const targetCountryStored = countryTags.length ? countryTags.join(', ') : null;
+      const targetInterestStored = interestTags.length ? interestTags.join(', ') : null;
+      const minAgeRaw = (form.targetMinAge ?? '').trim();
+      const maxAgeRaw = (form.targetMaxAge ?? '').trim();
       const { error: insertError } = await supabase.from('ads').insert({
         user_id: authUser.id,
         title: safeTitle || null,
         image_url: imageUrl,
         link_url: safeLink,
-        is_active: false,
-        status: 'pending',
+        is_active: true,
+        status: 'approved',
         ends_at: endsAt,
-        target_country: targetCountry.trim() || null,
-        target_interest: targetInterest.trim() || null,
-        target_min_age: targetMinAge.trim() ? Number(targetMinAge) : null,
-        target_max_age: targetMaxAge.trim() ? Number(targetMaxAge) : null,
+        target_country: targetCountryStored,
+        target_interest: targetInterestStored,
+        target_min_age: minAgeRaw ? Number(minAgeRaw) : null,
+        target_max_age: maxAgeRaw ? Number(maxAgeRaw) : null,
       });
       if (insertError) throw insertError;
 
-      alert('Ad submitted for review.');
+      alert('Your ad is live.');
       navigate('/profile');
     } catch (err: any) {
       if (deducted) {
@@ -114,14 +130,14 @@ export default function CreateAdPage() {
     <div className="max-w-xl mx-auto p-4 md:p-8">
       <h1 className="text-2xl font-black mb-2">Create Ad</h1>
       <p className="text-sm text-gray-500 mb-6">
-        Submitting an ad costs {adCostForDays(durationDays)} coins and requires admin approval.
+        Submitting an ad costs {adCostForDays(durationDays)} coins. It goes live in the feed after payment.
       </p>
       <form onSubmit={handleSubmit} className="space-y-4">
         <div>
           <label className="text-sm font-bold">Title</label>
           <input
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
+            value={form.title}
+            onChange={(e) => setForm((f) => ({ ...f, title: e.target.value }))}
             placeholder="Optional ad title"
             className="mt-1 w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2 text-sm"
           />
@@ -129,8 +145,8 @@ export default function CreateAdPage() {
         <div>
           <label className="text-sm font-bold">Link URL</label>
           <input
-            value={linkUrl}
-            onChange={(e) => setLinkUrl(e.target.value)}
+            value={form.linkUrl}
+            onChange={(e) => setForm((f) => ({ ...f, linkUrl: e.target.value }))}
             placeholder="https://example.com"
             className="mt-1 w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2 text-sm"
           />
@@ -152,8 +168,8 @@ export default function CreateAdPage() {
         <div>
           <label className="text-sm font-bold">Target Country (optional)</label>
           <select
-            value={targetCountry}
-            onChange={(e) => setTargetCountry(e.target.value)}
+            value={form.targetCountry}
+            onChange={(e) => setForm((f) => ({ ...f, targetCountry: e.target.value }))}
             className="mt-1 w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2 text-sm"
           >
             <option value="">Any country</option>
@@ -168,8 +184,8 @@ export default function CreateAdPage() {
         <div>
           <label className="text-sm font-bold">Target Interest (optional)</label>
           <input
-            value={targetInterest}
-            onChange={(e) => setTargetInterest(e.target.value)}
+            value={form.targetInterest}
+            onChange={(e) => setForm((f) => ({ ...f, targetInterest: e.target.value }))}
             placeholder="e.g. sports, music"
             className="mt-1 w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2 text-sm"
           />
@@ -180,8 +196,8 @@ export default function CreateAdPage() {
             <input
               type="number"
               min={0}
-              value={targetMinAge}
-              onChange={(e) => setTargetMinAge(e.target.value)}
+              value={form.targetMinAge}
+              onChange={(e) => setForm((f) => ({ ...f, targetMinAge: e.target.value }))}
               className="mt-1 w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2 text-sm"
             />
           </div>
@@ -190,8 +206,8 @@ export default function CreateAdPage() {
             <input
               type="number"
               min={0}
-              value={targetMaxAge}
-              onChange={(e) => setTargetMaxAge(e.target.value)}
+              value={form.targetMaxAge}
+              onChange={(e) => setForm((f) => ({ ...f, targetMaxAge: e.target.value }))}
               className="mt-1 w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2 text-sm"
             />
           </div>

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
@@ -43,6 +43,8 @@ import { notifyLikeCommentFollowDm } from '../lib/supabaseNotifications';
 import { useAuth } from '../contexts/AuthContext';
 import { Video } from '../types';
 import ShareModal from '../components/ShareModal';
+import { MonetizationTipPicker } from '../components/MonetizationTipPicker';
+import { TipSuccessOverlay, type TipSuccessFlash } from '../components/TipSuccessOverlay';
 import StoryEditor from '../components/StoryEditor';
 import { ResponsiveImage } from '../components/ResponsiveImage';
 import { isValidVideoUrl } from '../lib/videoUrl';
@@ -51,11 +53,15 @@ import { getViews, getViralScore } from '../lib/postViews';
 import { getPersonalizedScore, trackWatchTime, updateInterest } from '../lib/personalizedRanking';
 import { maybeRewardViralPost } from '../lib/viralRewards';
 import { startCreatorValidViewWatch, stopCreatorValidViewWatch } from '../lib/creatorValidViews';
+import { trackUserBehavior } from '../lib/userBehavior';
 import {
   fetchMonetizationPost,
+  mergeMonetizationPostStatus,
   sendMonetizationGift,
   type MonetizationPostStatus,
 } from '../lib/monetization';
+import { MONETIZATION_TIP_AMOUNTS } from '../lib/monetizationTipUi';
+import { isPostBoostedForTips, normalizePostRowIsFeatured } from '../lib/monetizationFeaturedUi';
 import { subscribePostMonetization } from '../lib/monetizationRealtime';
 import { hasRecordedViewThisSession, markPostViewRecordedSession } from '../lib/postViewTracking';
 import { ReelsFeedSkeleton } from '../components/LoadingSkeletons';
@@ -65,11 +71,34 @@ import {
   storageUploadContentType,
 } from '../lib/storageUpload';
 import { fetchCommentsWithProfiles, resolveProfileUsername } from '../lib/postComments';
+import { AdCard } from '../components/AdCard';
+import { getActiveAds, type ActiveAdRow } from '../lib/activeAds';
 
 /** Views per hour above this = show “Viral” badge and sort higher. */
 const VIRAL_THRESHOLD = 50;
 /** Minimum total views before a post can be marked viral. */
 const MIN_VIEWS = 100;
+
+/** Home → Reels: feed row id can differ from reel row id; keep `is_featured` from the tapped card when URL or id matches. */
+function mergeFeaturedFromHomeSelectedPost(
+  list: any[],
+  selectedPost: any | null,
+  targetId: string | null,
+  normalizeUrl: (u: string) => string
+): any[] {
+  if (!selectedPost || !targetId) return list;
+  const selUrl = normalizeUrl(String(selectedPost.video_url || selectedPost.url || '').trim());
+  return list.map((v) => {
+    if (String(v.id) !== String(targetId)) return v;
+    const vUrl = normalizeUrl(String(v.url || v.videoUrl || '').trim());
+    const sameId = String(selectedPost.id) === String(v.id);
+    const sameUrl = selUrl && vUrl && selUrl === vUrl;
+    if (!sameId && !sameUrl) return v;
+    const mergedFeatured =
+      normalizePostRowIsFeatured(selectedPost) || normalizePostRowIsFeatured(v);
+    return { ...v, is_featured: mergedFeatured };
+  });
+}
 
 export default function ReelsPage() {
   const navigate = useNavigate();
@@ -79,6 +108,11 @@ export default function ReelsPage() {
   const navState = location.state as any;
   const selectedVideoUrl: string | undefined = navState?.videoUrl;
   const selectedPost: any | null = navState?.selectedPost ?? null;
+  /** Home feed post id when it differs from the reel row id (same video URL). Used for monetization API merge in VideoPost. */
+  const homeNavPostId =
+    navState?.postId != null && String(navState.postId).trim() !== ''
+      ? String(navState.postId).trim()
+      : '';
   const selectedVideoId: string | null =
     (navState?.selectedReelId ? String(navState.selectedReelId) : null) ||
     (navState?.videoId ? String(navState.videoId) : null) ||
@@ -88,6 +122,7 @@ export default function ReelsPage() {
   const isSelectedMode = !!selectedVideoId;
 
   const [videos, setVideos] = useState<any[]>([]);
+  const [feedAds, setFeedAds] = useState<ActiveAdRow[]>([]);
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
   const [isCommentsOpen, setIsCommentsOpen] = useState(false);
   const [activeVideoId, setActiveVideoId] = useState<string | null>(null);
@@ -102,10 +137,16 @@ export default function ReelsPage() {
   const [feedScrollRoot, setFeedScrollRoot] = useState<HTMLElement | null>(null);
   const videoRefs = useRef<(HTMLDivElement | null)[]>([]);
   const reelVideoElsRef = useRef<Record<string, HTMLVideoElement | null>>({});
+  /** After first programmatic alignment for this navigation; blocks scroll-driven feedback loops. */
+  const isInitialScrollDone = useRef(false);
+  /** True while programmatic scrollIntoView runs; observers/onScroll ignore updates. */
+  const isAutoScrolling = useRef(false);
+  /** Prevents duplicate scrollIntoView when `videos` identity changes before initial alignment finishes. */
+  const initialScrollLockRef = useRef(false);
 
   useLayoutEffect(() => {
     setFeedScrollRoot(feedRef.current);
-  }, [videos.length]);
+  }, [videos.length, feedAds.length]);
 
   useEffect(() => {
     const mq = window.matchMedia('(pointer: coarse)');
@@ -114,6 +155,24 @@ export default function ReelsPage() {
     mq.addEventListener('change', sync);
     return () => mq.removeEventListener('change', sync);
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const { data, error } = await getActiveAds(supabase, { limit: 12 });
+      if (cancelled || error) return;
+      setFeedAds(data);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // New navigation → allow one programmatic scroll to target reel again.
+  useEffect(() => {
+    isInitialScrollDone.current = false;
+    initialScrollLockRef.current = false;
+  }, [location.key]);
 
   // If navigated from Home with a selected video, prioritize it once the feed loads
   // (do not replace the feed with a single video).
@@ -302,6 +361,7 @@ export default function ReelsPage() {
               created_at: r.created_at ?? null,
               category: r.category ?? null,
               post_user_id: uid,
+              is_featured: normalizePostRowIsFeatured(r),
             };
           })
           .filter((v: any): v is NonNullable<typeof v> => v != null && !!v.url);
@@ -331,6 +391,8 @@ export default function ReelsPage() {
           followingCount: followingIds.length,
         });
 
+        finalList = mergeFeaturedFromHomeSelectedPost(finalList, selectedPost, targetId, normalizeUrl);
+
         setVideos(finalList);
         const targetById = targetId
           ? finalList.find((v: any) => String(v.id) === String(targetId))
@@ -348,7 +410,16 @@ export default function ReelsPage() {
     };
 
     void fetchReels();
-  }, [isSelectedMode, params.id, selectedVideoId, selectedVideoUrl, location.key, activeNav, user?.id]);
+  }, [
+    isSelectedMode,
+    params.id,
+    selectedVideoId,
+    selectedVideoUrl,
+    location.key,
+    activeNav,
+    user?.id,
+    selectedPost?.id,
+  ]);
 
   useEffect(() => {
     const channel = supabase
@@ -393,6 +464,7 @@ export default function ReelsPage() {
                 isViral: isViralNow,
                 viralScore,
                 post_user_id: ownerId || (v as { post_user_id?: string }).post_user_id,
+                is_featured: normalizePostRowIsFeatured(merged as { is_featured?: unknown; isFeatured?: unknown }),
               };
             })
           );
@@ -462,33 +534,54 @@ export default function ReelsPage() {
     if (idx >= 0) setCurrentIndex(idx);
   }, [videos, activeVideoId]);
 
+  /**
+   * Single initial alignment per navigation (replaces duplicate scroll effects on activeVideoId + selectedPost).
+   * After isInitialScrollDone, activeVideoId changes from IntersectionObserver no longer call scrollIntoView.
+   */
   useEffect(() => {
-    if (!activeVideoId || !feedRef.current || videos.length <= 1) return;
-    const target = feedRef.current.querySelector(`[data-reel-id="${activeVideoId}"]`) as HTMLElement | null;
-    if (target) {
-      const instantSnap =
-        typeof window !== 'undefined' && window.matchMedia('(max-width: 1023px)').matches;
-      target.scrollIntoView({ block: 'start', behavior: instantSnap ? 'auto' : 'smooth' });
+    if (!videos.length || !feedRef.current) return;
+    if (isInitialScrollDone.current) return;
+    if (!activeVideoId) {
+      isInitialScrollDone.current = true;
+      return;
     }
-  }, [activeVideoId, videos.length]);
+    const targetIndex = videos.findIndex((p) => String(p.id) === String(activeVideoId));
+    if (targetIndex === -1) {
+      isInitialScrollDone.current = true;
+      return;
+    }
+    if (initialScrollLockRef.current) return;
+    const target = feedRef.current.querySelector(`[data-reel-id="${activeVideoId}"]`) as HTMLElement | null;
+    if (!target) return;
 
-  // Home → Reels: center the clicked video once the feed list is ready.
-  useEffect(() => {
-    if (!selectedPost?.id || !videos.length) return;
-    const targetId = String(selectedPost.id);
-    const index = videos.findIndex((v) => String(v.id) === targetId);
-    if (index === -1) return;
-    const el = videoRefs.current[index];
-    if (!el) return;
+    initialScrollLockRef.current = true;
+
     const instantSnap =
       typeof window !== 'undefined' && window.matchMedia('(max-width: 1023px)').matches;
-    const raf = requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        el.scrollIntoView({ behavior: instantSnap ? 'auto' : 'smooth', block: 'center' });
-      });
-    });
-    return () => cancelAnimationFrame(raf);
-  }, [videos, selectedPost?.id]);
+    const fromHomePost = !!selectedPost?.id && String(selectedPost.id) === String(activeVideoId);
+    const scrollBlock: ScrollLogicalPosition = fromHomePost ? 'center' : 'start';
+
+    isAutoScrolling.current = true;
+    const runScroll = () => {
+      target.scrollIntoView({ block: scrollBlock, behavior: instantSnap ? 'auto' : 'smooth' });
+    };
+    if (fromHomePost) {
+      requestAnimationFrame(() => requestAnimationFrame(runScroll));
+    } else {
+      runScroll();
+    }
+    const done = window.setTimeout(() => {
+      isAutoScrolling.current = false;
+      isInitialScrollDone.current = true;
+    }, 300);
+    return () => {
+      window.clearTimeout(done);
+      if (!isInitialScrollDone.current) {
+        initialScrollLockRef.current = false;
+        isAutoScrolling.current = false;
+      }
+    };
+  }, [activeVideoId, videos.length, selectedPost?.id]);
 
   const updateVideoCounts = useCallback(
     (
@@ -575,13 +668,24 @@ export default function ReelsPage() {
     videos[currentIndex] ||
     videos[0];
 
+  const reelFeedItems = useMemo(() => {
+    const out: Array<{ kind: 'video'; video: any } | { kind: 'ad'; ad: ActiveAdRow }> = [];
+    videos.forEach((video, index) => {
+      out.push({ kind: 'video', video });
+      if (index % 5 === 0 && feedAds.length > 0) {
+        out.push({ kind: 'ad', ad: feedAds[index % feedAds.length] });
+      }
+    });
+    return out;
+  }, [videos, feedAds]);
+
   if (!videos.length && !reelsLoaded) {
     return <ReelsFeedSkeleton />;
   }
 
   if (!videos.length && reelsLoaded) {
     return (
-      <div className="relative h-screen overflow-hidden bg-[#0A0A0A] flex items-center justify-center">
+      <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-[#0A0A0A]">
         <div className="text-center text-white/80 px-6">
           <div className="text-sm font-bold">No videos available</div>
           <div className="text-xs text-white/50 mt-1">Please try again later.</div>
@@ -591,7 +695,7 @@ export default function ReelsPage() {
   }
 
   return (
-    <div className="relative flex h-full min-h-0 flex-col bg-[#0A0A0A] font-sans lg:h-screen lg:overflow-hidden">
+    <div className="relative flex h-full min-h-0 flex-1 flex-col bg-[#0A0A0A] font-sans overflow-hidden">
       {/* Top Navigation Bar */}
       <div className="absolute top-0 left-0 right-0 h-14 sm:h-16 flex items-center justify-between px-4 sm:px-6 z-[100] bg-gradient-to-b from-black/80 to-transparent">
         <div className="w-20" /> {/* Spacer for symmetry */}
@@ -646,21 +750,16 @@ export default function ReelsPage() {
         </div>
       </div>
 
-      {/* Main Content Area — on mobile, do not clip overflow so the feed is the sole scroll/snap port */}
-      <div className="flex min-h-0 flex-1 max-lg:overflow-visible lg:overflow-hidden">
-        {/* Reels Feed — sole scroll container on mobile */}
+      {/* Main Content Area — single scroll: feed is the only vertical overflow (matches App main min-h-0 chain) */}
+      <div className="flex min-h-0 flex-1 overflow-hidden">
+        {/* Reels Feed — sole vertical scroll + snap; avoid 100vh inline so it matches parent 100dvh flex */}
         <div
           className={cn(
-            'relative min-h-0 w-full flex-1 snap-y snap-mandatory overflow-y-scroll no-scrollbar',
-            'max-lg:h-full max-lg:overscroll-y-contain max-lg:[-webkit-overflow-scrolling:touch] max-lg:touch-pan-y',
+            'relative h-full min-h-0 w-full flex-1 snap-y snap-mandatory overflow-y-auto overscroll-y-contain no-scrollbar',
+            '[-webkit-overflow-scrolling:touch] touch-pan-y',
             'lg:transition-all lg:duration-500 lg:ease-in-out lg:touch-auto',
             isCommentsOpen ? 'lg:mr-0' : ''
           )}
-          style={
-            isTouchDevice
-              ? { height: '100vh', overflowY: 'scroll', scrollSnapType: 'y mandatory', backgroundColor: '#000' }
-              : undefined
-          }
           ref={feedRef}
           onClick={() => {
             if (!hasUserInteracted) setHasUserInteracted(true);
@@ -669,48 +768,82 @@ export default function ReelsPage() {
             if (!hasUserInteracted) setHasUserInteracted(true);
           }}
           onScroll={() => {
+            if (!isInitialScrollDone.current) return;
+            if (isAutoScrolling.current) return;
             if (!hasUserInteracted) setHasUserInteracted(true);
           }}
         >
-          {videos.map((video, index) => (
-            <div
-              key={video.id}
-              ref={(el) => {
-                videoRefs.current[index] = el;
-              }}
-              data-reel-id={video.id}
-              className={cn(
-                'relative box-border w-full shrink-0 snap-start p-0 m-0',
-                'max-lg:h-[100dvh] max-lg:min-h-[100dvh] max-lg:max-h-[100dvh] max-lg:[scroll-snap-stop:always]',
-                'lg:h-full'
-              )}
-              style={isTouchDevice ? { height: '100vh', scrollSnapAlign: 'start', backgroundColor: '#000' } : undefined}
-            >
-              <VideoPost
-                video={video}
-                reelId={String(video.id)}
-                feedScrollRoot={feedScrollRoot}
-                hasUserInteracted={hasUserInteracted}
-                isTouchDevice={isTouchDevice}
-                globalMuted={isMuted}
-                activeVideoId={activeVideoId}
-                pauseAllReelVideos={pauseAllReelVideos}
-                onToggleGlobalMute={() => setIsMuted((prev) => !prev)}
-                onUserInteract={() => setHasUserInteracted(true)}
-                onVideoElementRef={(videoId, el) => {
-                  reelVideoElsRef.current[String(videoId)] = el;
-                }}
-                onToggleComments={() => setIsCommentsOpen(!isCommentsOpen)}
-                onReelActive={setActiveReel}
-                onCountsChange={updateVideoCounts}
-                onRefreshPostCounts={(postId) => void refreshPostCounts(postId)}
-                onUseSound={(sound) => {
-                  setPreselectedSound(sound);
-                  setIsUploadModalOpen(true);
-                }}
-              />
-            </div>
-          ))}
+          {(() => {
+            let videoLayoutIndex = 0;
+            return reelFeedItems.map((entry, index) => {
+              if (entry.kind === 'ad') {
+                return (
+                  <div
+                    key={`ad-${entry.ad.id}-${index}`}
+                    className={cn(
+                      'relative box-border w-full shrink-0 snap-start p-0 m-0',
+                      'max-lg:h-[100dvh] max-lg:min-h-[100dvh] max-lg:max-h-[100dvh] max-lg:[scroll-snap-stop:always]',
+                      'lg:h-full flex items-center justify-center bg-black'
+                    )}
+                    style={isTouchDevice ? { scrollSnapAlign: 'start', backgroundColor: '#000' } : undefined}
+                  >
+                    <div className="w-full max-w-lg px-4 py-6">
+                      <AdCard
+                        ad={entry.ad}
+                        tone="dark"
+                        className="w-full border border-white/10 bg-[#0A0A0A] rounded-2xl"
+                      />
+                    </div>
+                  </div>
+                );
+              }
+              const video = entry.video;
+              const refIdx = videoLayoutIndex++;
+              return (
+                <div
+                  key={video.id}
+                  ref={(el) => {
+                    videoRefs.current[refIdx] = el;
+                  }}
+                  data-reel-id={video.id}
+                  className={cn(
+                    'relative box-border w-full shrink-0 snap-start p-0 m-0',
+                    'max-lg:h-[100dvh] max-lg:min-h-[100dvh] max-lg:max-h-[100dvh] max-lg:[scroll-snap-stop:always]',
+                    'lg:h-full'
+                  )}
+                  style={isTouchDevice ? { scrollSnapAlign: 'start', backgroundColor: '#000' } : undefined}
+                >
+                  <VideoPost
+                    video={video}
+                    reelId={String(video.id)}
+                    monetizationPostIdOverride={
+                      homeNavPostId && homeNavPostId !== String(video.id) ? homeNavPostId : undefined
+                    }
+                    feedScrollRoot={feedScrollRoot}
+                    isAutoScrollingRef={isAutoScrolling}
+                    hasUserInteracted={hasUserInteracted}
+                    isTouchDevice={isTouchDevice}
+                    globalMuted={isMuted}
+                    activeVideoId={activeVideoId}
+                    pauseAllReelVideos={pauseAllReelVideos}
+                    onToggleGlobalMute={() => setIsMuted((prev) => !prev)}
+                    onUserInteract={() => setHasUserInteracted(true)}
+                    onVideoElementRef={(videoId, el) => {
+                      reelVideoElsRef.current[String(videoId)] = el;
+                    }}
+                    onToggleComments={() => setIsCommentsOpen(!isCommentsOpen)}
+                    onReelActive={setActiveReel}
+                    onCountsChange={updateVideoCounts}
+                    onRefreshPostCounts={(postId) => void refreshPostCounts(postId)}
+                    onUseSound={(sound) => {
+                      setPreselectedSound(sound);
+                      setIsUploadModalOpen(true);
+                    }}
+                  />
+                </div>
+              );
+            });
+          })()}
         </div>
 
         {/* Tablet/Desktop Sidebar */}
@@ -1324,7 +1457,9 @@ function SoundSelector({ onClose, onSelect, selectedSoundId }: { onClose: () => 
 function VideoPost({
   video,
   reelId,
+  monetizationPostIdOverride,
   feedScrollRoot,
+  isAutoScrollingRef,
   hasUserInteracted,
   isTouchDevice,
   globalMuted,
@@ -1341,7 +1476,10 @@ function VideoPost({
 }: {
   video: any;
   reelId: string;
+  /** When set, merge GET /monetization/post for this id with the reel row id (Home feed vs reel row). */
+  monetizationPostIdOverride?: string | null;
   feedScrollRoot: HTMLElement | null;
+  isAutoScrollingRef: React.MutableRefObject<boolean>;
   hasUserInteracted: boolean;
   isTouchDevice: boolean;
   globalMuted: boolean;
@@ -1372,6 +1510,7 @@ function VideoPost({
   const [isReady, setIsReady] = useState(false);
   const [videoFailed, setVideoFailed] = useState(false);
   const [monetization, setMonetization] = useState<MonetizationPostStatus | null>(null);
+  const [monetizationReady, setMonetizationReady] = useState(false);
   const reelContainerRef = useRef<HTMLDivElement>(null);
   const intersectingRef = useRef(false);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -1381,8 +1520,8 @@ function VideoPost({
   const watchStartRef = useRef<number | null>(null);
   const monetizationPromoTimersRef = useRef<{ show?: number; hide?: number }>({});
   const [monetizationPromoVisible, setMonetizationPromoVisible] = useState(false);
-
-  const TIP_COINS = 50;
+  const [tipPickerOpen, setTipPickerOpen] = useState(false);
+  const [tipFlash, setTipFlash] = useState<TipSuccessFlash | null>(null);
 
   const REEL_GIFTS = [
     { id: 'g1', icon: '🎁', price: 500 },
@@ -1401,14 +1540,35 @@ function VideoPost({
   ).trim();
   const isOwner = !!user?.id && ownerId === user.id;
   const monetizationUnlocked = !!monetization?.unlocked;
-  const canGiftOrTip = monetizationUnlocked && !isOwner && !!user?.id;
+  const postBoosted = isPostBoostedForTips(video, monetization);
+  const canGiftOrTip = postBoosted && !isOwner && !!user?.id;
 
   const reloadMonetization = useCallback(async () => {
-    const reelId = video?.id != null ? String(video.id) : null;
-    if (!reelId) return;
-    const s = await fetchMonetizationPost(reelId);
-    setMonetization(s);
-  }, [video?.id]);
+    const rid = video?.id != null ? String(video.id) : null;
+    if (!rid) {
+      setMonetizationReady(true);
+      return;
+    }
+    setMonetizationReady(false);
+    const alt =
+      monetizationPostIdOverride && String(monetizationPostIdOverride) !== String(rid)
+        ? String(monetizationPostIdOverride)
+        : null;
+    const [primary, secondary] = await Promise.all([
+      fetchMonetizationPost(rid),
+      alt ? fetchMonetizationPost(alt) : Promise.resolve(null),
+    ]);
+    const merged = mergeMonetizationPostStatus(primary, secondary);
+    setMonetization(merged);
+    setMonetizationReady(true);
+    if (import.meta.env.DEV) {
+      console.log('[Monetization][Reels]', rid, {
+        is_featured: (video as { is_featured?: unknown })?.is_featured,
+        monetization: merged,
+        mergedWithHomePostId: alt ?? null,
+      });
+    }
+  }, [video?.id, monetizationPostIdOverride]);
 
   useEffect(() => {
     void reloadMonetization();
@@ -1416,10 +1576,20 @@ function VideoPost({
 
   useEffect(() => {
     return subscribePostMonetization((postId) => {
-      const reelId = video?.id != null ? String(video.id) : null;
-      if (reelId && postId === reelId) void reloadMonetization();
+      const rid = video?.id != null ? String(video.id) : null;
+      const alt =
+        monetizationPostIdOverride && String(monetizationPostIdOverride) !== String(rid)
+          ? String(monetizationPostIdOverride)
+          : null;
+      if (rid && (postId === rid || (alt && postId === alt))) void reloadMonetization();
     });
-  }, [video?.id, reloadMonetization]);
+  }, [video?.id, monetizationPostIdOverride, reloadMonetization]);
+
+  useEffect(() => {
+    if (!tipFlash) return;
+    const t = window.setTimeout(() => setTipFlash(null), 2600);
+    return () => window.clearTimeout(t);
+  }, [tipFlash]);
 
   const playUrl = String((video as any).videoUrl || video.url || '').trim();
   console.log("VIDEO URL:", playUrl);
@@ -1437,7 +1607,7 @@ function VideoPost({
     t.hide = undefined;
     setMonetizationPromoVisible(false);
 
-    const eligible = !monetizationUnlocked && urlOk && !videoFailed;
+    const eligible = !postBoosted && urlOk && !videoFailed && monetizationReady;
     if (!eligible) return;
 
     const DELAY_MS = 2600;
@@ -1456,7 +1626,7 @@ function VideoPost({
       if (t.show != null) window.clearTimeout(t.show);
       if (t.hide != null) window.clearTimeout(t.hide);
     };
-  }, [video?.id, monetizationUnlocked, urlOk, videoFailed]);
+  }, [video?.id, postBoosted, urlOk, videoFailed, monetizationReady]);
 
   const flushMainVideoWatchSegment = useCallback(() => {
     if (watchStartRef.current != null) {
@@ -1514,6 +1684,23 @@ function VideoPost({
       if (!response || !response.ok) throw new Error('Failed to like post');
       const data = await response.json().catch(() => null);
       console.log('[ReelsPage] post-like response', { postId: reelId, data });
+      if (nextLiked && reelId) {
+        if (import.meta.env.DEV) {
+          console.log('[ReelsPage][userBehavior] calling trackUserBehavior', {
+            action: 'like',
+            userId,
+            targetId: reelId,
+            via: 'post-like API',
+          });
+        }
+        void trackUserBehavior({
+          userId,
+          actionType: 'like',
+          targetType: 'post',
+          targetId: reelId,
+          category: String((video as { category?: string })?.category || 'reel'),
+        });
+      }
 
       // Persist liked UI across refresh.
       try {
@@ -1553,6 +1740,23 @@ function VideoPost({
             .from('likes')
             .insert({ post_id: reelId, user_id: userId });
           if (insErr) throw insErr;
+          if (reelId) {
+            if (import.meta.env.DEV) {
+              console.log('[ReelsPage][userBehavior] calling trackUserBehavior', {
+                action: 'like',
+                userId,
+                targetId: reelId,
+                via: 'supabase fallback',
+              });
+            }
+            void trackUserBehavior({
+              userId,
+              actionType: 'like',
+              targetType: 'post',
+              targetId: reelId,
+              category: String((video as { category?: string })?.category || 'reel'),
+            });
+          }
 
           // Best-effort notification (non-fatal).
           try {
@@ -1703,8 +1907,8 @@ function VideoPost({
       alert('Sign in to send gifts.');
       return;
     }
-    if (!monetizationUnlocked) {
-      alert('Monetization is locked on this reel until the creator boosts.');
+    if (!isPostBoostedForTips(video, monetization)) {
+      alert('Tips and gifts are only available on boosted posts.');
       return;
     }
     if (isOwner) {
@@ -1716,17 +1920,30 @@ function VideoPost({
     const finalGift = giftToSend || REEL_GIFTS[0];
     const coins = finalGift?.price ?? 50;
 
+    const effectivePostId = monetizationPostIdOverride
+      ? String(monetizationPostIdOverride)
+      : reelId;
+    if (import.meta.env.DEV) {
+      console.log('[Gifts] effectivePostId:', effectivePostId);
+      console.log('[Gifts] reelId:', reelId);
+      console.log('[Gifts] overridePostId:', monetizationPostIdOverride ?? null);
+    }
+
     console.log('[ReelsPage] gift send', {
       reelId,
+      effectivePostId,
       userId,
       giftId: finalGift?.id,
       giftPrice: coins,
     });
 
-    const res = await sendMonetizationGift(reelId, coins);
+    const res = await sendMonetizationGift(effectivePostId, coins);
     if (!res.ok) {
       alert(res.error || 'Gift failed');
       return;
+    }
+    if (import.meta.env.DEV) {
+      console.log('[Gifts][AfterSend] postId used:', effectivePostId);
     }
     await refreshProfile();
     await reloadMonetization();
@@ -1752,29 +1969,45 @@ function VideoPost({
     }, 2000);
   };
 
-  const handleSendTip = async () => {
+  const handleSendTip = async (amount: number) => {
     const reelId = video?.id != null ? String(video.id) : null;
     if (!reelId || !user?.id) {
       alert('Sign in to tip.');
       return;
     }
-    if (!monetizationUnlocked) {
-      alert('Monetization is locked until the creator boosts.');
+    if (!isPostBoostedForTips(video, monetization)) {
+      alert('Tips and gifts are only available on boosted posts.');
       return;
     }
     if (isOwner) return;
     const bal = Number(profile?.coins) || 0;
-    if (bal < TIP_COINS) {
-      alert(`You need at least ${TIP_COINS} coins to tip.`);
+    if (bal < amount) {
+      alert(`You need at least ${amount} coins to tip.`);
       return;
     }
-    const res = await sendMonetizationGift(reelId, TIP_COINS);
+    const effectivePostId = monetizationPostIdOverride
+      ? String(monetizationPostIdOverride)
+      : reelId;
+    if (import.meta.env.DEV) {
+      console.log('[Gifts] effectivePostId:', effectivePostId);
+      console.log('[Gifts] reelId:', reelId);
+      console.log('[Gifts] overridePostId:', monetizationPostIdOverride ?? null);
+    }
+    const res = await sendMonetizationGift(effectivePostId, amount);
     if (!res.ok) {
       alert(res.error || 'Tip failed');
       return;
     }
+    if (import.meta.env.DEV) {
+      console.log('[Gifts][AfterSend] postId used:', effectivePostId);
+    }
     await refreshProfile();
     await reloadMonetization();
+    const u = (profile?.username || user.email?.split('@')[0] || '').trim();
+    setTipFlash({
+      id: Date.now(),
+      text: u ? `${u} ${amount} Tip` : `+${amount} Tip`,
+    });
     const newHearts = Array.from({ length: 5 }).map((_, i) => ({
       id: Date.now() + i,
       x: Math.random() * 60 - 30,
@@ -1930,6 +2163,7 @@ function VideoPost({
 
     const observer = new IntersectionObserver(
       (entries) => {
+        if (isAutoScrollingRef.current) return;
         entries.forEach((entry) => {
           if (entry.target !== root) return;
           const visible = entry.isIntersecting && entry.intersectionRatio >= REEL_VISIBLE_RATIO;
@@ -1969,6 +2203,22 @@ function VideoPost({
             ) {
               hasReelViewCountedRef.current = true;
               markPostViewRecordedSession(reelId);
+              if (user?.id && reelId) {
+                if (import.meta.env.DEV) {
+                  console.log('[ReelsPage][userBehavior] calling trackUserBehavior', {
+                    action: 'view',
+                    userId: user.id,
+                    targetId: reelId,
+                  });
+                }
+                void trackUserBehavior({
+                  userId: user.id,
+                  actionType: 'view',
+                  targetType: 'video',
+                  targetId: reelId,
+                  category: String((video as { category?: string })?.category || 'reel'),
+                });
+              }
               const next = getViews(video) + 1;
               onCountsChange(reelId, { views: next });
               void supabase
@@ -2025,6 +2275,7 @@ function VideoPost({
     };
   }, [
     feedScrollRoot,
+    isAutoScrollingRef,
     onReelActive,
     onCountsChange,
     pauseAllReelVideos,
@@ -2047,9 +2298,12 @@ function VideoPost({
   const desktopMuted = !hasUserInteracted;
 
   return (
-    <div ref={reelContainerRef} className="relative w-full h-screen overflow-hidden bg-black group">
+    <div
+      ref={reelContainerRef}
+      className="relative isolate h-full min-h-0 w-full flex-shrink-0 overflow-hidden bg-black group"
+    >
       {video.isViral && (
-        <div className="pointer-events-none absolute top-2 left-2 z-30 bg-orange-500 text-white text-xs px-2 py-1 rounded-full font-bold shadow-lg">
+        <div className="pointer-events-none absolute top-2 left-2 z-[30] bg-orange-500 text-white text-xs px-2 py-1 rounded-full font-bold shadow-lg">
           🔥 Viral
         </div>
       )}
@@ -2059,16 +2313,18 @@ function VideoPost({
             <img
               src={thumbStr}
               alt=""
-              className="absolute inset-0 z-0 h-full w-full object-cover"
+              className="pointer-events-none absolute inset-0 z-0 h-full w-full object-cover"
               aria-hidden
             />
           )}
-          {!thumbOk && <div className="absolute inset-0 z-0 bg-neutral-900" aria-hidden />}
+          {!thumbOk && (
+            <div className="pointer-events-none absolute inset-0 z-0 bg-neutral-900" aria-hidden />
+          )}
           {/* Blurred background — same src as main; fills letterbox edges */}
           <video
             ref={blurVideoRef}
             src={playUrl}
-            className="absolute inset-0 z-[1] h-full w-full object-cover blur-2xl scale-110 [will-change:transform]"
+            className="pointer-events-none absolute inset-0 z-0 h-full w-full object-cover blur-2xl"
             poster={posterForPlayer}
             muted
             loop
@@ -2080,7 +2336,7 @@ function VideoPost({
             style={{ backgroundColor: '#000' }}
           />
           {/* Main player — shrink-wrapped + centered so sides/top-bottom show blur, not black pillarbox */}
-          <div className="absolute inset-0 z-10 flex min-h-0 min-w-0 items-center justify-center">
+          <div className="absolute inset-0 z-[10] flex h-full w-full min-h-0 min-w-0 items-center justify-center">
             <video
               key={video.id}
               ref={(el) => {
@@ -2089,7 +2345,10 @@ function VideoPost({
               }}
               src={playUrl}
               poster={posterForPlayer}
-              className="max-h-full max-w-full object-contain [will-change:transform] transition-opacity duration-300"
+              className={cn(
+                'relative z-[10] max-h-full max-w-full object-contain',
+                !isReady && 'invisible'
+              )}
               controls={!isTouchDevice}
               loop
               muted={isTouchDevice ? globalMuted : desktopMuted}
@@ -2101,15 +2360,7 @@ function VideoPost({
               onPause={handleMainVideoPauseOrEnd}
               onEnded={handleMainVideoPauseOrEnd}
               onClick={handleVideoSurfaceTap}
-              style={{
-                opacity: isReady ? 1 : 0,
-                ...(isTouchDevice
-                  ? {
-                      transform: 'translateZ(0)',
-                      willChange: 'transform',
-                    }
-                  : { cursor: 'pointer' }),
-              }}
+              style={isTouchDevice ? undefined : { cursor: 'pointer' }}
             />
           </div>
         </>
@@ -2129,13 +2380,13 @@ function VideoPost({
           <img
             src={thumbStr}
             alt=""
-            className="absolute inset-0 h-full w-full object-cover blur-[20px] scale-[1.2] z-0 [will-change:transform]"
+            className="pointer-events-none absolute inset-0 z-0 h-full w-full object-cover blur-[20px]"
             aria-hidden
           />
           <img
             src={thumbStr}
             alt=""
-            className="relative z-[1] h-full w-full object-cover"
+            className="relative z-[10] h-full w-full object-cover"
             onLoad={() => setIsReady(true)}
           />
         </>
@@ -2160,7 +2411,7 @@ function VideoPost({
             position: 'absolute',
             bottom: '80px',
             right: '16px',
-            zIndex: 20,
+            zIndex: 30,
             background: 'rgba(0,0,0,0.4)',
             borderRadius: '50%',
             padding: '8px',
@@ -2173,7 +2424,7 @@ function VideoPost({
       {urlOk && !videoFailed && !hasUserInteracted && !isTouchDevice && (
         <button
           type="button"
-          className="absolute left-1/2 top-1/2 z-[12] -translate-x-1/2 -translate-y-1/2 rounded-full bg-black/45 px-3 py-2 text-[12px] font-bold text-white shadow-sm backdrop-blur-md touch-manipulation"
+          className="absolute left-1/2 top-1/2 z-[30] -translate-x-1/2 -translate-y-1/2 rounded-full bg-black/70 px-3 py-2 text-[12px] font-bold text-white shadow-sm touch-manipulation"
           aria-label="Tap for sound"
           onClick={(e) => {
             e.stopPropagation();
@@ -2192,12 +2443,12 @@ function VideoPost({
         </button>
       )}
 
-      {/* Overlays */}
-      <div className="absolute inset-0 bg-gradient-to-b from-black/40 via-transparent to-black/60 pointer-events-none" />
+      {/* Overlays — above video (z-10), below controls (z-30) */}
+      <div className="pointer-events-none absolute inset-0 z-[5] bg-gradient-to-b from-black/40 via-transparent to-black/60" />
 
       {/* LIVE Badge */}
       {video.isLive && (
-        <div className="absolute top-20 left-6 z-10 flex flex-col gap-1">
+        <div className="absolute top-20 left-6 z-[30] flex flex-col gap-1">
           <div className="flex items-center gap-2 bg-pink-600 px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-widest text-white w-fit">
             <div className="w-1.5 h-1.5 bg-white rounded-full animate-pulse" />
             LIVE
@@ -2207,7 +2458,7 @@ function VideoPost({
       )}
 
       {/* Right Action Bar */}
-      <div className="absolute right-4 top-1/2 -translate-y-1/2 flex flex-col items-center gap-6 z-10">
+      <div className="absolute right-4 top-1/2 z-[30] flex -translate-y-1/2 flex-col items-center gap-6">
         <ActionButton 
           icon={<Heart className={cn("transition-all duration-300", isLiked ? "text-red-500 fill-red-500 scale-125" : "text-white")} size={30} />} 
           label={video.likes || 0}
@@ -2245,17 +2496,19 @@ function VideoPost({
             label="Tip"
             onClick={(e) => {
               e.stopPropagation();
-              void handleSendTip();
+              setTipPickerOpen(true);
             }}
           />
         )}
-        {!monetizationUnlocked && !isOwner && (
-          <div className="flex flex-col items-center gap-1 max-w-[72px]">
-            <div className="w-12 h-12 rounded-full bg-black/50 border border-white/20 flex items-center justify-center">
-              <Lock className="text-white/70" size={22} />
-            </div>
-            <span className="text-[9px] text-white/60 text-center font-bold leading-tight">Locked</span>
-          </div>
+        {!postBoosted && monetizationReady && !isOwner && (
+          <ActionButton
+            icon={<Sparkles className="text-amber-300/90" size={28} />}
+            label="Boost tips"
+            onClick={(e) => {
+              e.stopPropagation();
+              navigate(user ? '/profile' : '/login');
+            }}
+          />
         )}
         <ActionButton 
           icon={<Camera className="text-white" size={30} />} 
@@ -2264,10 +2517,10 @@ function VideoPost({
       </div>
 
       {/* Bottom Content Overlay */}
-      <div className="absolute bottom-12 sm:bottom-24 left-6 right-20 z-10">
+      <div className="absolute bottom-12 left-6 right-20 z-[30] sm:bottom-24">
         <div className="flex flex-col gap-3">
           {monetizationUnlocked && monetization && (
-            <div className="rounded-xl border border-emerald-500/30 bg-black/50 px-3 py-2 backdrop-blur-md max-w-sm space-y-1.5">
+            <div className="max-w-sm space-y-1.5 rounded-xl border border-emerald-500/30 bg-black/70 px-3 py-2">
               <p className="text-emerald-300 text-[10px] font-black uppercase tracking-wider">Earnings (boost cap)</p>
               <div className="h-2 w-full rounded-full bg-white/10 overflow-hidden">
                 <div
@@ -2308,7 +2561,7 @@ function VideoPost({
             ))}
           </div>
 
-          <div className="flex items-center gap-2 bg-white/5 backdrop-blur-md w-fit px-3 py-1.5 rounded-full border border-white/10">
+          <div className="flex w-fit items-center gap-2 rounded-full border border-white/10 bg-black/50 px-3 py-1.5">
             <Music size={12} className="text-white animate-spin-slow" />
               <span className="text-white text-[10px] font-bold">
                 {video.sound?.title || 'Original Audio'}
@@ -2319,7 +2572,7 @@ function VideoPost({
 
       {/* Timed monetization promo (locked reels only; mutually exclusive with earnings card above) */}
       <AnimatePresence>
-        {monetizationPromoVisible && !monetizationUnlocked && urlOk && !videoFailed && (
+        {monetizationPromoVisible && !postBoosted && urlOk && !videoFailed && (
           <motion.button
             key={`monetization-promo-${String(video?.id ?? '')}`}
             type="button"
@@ -2333,15 +2586,15 @@ function VideoPost({
               navigate(user ? '/profile' : '/login');
             }}
             className={cn(
-              'absolute left-1/2 z-[25] max-w-sm -translate-x-1/2 pointer-events-auto cursor-pointer select-none',
+              'pointer-events-auto absolute left-1/2 z-[30] max-w-sm -translate-x-1/2 cursor-pointer select-none',
               'bottom-[6.75rem] sm:bottom-[8.25rem]',
-              'rounded-xl border border-[#D97706] bg-black px-3.5 py-2.5 text-left shadow-lg shadow-black/40',
-              'backdrop-blur-sm transition-transform active:scale-[0.99] hover:brightness-110'
+              'rounded-xl border border-[#D97706] bg-black/90 px-3.5 py-2.5 text-left shadow-lg shadow-black/40',
+              'transition-transform active:scale-[0.99] hover:brightness-110'
             )}
             aria-label="Open profile to boost and earn"
           >
-            <p className="text-white text-xs font-black tracking-tight">🔒 Monetization locked</p>
-            <p className="text-gray-300 text-[11px] font-medium mt-0.5">🚀 Boost to earn</p>
+            <p className="text-white text-xs font-black tracking-tight">Boost to receive tips</p>
+            <p className="text-gray-300 text-[11px] font-medium mt-0.5">Boost this post to unlock gifts & tips</p>
           </motion.button>
         )}
       </AnimatePresence>
@@ -2349,7 +2602,7 @@ function VideoPost({
       {/* Tablet Gift Selection Row */}
       <div
         id="gift-selection-row"
-        className="hidden lg:flex absolute bottom-6 left-6 right-6 min-h-16 bg-black/40 backdrop-blur-xl border border-white/10 rounded-2xl items-center justify-between px-6 py-2 z-10"
+        className="hidden lg:flex absolute bottom-6 left-6 right-6 z-[30] min-h-16 items-center justify-between rounded-2xl border border-white/10 bg-black/75 px-6 py-2"
       >
         {canGiftOrTip ? (
           <>
@@ -2369,7 +2622,9 @@ function VideoPost({
                 </button>
               ))}
               <div className="flex flex-col items-center gap-1">
-                <span className="text-[10px] font-black text-white/40 uppercase tracking-widest">Tip {TIP_COINS}c</span>
+                <span className="text-[10px] font-black text-white/40 uppercase tracking-widest">
+                  Tip {MONETIZATION_TIP_AMOUNTS[0]}–{MONETIZATION_TIP_AMOUNTS[MONETIZATION_TIP_AMOUNTS.length - 1]}c
+                </span>
               </div>
             </div>
             <div className="flex items-center gap-4 shrink-0">
@@ -2393,11 +2648,15 @@ function VideoPost({
             <span>
               {isOwner
                 ? 'Boost from your profile to unlock gifts & tips.'
-                : '🔒 Monetization locked — creator must boost to enable gifts.'}
+                : !postBoosted
+                  ? 'Boost to receive tips — the creator can boost this post from their profile.'
+                  : 'Sign in to send gifts & tips.'}
             </span>
           </div>
         )}
       </div>
+
+      <TipSuccessOverlay flash={tipFlash} className="z-[30]" />
 
       {/* Floating Hearts Overlay */}
       <div className="absolute bottom-48 right-12 pointer-events-none z-[90]">
@@ -2422,6 +2681,16 @@ function VideoPost({
         </AnimatePresence>
       </div>
 
+      <MonetizationTipPicker
+        open={tipPickerOpen}
+        onClose={() => setTipPickerOpen(false)}
+        balanceCoins={profile?.coins != null ? Number(profile.coins) : undefined}
+        onPick={(amount) => {
+          setTipPickerOpen(false);
+          void handleSendTip(amount);
+        }}
+      />
+
       <ShareModal 
         isOpen={isShareModalOpen} 
         onClose={() => setIsShareModalOpen(false)}
@@ -2430,6 +2699,26 @@ function VideoPost({
           setIsStoryEditorOpen(true);
         }}
         postUrl={`${window.location.origin}/reels?video=${video.id}`}
+        onShareRecorded={
+          user?.id && video?.id != null
+            ? () => {
+                if (import.meta.env.DEV) {
+                  console.log('[ReelsPage][userBehavior] calling trackUserBehavior', {
+                    action: 'share',
+                    userId: user.id,
+                    targetId: String(video.id),
+                  });
+                }
+                void trackUserBehavior({
+                  userId: user.id,
+                  actionType: 'share',
+                  targetType: 'post',
+                  targetId: String(video.id),
+                  category: String((video as { category?: string })?.category || 'reel'),
+                });
+              }
+            : undefined
+        }
       />
 
       <StoryEditor 
@@ -2683,6 +2972,22 @@ function CommentsSection({
       // Deterministic sync with persisted counts.
       if (postId) {
         await onRefreshPostCounts(postId);
+      }
+      if (inserted && !String(inserted.id).startsWith('temp-')) {
+        if (import.meta.env.DEV) {
+          console.log('[ReelsPage][userBehavior] calling trackUserBehavior', {
+            action: 'comment',
+            userId,
+            targetId: postId,
+          });
+        }
+        void trackUserBehavior({
+          userId,
+          actionType: 'comment',
+          targetType: 'post',
+          targetId: postId,
+          category: String((video as { category?: string })?.category || 'reel'),
+        });
       }
     } catch (err) {
       console.error('[CommentError]', err);

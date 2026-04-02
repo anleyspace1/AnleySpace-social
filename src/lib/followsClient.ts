@@ -92,6 +92,13 @@ export async function persistFollowEdge(opts: {
           console.log('REFERRAL TRIGGER: follow_3', followerId);
           await rewardInviter(followerId, 'follow_3', 10);
         }
+        if (import.meta.env.DEV) {
+          console.log('[followsClient][userBehavior] calling trackUserBehavior', {
+            action: 'follow',
+            userId: followerId,
+            targetId: followingId,
+          });
+        }
         await trackUserBehavior({
           userId: followerId,
           actionType: 'follow',

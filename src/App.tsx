@@ -398,8 +398,9 @@ export default function App() {
 function AppContent() {
   const location = useLocation();
   const path = normalizeAppPathname(location.pathname);
-  const isReels = path === '/reels';
   const isCreateReel = path === '/reels/create';
+  /** `/reels` and `/reels/:id` share the reels shell; `/reels/create` uses the create flow. */
+  const isReels = path.startsWith('/reels') && !isCreateReel;
   const isMessages = path === '/messages';
   const isGroupChat = /^\/groups\/[^/]+\/chat$/.test(path);
   const isGroupsPage = path === '/groups';

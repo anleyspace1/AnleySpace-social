@@ -5,6 +5,7 @@ import { apiUrl } from '../lib/apiOrigin';
 import { getBearerAuthHeaders } from '../lib/supabaseAuthHeaders';
 import { supabase } from '../lib/supabase';
 import { boostPostAction, BOOST_COST } from '../lib/boostPost';
+import { normalizePostRowIsFeatured } from '../lib/monetizationFeaturedUi';
 
 type WithdrawRequest = {
   id: string;
@@ -29,11 +30,66 @@ type ModerationUser = {
   is_banned: boolean | null;
 };
 
+type PostMonetizationRow = {
+  post_id: string;
+  creator_id: string;
+  tier: string;
+  price_coins: number;
+  expires_at: string;
+  boost_earnings_cents?: number;
+  max_boost_earnings_cents?: number;
+  organic_earnings_cents?: number;
+  created_at?: string;
+};
+
 type AdminPost = {
   id: string;
   user_id: string;
   content: string | null;
   created_at: string;
+  is_featured?: boolean;
+  post_monetization?: PostMonetizationRow | null;
+  monetizationActive?: boolean;
+  isBoostedOrMonetized?: boolean;
+  legacyAdminBoosts?: { count: number; totalAmount: number };
+};
+
+type GiftsOverview = {
+  totalGifts: number;
+  totalCoins: number;
+  totalCreatorCoins: number;
+  topReceivers: { user_id: string; username: string | null; total_coins: number }[];
+  recent: {
+    id: string;
+    post_id: string;
+    sender_id: string;
+    creator_id: string;
+    coins: number;
+    gift_type?: string | null;
+    created_at: string;
+  }[];
+};
+
+type RewardsClaimRow = {
+  id: string;
+  user_id: string;
+  points_snapshot: number;
+  reward_coins: number;
+  activity_percent: number;
+  month: string;
+  created_at: string;
+};
+
+type RewardsOverview = {
+  summary: { totalClaims: number; totalCoinsDistributed: number };
+  recentClaims: RewardsClaimRow[];
+  topUsersByPoints: {
+    user_id: string;
+    username: string | null;
+    points: number;
+    gift_points: number;
+    effective_points: number;
+  }[];
 };
 
 type ReportItem = {
@@ -79,6 +135,48 @@ type SuspiciousPost = {
 
 const ADMIN_EMAIL = 'anleyspace@gmail.com';
 
+function mergePostsWithMonetization(
+  posts: Array<{
+    id: string;
+    user_id: string;
+    content: string | null;
+    created_at: string;
+    is_featured?: unknown;
+  }>,
+  monRows: PostMonetizationRow[] | null | undefined,
+  boostRows: Array<{ post_id: string; boost_amount?: number | null }> | null | undefined
+): AdminPost[] {
+  const monByPost = new Map((monRows || []).map((m) => [m.post_id, m]));
+  const legacyByPost = new Map<string, { count: number; totalAmount: number }>();
+  for (const b of boostRows || []) {
+    const pid = String(b.post_id);
+    if (!legacyByPost.has(pid)) legacyByPost.set(pid, { count: 0, totalAmount: 0 });
+    const agg = legacyByPost.get(pid)!;
+    agg.count += 1;
+    agg.totalAmount += Number(b.boost_amount || 0);
+  }
+  const now = Date.now();
+  return posts.map((p) => {
+    const mon = monByPost.get(p.id) || null;
+    const exp = mon?.expires_at ? new Date(mon.expires_at).getTime() : 0;
+    const monetizationActive = !!(mon && exp > now);
+    const featured = normalizePostRowIsFeatured(p);
+    const isBoostedOrMonetized = featured || monetizationActive;
+    const legacy = legacyByPost.get(String(p.id)) || { count: 0, totalAmount: 0 };
+    return {
+      id: p.id,
+      user_id: p.user_id,
+      content: p.content,
+      created_at: p.created_at,
+      is_featured: featured,
+      post_monetization: mon,
+      monetizationActive,
+      isBoostedOrMonetized,
+      legacyAdminBoosts: legacy,
+    };
+  });
+}
+
 function statusBadgeClass(status: string): string {
   if (status === 'approved') {
     return 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300';
@@ -101,6 +199,10 @@ export default function AdminDashboardPage() {
   const [supportMessages, setSupportMessages] = useState<SupportMessage[]>([]);
   const [moderationUsers, setModerationUsers] = useState<ModerationUser[]>([]);
   const [adminPosts, setAdminPosts] = useState<AdminPost[]>([]);
+  const [adminPostsLoading, setAdminPostsLoading] = useState(false);
+  const [showBoostedOnly, setShowBoostedOnly] = useState(false);
+  const [giftsOverview, setGiftsOverview] = useState<GiftsOverview | null>(null);
+  const [rewardsOverview, setRewardsOverview] = useState<RewardsOverview | null>(null);
   const [reports, setReports] = useState<ReportItem[]>([]);
   const [ads, setAds] = useState<AdItem[]>([]);
   const [stats, setStats] = useState({
@@ -134,6 +236,11 @@ export default function AdminDashboardPage() {
   });
   const [loading, setLoading] = useState<boolean>(true);
   const [busyId, setBusyId] = useState<string | null>(null);
+
+  const displayAdminPosts = useMemo(() => {
+    if (!showBoostedOnly) return adminPosts;
+    return adminPosts.filter((p) => p.isBoostedOrMonetized === true);
+  }, [adminPosts, showBoostedOnly]);
 
   const withdrawStats = useMemo(() => {
     if (!requests) return null;
@@ -284,7 +391,7 @@ export default function AdminDashboardPage() {
 
         const { data: todayTx } = await supabase
           .from('transactions')
-          .select('amount, created_at, type')
+          .select('amount, created_at, type, target')
           .gte('created_at', today.toISOString())
           .eq('type', 'spend');
 
@@ -297,6 +404,25 @@ export default function AdminDashboardPage() {
           coins: todayRevenueCoins,
           usd: todayRevenueUSD,
         });
+
+        if (import.meta.env.DEV) {
+          const txs = (todayTx || []) as { amount?: number | null; target?: string | null }[];
+          const monetizationBoostToday = txs.filter((tx) => tx.target === 'monetization_boost');
+          const monetizationBoostCoinsToday = monetizationBoostToday.reduce(
+            (s, tx) => s + Number(tx.amount || 0),
+            0
+          );
+          console.log('[admin][dev] monetization revenue trace', {
+            source: 'fetchStats',
+            platformWalletCoins,
+            platformWalletReadError: pwErr?.message ?? null,
+            todaySpendRowCount: txs.length,
+            todayRevenueCoins,
+            monetizationBoostTxToday: monetizationBoostToday.length,
+            monetizationBoostCoinsToday,
+            sampleTodayTx: txs.slice(0, 8),
+          });
+        }
 
         const { data: payouts } = await supabase.from('creator_daily_view_earnings').select('coins');
         const totalPayouts = (payouts || []).reduce(
@@ -439,17 +565,121 @@ export default function AdminDashboardPage() {
     if (!isAdmin) return;
     if (!profile) return;
     void (async () => {
-      const { data, error } = await supabase
-        .from('posts')
-        .select('id, user_id, content, created_at')
-        .order('created_at', { ascending: false })
-        .limit(100);
-      if (error) {
-        console.error('ADMIN POSTS FETCH ERROR:', error);
-        setAdminPosts([]);
-        return;
+      setAdminPostsLoading(true);
+      try {
+        const headers = await getBearerAuthHeaders();
+        if (headers) {
+          const res = await fetch(apiUrl('/api/admin/monetization/posts'), { headers });
+          const j = (await res.json()) as { ok?: boolean; posts?: AdminPost[]; error?: string };
+          if (res.ok && j.ok && Array.isArray(j.posts)) {
+            setAdminPosts(j.posts);
+            return;
+          }
+          console.error('ADMIN MONETIZATION POSTS API:', j?.error || j);
+        }
+        const { data, error } = await supabase
+          .from('posts')
+          .select('id, user_id, content, created_at, is_featured')
+          .order('created_at', { ascending: false })
+          .limit(100);
+        if (error) {
+          console.error('ADMIN POSTS FETCH ERROR:', error);
+          setAdminPosts([]);
+          return;
+        }
+        const base = Array.isArray(data) ? data : [];
+        const ids = base.map((p: { id: string }) => p.id);
+        if (ids.length === 0) {
+          setAdminPosts([]);
+          return;
+        }
+        const [{ data: monRows, error: monErr }, { data: boostRows, error: boostErr }] = await Promise.all([
+          supabase.from('post_monetization').select('*').in('post_id', ids),
+          supabase.from('post_boosts').select('post_id, boost_amount').in('post_id', ids),
+        ]);
+        if (monErr) console.error('post_monetization:', monErr);
+        if (boostErr) console.error('post_boosts:', boostErr);
+        setAdminPosts(
+          mergePostsWithMonetization(
+            base as Array<{
+              id: string;
+              user_id: string;
+              content: string | null;
+              created_at: string;
+              is_featured?: unknown;
+            }>,
+            (monRows || []) as PostMonetizationRow[],
+            boostRows || []
+          )
+        );
+      } finally {
+        setAdminPostsLoading(false);
       }
-      setAdminPosts(Array.isArray(data) ? (data as AdminPost[]) : []);
+    })();
+  }, [isAdmin, profile]);
+
+  useEffect(() => {
+    if (!isAdmin) return;
+    if (!profile) return;
+    void (async () => {
+      try {
+        const headers = await getBearerAuthHeaders();
+        if (!headers) return;
+        const res = await fetch(apiUrl('/api/admin/monetization/gifts'), { headers });
+        const j = (await res.json()) as {
+          ok?: boolean;
+          totalGifts?: number;
+          totalCoins?: number;
+          totalCreatorCoins?: number;
+          topReceivers?: GiftsOverview['topReceivers'];
+          recent?: GiftsOverview['recent'];
+        };
+        if (res.ok && j.ok) {
+          setGiftsOverview({
+            totalGifts: Number(j.totalGifts) || 0,
+            totalCoins: Number(j.totalCoins) || 0,
+            totalCreatorCoins: Number(j.totalCreatorCoins) || 0,
+            topReceivers: Array.isArray(j.topReceivers) ? j.topReceivers : [],
+            recent: Array.isArray(j.recent) ? j.recent : [],
+          });
+        } else {
+          console.error('ADMIN GIFTS OVERVIEW:', j);
+        }
+      } catch (e) {
+        console.error('ADMIN GIFTS OVERVIEW', e);
+      }
+    })();
+  }, [isAdmin, profile]);
+
+  useEffect(() => {
+    if (!isAdmin) return;
+    if (!profile) return;
+    void (async () => {
+      try {
+        const headers = await getBearerAuthHeaders();
+        if (!headers) return;
+        const res = await fetch(apiUrl('/api/admin/rewards/overview'), { headers });
+        const j = (await res.json()) as {
+          ok?: boolean;
+          summary?: RewardsOverview['summary'];
+          recentClaims?: RewardsClaimRow[];
+          topUsersByPoints?: RewardsOverview['topUsersByPoints'];
+          error?: string;
+        };
+        if (res.ok && j.ok && j.summary) {
+          setRewardsOverview({
+            summary: j.summary,
+            recentClaims: Array.isArray(j.recentClaims) ? j.recentClaims : [],
+            topUsersByPoints: Array.isArray(j.topUsersByPoints) ? j.topUsersByPoints : [],
+          });
+        } else {
+          console.error('ADMIN REWARDS OVERVIEW:', j?.error || j);
+          setRewardsOverview(null);
+        }
+      } catch (e) {
+        console.error('ADMIN REWARDS OVERVIEW', e);
+        setRewardsOverview(null);
+      }
     })();
   }, [isAdmin, profile]);
 
@@ -842,6 +1072,12 @@ export default function AdminDashboardPage() {
 
         <div className="rounded-xl border border-white/10 bg-black/20 p-4">
           <h3 className="text-base font-bold mb-2">Top Posts</h3>
+          <p className="text-xs text-gray-400 mb-2">
+            &quot;Boost Post&quot; records paid ranking boosts in <span className="font-semibold text-gray-300">post_boosts</span>{' '}
+            (admin boost). User-facing &quot;boosted for tips&quot; on Home/Reels also uses{' '}
+            <span className="font-semibold text-gray-300">is_featured</span> and{' '}
+            <span className="font-semibold text-gray-300">post_monetization</span> — see Posts Moderation below.
+          </p>
           {stats.topPosts.length === 0 ? (
             <p className="text-sm text-gray-300">No top posts found</p>
           ) : (
@@ -965,6 +1201,158 @@ export default function AdminDashboardPage() {
               </div>
             ))}
           </div>
+        )}
+      </div>
+
+      <div className="mb-8 rounded-xl border border-fuchsia-500/25 bg-fuchsia-950/20 p-4">
+        <h2 className="text-lg font-bold mb-1">Gifts &amp; Tips Overview</h2>
+        <p className="text-xs text-gray-400 mb-4">
+          Aggregated from <span className="font-semibold text-gray-300">gift_transactions</span> (service role). Party-only RLS does not apply here.
+        </p>
+        {giftsOverview == null ? (
+          <p className="text-sm text-gray-400">Loading gifts summary…</p>
+        ) : (
+          <>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-6">
+              <div className="rounded-lg border border-white/10 bg-black/30 p-3">
+                <p className="text-xs text-gray-400">Total gift transactions</p>
+                <p className="text-2xl font-black">{giftsOverview.totalGifts.toLocaleString()}</p>
+              </div>
+              <div className="rounded-lg border border-white/10 bg-black/30 p-3">
+                <p className="text-xs text-gray-400">Total gift coins (face value)</p>
+                <p className="text-2xl font-black">{giftsOverview.totalCoins.toLocaleString()}</p>
+              </div>
+              <div className="rounded-lg border border-white/10 bg-black/30 p-3">
+                <p className="text-xs text-gray-400">Creator share (sum of creator_coins)</p>
+                <p className="text-2xl font-black">{giftsOverview.totalCreatorCoins.toLocaleString()}</p>
+              </div>
+            </div>
+            <div className="mb-6">
+              <h3 className="text-sm font-bold mb-2">Top receiving users</h3>
+              {giftsOverview.topReceivers.length === 0 ? (
+                <p className="text-sm text-gray-400">No gift data yet</p>
+              ) : (
+                <ul className="space-y-1 text-sm">
+                  {giftsOverview.topReceivers.map((t) => (
+                    <li key={t.user_id} className="flex justify-between gap-2 border-b border-white/5 py-1">
+                      <span className="text-gray-300 truncate">{t.username || t.user_id}</span>
+                      <span className="font-bold shrink-0">{t.total_coins.toLocaleString()} creator coins</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+            <div className="overflow-x-auto rounded-lg border border-white/10">
+              <table className="min-w-full text-sm">
+                <thead className="bg-white/5">
+                  <tr>
+                    <th className="text-left p-2 font-bold">created_at</th>
+                    <th className="text-left p-2 font-bold">post_id</th>
+                    <th className="text-left p-2 font-bold">creator_id</th>
+                    <th className="text-left p-2 font-bold">sender_id</th>
+                    <th className="text-left p-2 font-bold">coins</th>
+                    <th className="text-left p-2 font-bold">type</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {giftsOverview.recent.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="p-4 text-center text-gray-400">
+                        No recent gifts
+                      </td>
+                    </tr>
+                  ) : (
+                    giftsOverview.recent.map((g) => (
+                      <tr key={g.id} className="border-t border-white/10">
+                        <td className="p-2 whitespace-nowrap">{new Date(g.created_at).toLocaleString()}</td>
+                        <td className="p-2 font-mono text-xs">{g.post_id}</td>
+                        <td className="p-2 font-mono text-xs">{g.creator_id}</td>
+                        <td className="p-2 font-mono text-xs">{g.sender_id}</td>
+                        <td className="p-2 font-bold">{g.coins}</td>
+                        <td className="p-2">{g.gift_type || 'gift'}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+      </div>
+
+      <div className="mb-8 rounded-xl border border-teal-500/25 bg-teal-950/20 p-4">
+        <h2 className="text-lg font-bold mb-1">Rewards (Supabase)</h2>
+        <p className="text-xs text-gray-400 mb-4">
+          From <span className="font-semibold text-gray-300">rewards_claims</span>,{' '}
+          <span className="font-semibold text-gray-300">profiles</span> (points / gift_points). Requires migration
+          20260403120000.
+        </p>
+        {rewardsOverview == null ? (
+          <p className="text-sm text-gray-400">Loading rewards overview…</p>
+        ) : (
+          <>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-6">
+              <div className="rounded-lg border border-white/10 bg-black/30 p-3">
+                <p className="text-xs text-gray-400">Total claims</p>
+                <p className="text-2xl font-black">{rewardsOverview.summary.totalClaims.toLocaleString()}</p>
+              </div>
+              <div className="rounded-lg border border-white/10 bg-black/30 p-3">
+                <p className="text-xs text-gray-400">Total coins distributed (claims)</p>
+                <p className="text-2xl font-black">{rewardsOverview.summary.totalCoinsDistributed.toLocaleString()}</p>
+              </div>
+            </div>
+            <div className="mb-6">
+              <h3 className="text-sm font-bold mb-2">Top users by points (max of points / gift_points)</h3>
+              {rewardsOverview.topUsersByPoints.length === 0 ? (
+                <p className="text-sm text-gray-400">No profile data</p>
+              ) : (
+                <ul className="space-y-1 text-sm max-h-48 overflow-y-auto">
+                  {rewardsOverview.topUsersByPoints.map((u) => (
+                    <li key={u.user_id} className="flex justify-between gap-2 border-b border-white/5 py-1">
+                      <span className="text-gray-300 truncate">{u.username || u.user_id}</span>
+                      <span className="font-mono text-xs shrink-0">
+                        eff {u.effective_points.toLocaleString()} (p {u.points} / g {u.gift_points})
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+            <div className="overflow-x-auto rounded-lg border border-white/10">
+              <table className="min-w-full text-sm">
+                <thead className="bg-white/5">
+                  <tr>
+                    <th className="text-left p-2 font-bold">created_at</th>
+                    <th className="text-left p-2 font-bold">user_id</th>
+                    <th className="text-left p-2 font-bold">month</th>
+                    <th className="text-left p-2 font-bold">points_snapshot</th>
+                    <th className="text-left p-2 font-bold">reward_coins</th>
+                    <th className="text-left p-2 font-bold">activity %</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rewardsOverview.recentClaims.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="p-4 text-center text-gray-400">
+                        No claims yet
+                      </td>
+                    </tr>
+                  ) : (
+                    rewardsOverview.recentClaims.map((c) => (
+                      <tr key={c.id} className="border-t border-white/10">
+                        <td className="p-2 whitespace-nowrap">{new Date(c.created_at).toLocaleString()}</td>
+                        <td className="p-2 font-mono text-xs">{c.user_id}</td>
+                        <td className="p-2">{String(c.month).slice(0, 10)}</td>
+                        <td className="p-2">{c.points_snapshot}</td>
+                        <td className="p-2 font-bold">{c.reward_coins}</td>
+                        <td className="p-2">{Number(c.activity_percent).toFixed(1)}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </>
         )}
       </div>
 
@@ -1127,40 +1515,98 @@ export default function AdminDashboardPage() {
       </div>
 
       <div className="mt-8 overflow-x-auto rounded-xl border border-white/10 bg-black/20">
-        <div className="p-3 font-bold">Posts Moderation</div>
+        <div className="p-3 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <div className="font-bold">Posts Moderation</div>
+            <p className="text-xs text-gray-400 mt-1 max-w-2xl">
+              <span className="font-semibold text-gray-300">User monetization (Home/Reels):</span> boosted when{' '}
+              <code className="text-[11px]">is_featured</code> or active <code className="text-[11px]">post_monetization</code>{' '}
+              (expires in future). <span className="font-semibold text-gray-300">Admin boost (legacy):</span>{' '}
+              <code className="text-[11px]">post_boosts</code> from &quot;Boost Post&quot; above — separate system.
+            </p>
+          </div>
+          <label className="flex items-center gap-2 text-sm shrink-0 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={showBoostedOnly}
+              onChange={(e) => setShowBoostedOnly(e.target.checked)}
+              className="rounded border-white/20"
+            />
+            Only boosted / monetized
+          </label>
+        </div>
         <table className="min-w-full text-sm">
           <thead className="bg-white/5">
             <tr>
               <th className="text-left p-3 font-bold">post_id</th>
               <th className="text-left p-3 font-bold">user_id</th>
+              <th className="text-left p-3 font-bold">boosted</th>
+              <th className="text-left p-3 font-bold">user monetization</th>
+              <th className="text-left p-3 font-bold">admin boost (legacy)</th>
               <th className="text-left p-3 font-bold">content</th>
               <th className="text-left p-3 font-bold">created_at</th>
               <th className="text-left p-3 font-bold">actions</th>
             </tr>
           </thead>
           <tbody>
-            {adminPosts.length === 0 ? (
+            {adminPostsLoading ? (
               <tr>
-                <td colSpan={5} className="p-6 text-center text-gray-300">No posts found</td>
+                <td colSpan={8} className="p-6 text-center text-gray-300">Loading posts…</td>
+              </tr>
+            ) : displayAdminPosts.length === 0 ? (
+              <tr>
+                <td colSpan={8} className="p-6 text-center text-gray-300">
+                  {showBoostedOnly ? 'No boosted / monetized posts in this list' : 'No posts found'}
+                </td>
               </tr>
             ) : (
-              adminPosts.map((post) => (
-                <tr key={post.id} className="border-t border-white/10">
-                  <td className="p-3">{post.id}</td>
-                  <td className="p-3">{post.user_id}</td>
-                  <td className="p-3">{post.content || '-'}</td>
-                  <td className="p-3">{new Date(post.created_at).toLocaleString()}</td>
-                  <td className="p-3">
-                    <button
-                      type="button"
-                      onClick={() => void handleAdminDeletePost(post.id)}
-                      className="px-3 py-1.5 rounded-lg bg-red-600 text-white font-bold"
-                    >
-                      Delete Post
-                    </button>
-                  </td>
-                </tr>
-              ))
+              displayAdminPosts.map((post) => {
+                const boosted = post.isBoostedOrMonetized === true;
+                const mon = post.post_monetization;
+                const legacy = post.legacyAdminBoosts || { count: 0, totalAmount: 0 };
+                const monLabel =
+                  mon && post.monetizationActive
+                    ? `${mon.tier} · exp ${new Date(mon.expires_at).toLocaleDateString()}`
+                    : mon
+                      ? `${mon.tier} (expired)`
+                      : '—';
+                return (
+                  <tr key={post.id} className="border-t border-white/10">
+                    <td className="p-3 font-mono text-xs align-top">{post.id}</td>
+                    <td className="p-3 align-top">{post.user_id}</td>
+                    <td className="p-3 align-top">
+                      {boosted ? (
+                        <span className="inline-flex px-2 py-0.5 rounded-full text-xs font-bold bg-amber-500/25 text-amber-200 border border-amber-500/40">
+                          Boosted
+                        </span>
+                      ) : (
+                        <span className="text-gray-500">—</span>
+                      )}
+                    </td>
+                    <td className="p-3 text-xs align-top max-w-[14rem]">{monLabel}</td>
+                    <td className="p-3 text-xs align-top whitespace-nowrap">
+                      {legacy.count > 0 ? (
+                        <>
+                          {legacy.count}× · {legacy.totalAmount} coins
+                        </>
+                      ) : (
+                        '—'
+                      )}
+                    </td>
+                    <td className="p-3 align-top max-w-xs break-words">{post.content || '-'}</td>
+                    <td className="p-3 align-top whitespace-nowrap">{new Date(post.created_at).toLocaleString()}</td>
+                    <td className="p-3 align-top">
+                      <button
+                        type="button"
+                        onClick={() => void handleAdminDeletePost(post.id)}
+                        className="px-3 py-1.5 rounded-lg bg-red-600 text-white font-bold"
+                      >
+                        Delete Post
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })
             )}
           </tbody>
         </table>

@@ -17,16 +17,15 @@ import {
   Banknote,
   Smartphone
 } from 'lucide-react';
-import { MOCK_USER } from '../constants';
 import { cn } from '../lib/utils';
 import { Transaction } from '../types';
 import { useSearchParams } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { apiUrl } from '../lib/apiOrigin';
 import { BuyCoinsMenu } from '../components/BuyCoinsMenu';
 import { useBuyCoins } from '../hooks/useBuyCoins';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { deductCoins } from '../lib/coinsWallet';
+import { subscribeMonetizationRefresh } from '../lib/monetizationRealtime';
 
 const MIN_WITHDRAW = 1000;
 const COIN_TO_USD_RATE = 0.01;
@@ -129,7 +128,7 @@ function groupTransactionsByDay(
 export default function WalletPage() {
   const { user, profile, refreshProfile } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [balance, setBalance] = useState(MOCK_USER.coins);
+  const [balance, setBalance] = useState(0);
   const [usdBalance, setUsdBalance] = useState(50.00);
   const [txList, setTxList] = useState<Array<{ tx: Transaction; sortKey: number }>>([]);
   const [breakdown, setBreakdown] = useState({
@@ -142,59 +141,214 @@ export default function WalletPage() {
     { id: string; coins: number; status: string; created_at: string }[]
   >([]);
   const fetchWalletData = useCallback(async () => {
-    if (!user) return;
+    if (!user || !isSupabaseConfigured) return;
     try {
-      const [userRes, txRes] = await Promise.all([
-        fetch(apiUrl(`/api/user/${user.id}`)),
-        fetch(apiUrl(`/api/transactions/${user.id}`)),
-      ]);
-      const userData = await userRes.json();
-      const txData = await txRes.json();
-      const rawRows = Array.isArray(txData) ? txData : [];
-      const { spent, purchased } = aggregateWalletTransactions(rawRows);
+      const safeList = async <T,>(label: string, promise: PromiseLike<{ data: T[] | null; error: { message?: string } | null }>): Promise<T[]> => {
+        const { data, error } = await promise;
+        if (error) {
+          console.warn(`[WalletPage] ${label} query failed`, error.message || error);
+          return [];
+        }
+        return (data || []) as T[];
+      };
+      const safeSingle = async <T,>(label: string, promise: PromiseLike<{ data: T | null; error: { message?: string } | null }>): Promise<T | null> => {
+        const { data, error } = await promise;
+        if (error) {
+          console.warn(`[WalletPage] ${label} query failed`, error.message || error);
+          return null;
+        }
+        return data as T | null;
+      };
 
-      if (typeof userData?.coins === 'number' && Number.isFinite(userData.coins)) {
-        setBalance(userData.coins);
-      } else if (profile?.coins != null) {
-        setBalance(Number(profile.coins));
-      }
-      setTxList(
-        rawRows.map((tx: { id?: string; type?: string; amount?: number; description?: string; timestamp?: string }) => {
-          const ts = tx.timestamp ? new Date(tx.timestamp).getTime() : Date.now();
-          const rawType = String(tx.type ?? '').toLowerCase();
-          let mappedType: Transaction['type'] = 'send';
-          if (rawType === 'game_win' || rawType === 'earn' || rawType === 'gift') {
-            mappedType = 'earn';
-          } else if (
-            rawType === 'deposit' ||
-            rawType === 'refund' ||
-            rawType === 'credit' ||
-            rawType === 'receive'
-          ) {
-            mappedType = 'receive';
-          } else if (rawType === 'withdraw') {
-            mappedType = 'withdraw';
-          } else if (rawType === 'exchange') {
-            mappedType = 'exchange';
-          } else if (rawType === 'spend') {
-            mappedType = 'spend';
-          }
-          const mapped: Transaction = {
-            id: String(tx.id ?? ''),
-            type: mappedType,
-            amount: Math.abs(Number(tx.amount) || 0),
-            description: String(tx.description ?? ''),
-            timestamp: tx.timestamp ? new Date(tx.timestamp).toLocaleString() : '',
-            status: 'completed',
-          };
-          return { tx: mapped, sortKey: ts };
-        })
+      const [
+        profileRow,
+        referralRows,
+        viewRows,
+        giftsSentRows,
+        giftsReceivedRows,
+        boostRows,
+        walletEventRows,
+        stripeRows,
+        withdrawRows,
+      ] = await Promise.all([
+        safeSingle<{ coins?: number }>('profiles', supabase.from('profiles').select('coins').eq('id', user.id).maybeSingle()),
+        safeList<{ coins?: number | null }>('referral_rewards', supabase.from('referral_rewards').select('coins').eq('inviter_id', user.id)),
+        safeList<{ coins?: number | null }>('creator_daily_view_earnings', supabase.from('creator_daily_view_earnings').select('coins').eq('user_id', user.id)),
+        safeList<{ id: string; coins?: number | null; gift_type?: string | null; created_at?: string | null }>(
+          'gift_transactions_sent',
+          supabase.from('gift_transactions').select('id, coins, gift_type, creator_id, sender_id, created_at').eq('sender_id', user.id)
+        ),
+        safeList<{ id: string; coins?: number | null; gift_type?: string | null; created_at?: string | null }>(
+          'gift_transactions_received',
+          supabase.from('gift_transactions').select('id, coins, gift_type, creator_id, sender_id, created_at').eq('creator_id', user.id)
+        ),
+        safeList<{ id: string; boost_amount?: number | null; created_at?: string | null }>(
+          'post_boosts',
+          supabase.from('post_boosts').select('id, boost_amount, created_at').eq('user_id', user.id)
+        ),
+        safeList<{ id: string; event_type?: string | null; reason?: string | null; amount?: number | null; created_at?: string | null }>(
+          'wallet_events',
+          supabase.from('wallet_events').select('id, event_type, reason, amount, created_at').eq('user_id', user.id)
+        ),
+        safeList<{ stripe_session_id?: string | null; coin_amount?: number | null; created_at?: string | null }>(
+          'stripe_checkout_credits_applied',
+          supabase.from('stripe_checkout_credits_applied').select('stripe_session_id, coin_amount, created_at').eq('user_id', user.id)
+        ),
+        safeList<{ id: string; coins?: number | null; status?: string | null; created_at?: string | null }>(
+          'withdraw_requests',
+          supabase.from('withdraw_requests').select('id, coins, status, created_at').eq('user_id', user.id)
+        ),
+      ]);
+
+      const profileCoins = Number(profileRow?.coins ?? profile?.coins ?? 0) || 0;
+      setBalance(profileCoins);
+
+      const earnedFromReferrals = referralRows.reduce(
+        (s, r: { coins?: number | null }) => s + Number(r?.coins || 0),
+        0
       );
-      setBreakdown((prev) => ({
-        ...prev,
-        purchasedCoins: purchased,
-        spentCoins: spent,
-      }));
+      const earnedFromViews = viewRows.reduce(
+        (s, r: { coins?: number | null }) => s + Number(r?.coins || 0),
+        0
+      );
+      const purchasedCoins = stripeRows.reduce(
+        (s, r: { coin_amount?: number | null }) => s + Number(r?.coin_amount || 0),
+        0
+      );
+      const spentOnGifts = giftsSentRows.reduce(
+        (s, r: { coins?: number | null }) => s + Number(r?.coins || 0),
+        0
+      );
+      const spentOnBoosts = boostRows.reduce(
+        (s, r: { boost_amount?: number | null }) => s + Number(r?.boost_amount || 0),
+        0
+      );
+      const spentFromWalletEvents = walletEventRows.reduce(
+        (s, r: { amount?: number | null; event_type?: string | null }) => {
+          const t = String(r?.event_type || '').toLowerCase();
+          const amt = Number(r?.amount || 0);
+          // Avoid double counting boosts: boost spend is already captured by post_boosts.
+          return t.includes('spend') && !t.includes('boost') ? s + Math.abs(amt) : s;
+        },
+        0
+      );
+      const spentCoins = spentOnGifts + spentOnBoosts + spentFromWalletEvents;
+
+      setBreakdown({
+        earnedFromViews,
+        earnedFromReferrals,
+        purchasedCoins,
+        spentCoins,
+      });
+
+      const txRows: Array<{ tx: Transaction; sortKey: number }> = [];
+      for (const r of stripeRows) {
+        const ts = new Date(String(r.created_at || Date.now())).getTime();
+        txRows.push({
+          sortKey: ts,
+          tx: {
+            id: `stripe-${String(r.stripe_session_id || ts)}`,
+            type: 'receive',
+            amount: Math.abs(Number(r.coin_amount || 0)),
+            description: 'Coin purchase',
+            timestamp: new Date(ts).toLocaleString(),
+            status: 'completed',
+          },
+        });
+      }
+      for (const r of giftsSentRows) {
+        const ts = new Date(String(r.created_at || Date.now())).getTime();
+        txRows.push({
+          sortKey: ts,
+          tx: {
+            id: `gift-sent-${String(r.id)}`,
+            type: 'send',
+            amount: Math.abs(Number(r.coins || 0)),
+            description: `Gift sent (${String(r.gift_type || 'gift')})`,
+            timestamp: new Date(ts).toLocaleString(),
+            status: 'completed',
+          },
+        });
+      }
+      for (const r of giftsReceivedRows) {
+        const ts = new Date(String(r.created_at || Date.now())).getTime();
+        txRows.push({
+          sortKey: ts,
+          tx: {
+            id: `gift-received-${String(r.id)}`,
+            type: 'receive',
+            amount: Math.abs(Number(r.coins || 0)),
+            description: `Gift received (${String(r.gift_type || 'gift')})`,
+            timestamp: new Date(ts).toLocaleString(),
+            status: 'completed',
+          },
+        });
+      }
+      for (const r of boostRows) {
+        const ts = new Date(String(r.created_at || Date.now())).getTime();
+        txRows.push({
+          sortKey: ts,
+          tx: {
+            id: `boost-${String(r.id)}`,
+            type: 'spend',
+            amount: Math.abs(Number(r.boost_amount || 0)),
+            description: 'Monetization boost',
+            timestamp: new Date(ts).toLocaleString(),
+            status: 'completed',
+          },
+        });
+      }
+      for (const r of walletEventRows) {
+        const ts = new Date(String(r.created_at || Date.now())).getTime();
+        const eventType = String(r.event_type || '').toLowerCase();
+        if (eventType.includes('boost')) continue;
+        const amount = Math.abs(Number(r.amount || 0));
+        const txType: Transaction['type'] =
+          eventType.includes('boost') || eventType.includes('spend') || eventType.includes('deduct')
+            ? 'spend'
+            : 'receive';
+        txRows.push({
+          sortKey: ts,
+          tx: {
+            id: `wallet-event-${String(r.id)}`,
+            type: txType,
+            amount,
+            description: String(r.reason || r.event_type || 'Wallet event'),
+            timestamp: new Date(ts).toLocaleString(),
+            status: 'completed',
+          },
+        });
+      }
+      for (const r of withdrawRows) {
+        const ts = new Date(String(r.created_at || Date.now())).getTime();
+        const status = String(r.status || 'pending').toLowerCase();
+        txRows.push({
+          sortKey: ts,
+          tx: {
+            id: `withdraw-${String(r.id)}`,
+            type: 'withdraw',
+            amount: Math.abs(Number(r.coins || 0)),
+            description: 'Withdrawal request',
+            timestamp: new Date(ts).toLocaleString(),
+            status: status === 'approved' ? 'completed' : status,
+          },
+        });
+      }
+      txRows.sort((a, b) => b.sortKey - a.sortKey);
+      const deduped = new Map<string, { tx: Transaction; sortKey: number }>();
+      for (const row of txRows) {
+        const key = `${row.tx.id}:${row.sortKey}`;
+        if (!deduped.has(key)) deduped.set(key, row);
+      }
+      setTxList(Array.from(deduped.values()).sort((a, b) => b.sortKey - a.sortKey));
+      setWithdrawHistory(
+        withdrawRows.map((row: any) => ({
+          id: String(row.id),
+          coins: Number(row.coins) || 0,
+          status: String(row.status || 'pending'),
+          created_at: String(row.created_at || ''),
+        }))
+      );
     } catch (err) {
       console.error('Error fetching wallet data:', err);
     }
@@ -226,54 +380,27 @@ export default function WalletPage() {
   }, [searchParams, user?.id, refreshProfile, fetchWalletData, setSearchParams]);
 
   useEffect(() => {
-    const loadBreakdown = async () => {
-      if (!user?.id || !isSupabaseConfigured) return;
-      try {
-        const [refRes, viewRes] = await Promise.all([
-          supabase.from('referral_rewards').select('coins').eq('inviter_id', user.id),
-          supabase.from('creator_daily_view_earnings').select('coins').eq('user_id', user.id),
-        ]);
-        const refSum = (refRes.data || []).reduce(
-          (s, r: { coins?: number | null }) => s + Number(r?.coins || 0),
-          0
-        );
-        const viewSum = (viewRes.data || []).reduce(
-          (s, r: { coins?: number | null }) => s + Number(r?.coins || 0),
-          0
-        );
-        setBreakdown((prev) => ({
-          ...prev,
-          earnedFromReferrals: refSum,
-          earnedFromViews: viewSum,
-        }));
-      } catch {
-        /* keep defaults */
-      }
+    if (!user?.id || !isSupabaseConfigured) return () => {};
+    const channel = supabase
+      .channel(`wallet-live-${user.id}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'profiles', filter: `id=eq.${user.id}` }, () => void fetchWalletData())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'withdraw_requests', filter: `user_id=eq.${user.id}` }, () => void fetchWalletData())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'wallet_events', filter: `user_id=eq.${user.id}` }, () => void fetchWalletData())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'post_boosts', filter: `user_id=eq.${user.id}` }, () => void fetchWalletData())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'stripe_checkout_credits_applied', filter: `user_id=eq.${user.id}` }, () => void fetchWalletData())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'gift_transactions' }, (payload) => {
+        const n = (payload.new ?? payload.old) as { sender_id?: string; creator_id?: string } | null;
+        if (n?.sender_id === user.id || n?.creator_id === user.id) void fetchWalletData();
+      })
+      .subscribe();
+    return () => {
+      void supabase.removeChannel(channel);
     };
-    void loadBreakdown();
-  }, [user?.id]);
+  }, [fetchWalletData, user?.id]);
 
   useEffect(() => {
-    const fetchWithdrawHistory = async () => {
-      if (!user) return;
-      const { data, error } = await supabase
-        .from('withdraw_requests')
-        .select('*')
-        .eq('user_id', user.id)
-        .order('created_at', { ascending: false });
-      console.log('WITHDRAW HISTORY:', data, error);
-      if (error) return;
-      setWithdrawHistory(
-        (Array.isArray(data) ? data : []).map((row: any) => ({
-          id: String(row.id),
-          coins: Number(row.coins) || 0,
-          status: String(row.status || 'pending'),
-          created_at: String(row.created_at || ''),
-        }))
-      );
-    };
-    void fetchWithdrawHistory();
-  }, [user?.id]);
+    return subscribeMonetizationRefresh(() => void fetchWalletData());
+  }, [fetchWalletData]);
 
   const { buyCoinsMenuOpen, toggleBuyCoinsMenu, closeBuyCoinsMenu } = useBuyCoins();
   const [isWithdrawModalOpen, setIsWithdrawModalOpen] = useState(false);

@@ -29,7 +29,10 @@ import {
   ListTodo,
   GripVertical,
   Play,
-  Upload
+  Upload,
+  Gift,
+  Sparkles,
+  Coins
 } from 'lucide-react';
 import { useNavigate, useSearchParams, useLocation } from 'react-router-dom';
 import { cn } from '../lib/utils';
@@ -58,6 +61,13 @@ import { rewardInviter } from '../lib/referralRewards';
 import { getUserTopInterest, trackUserBehavior } from '../lib/userBehavior';
 import { incrementCoins } from '../lib/coinsWallet';
 import { startCreatorValidViewWatch, stopCreatorValidViewWatch } from '../lib/creatorValidViews';
+import { fetchMonetizationPost, sendMonetizationGift, type MonetizationPostStatus } from '../lib/monetization';
+import { isPostBoostedForTips, normalizePostRowIsFeatured } from '../lib/monetizationFeaturedUi';
+import { subscribeMonetizationRefresh, subscribePostMonetization } from '../lib/monetizationRealtime';
+import { MonetizationTipPicker } from '../components/MonetizationTipPicker';
+import { TipSuccessOverlay, type TipSuccessFlash } from '../components/TipSuccessOverlay';
+import { AdCard } from '../components/AdCard';
+import { getActiveAds, type ActiveAdRow } from '../lib/activeAds';
 
 /** Home feed: white cards on #F5F6FA (see App layout when path is `/`). */
 const homeCard =
@@ -100,7 +110,9 @@ function renderTextWithHashtags(
           type="button"
           onClick={(e) => {
             e.stopPropagation();
-            console.log('[PostItem] hashtag click', tag);
+            if (import.meta.env.DEV) {
+              console.log('[PostItem] hashtag click', tag);
+            }
             navigate(`/hashtag/${encodeURIComponent(tag)}`);
           }}
           className="inline p-0 m-0 border-0 bg-transparent cursor-pointer hover:underline font-inherit text-inherit align-baseline"
@@ -276,8 +288,8 @@ function Stories() {
     if (isUploadingStory) return;
     try {
       const data = await fetchActiveStories();
-      console.log('Fetched stories:', data);
-      if (import.meta.env.PROD) {
+      if (import.meta.env.DEV) {
+        console.log('Fetched stories:', data);
         console.log('Fetched stories (PROD):', data);
       }
       setRealStories((prev) => {
@@ -441,8 +453,8 @@ function Stories() {
     if (!file.type.startsWith('image/') && !file.type.startsWith('video/')) {
       throw new Error('Invalid story file type. Please choose an image or video.');
     }
-    console.log('[StoryUpload] file:', file);
-    if (import.meta.env.PROD) {
+    if (import.meta.env.DEV) {
+      console.log('[StoryUpload] file:', file);
       console.log('ENV CHECK:', import.meta.env.VITE_SUPABASE_URL);
     }
 
@@ -470,12 +482,14 @@ function Stories() {
       form.append('username', username);
       form.append('avatar', avatar || '');
 
-      console.log('[StoryUpload] calling API /api/stories (multipart)', {
-        name: file.name,
-        type: file.type,
-        size: file.size,
-        user_id: user.id,
-      });
+      if (import.meta.env.DEV) {
+        console.log('[StoryUpload] calling API /api/stories (multipart)', {
+          name: file.name,
+          type: file.type,
+          size: file.size,
+          user_id: user.id,
+        });
+      }
 
       const response = await fetchFeedApiSafe(apiUrl('/api/stories'), {
         method: 'POST',
@@ -485,11 +499,13 @@ function Stories() {
       let insertedStory: any = null;
       if (responseLooksLikeJsonApi(response)) {
         const body = await response!.json().catch(() => null);
-        console.log('[StoryUpload] /api/stories response', {
-          status: response!.status,
-          ok: response!.ok,
-          body,
-        });
+        if (import.meta.env.DEV) {
+          console.log('[StoryUpload] /api/stories response', {
+            status: response!.status,
+            ok: response!.ok,
+            body,
+          });
+        }
         if (!response!.ok) {
           const serverMessage =
             (body && typeof body === 'object' && 'error' in body && typeof (body as any).error === 'string'
@@ -531,35 +547,37 @@ function Stories() {
         if (fallbackErr) throw fallbackErr;
         insertedStory = fallbackStory;
         console.warn('[StoryUpload] API unavailable; posted story via Supabase fallback.');
-        console.log('STORY TIME CHECK:', {
-          frontend_now: new Date().toISOString(),
-          created_at: nowIso,
-          expires_at: expiresAtIso,
-        });
+        if (import.meta.env.DEV) {
+          console.log('STORY TIME CHECK:', {
+            frontend_now: new Date().toISOString(),
+            created_at: nowIso,
+            expires_at: expiresAtIso,
+          });
+        }
       }
 
-      console.log('Inserted story:', insertedStory);
-      if (import.meta.env.PROD) {
+      if (import.meta.env.DEV) {
+        console.log('Inserted story:', insertedStory);
         console.log('Inserted story (PROD):', insertedStory);
       }
       if (insertedStory) {
-        console.log('STORY TIME CHECK:', {
-          frontend_now: new Date().toISOString(),
-          created_at: insertedStory.created_at,
-          expires_at: insertedStory.expires_at,
-        });
-        if (import.meta.env.PROD) {
+        if (import.meta.env.DEV) {
+          console.log('STORY TIME CHECK:', {
+            frontend_now: new Date().toISOString(),
+            created_at: insertedStory.created_at,
+            expires_at: insertedStory.expires_at,
+          });
           console.log('STORY TIME CHECK (PROD):', {
             frontend_now: new Date().toISOString(),
             created_at: insertedStory.created_at,
             expires_at: insertedStory.expires_at,
           });
+          console.log('STORY USER CHECK:', {
+            session_user_id: user.id,
+            inserted_user_id: insertedStory.user_id,
+            matches: String(insertedStory.user_id || '') === String(user.id),
+          });
         }
-        console.log('STORY USER CHECK:', {
-          session_user_id: user.id,
-          inserted_user_id: insertedStory.user_id,
-          matches: String(insertedStory.user_id || '') === String(user.id),
-        });
       }
 
       if (insertedStory?.id && insertedStory?.media_url) {
@@ -829,7 +847,9 @@ function Stories() {
 
         {/* Story Items */}
         {displayStories.map((story) => {
-          console.log('Story:', story);
+          if (import.meta.env.DEV) {
+            console.log('Story:', story);
+          }
           const userKey = extractUserIdOrUsername(story);
           const showRing = hasActiveStoryForUser(userKey);
           const isSeen = story.user_id && seenUsers.includes(String(story.user_id));
@@ -1183,7 +1203,9 @@ function CreatePostModal({
       }
 
       onClose();
-      console.log('REFERRAL TRIGGER: first_post', user.id);
+      if (import.meta.env.DEV) {
+        console.log('REFERRAL TRIGGER: first_post', user.id);
+      }
       void rewardInviter(user.id, 'first_post', 15);
       onPostCreated?.();
     } catch (err: any) {
@@ -1406,22 +1428,7 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
   const { user } = useAuth();
   const navigate = useNavigate();
   const [posts, setPosts] = useState<any[]>([]);
-  const [ads, setAds] = useState<
-    Array<{
-      id: string;
-      title?: string | null;
-      image_url: string;
-      link_url: string;
-      clicks?: number | null;
-      impressions?: number | null;
-      created_at?: string | null;
-      ends_at?: string | null;
-      target_country?: string | null;
-      target_interest?: string | null;
-      target_min_age?: number | null;
-      target_max_age?: number | null;
-    }>
-  >([]);
+  const [ads, setAds] = useState<ActiveAdRow[]>([]);
   const [adViewerProfile, setAdViewerProfile] = useState<{
     country?: string | null;
     interests?: string[] | null;
@@ -1434,14 +1441,23 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
   const postsRef = useRef(posts);
   postsRef.current = posts;
 
+  const fetchInFlightRef = useRef(false);
+  const lastFetchCompletedAtRef = useRef(0);
+  const throttledFetchDebounceRef = useRef<number | null>(null);
+  const fetchPostsRef = useRef<() => Promise<void>>(async () => {});
+
   const fetchPosts = async () => {
+    if (fetchInFlightRef.current) return;
+    fetchInFlightRef.current = true;
     if (postsRef.current.length === 0) setLoading(true);
     try {
       const { data: postsData, error: postsError } = await supabase
         .from('posts')
         .select('*')
         .order('created_at', { ascending: false });
-      console.log('POSTS DATA:', postsData);
+      if (import.meta.env.DEV) {
+        console.log('POSTS DATA:', postsData);
+      }
 
       if (postsError) {
         console.error('Error loading posts:', postsError);
@@ -1529,6 +1545,7 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
             profiles: prof || null,
             username: prof?.username || null,
             avatar_url: prof?.avatar_url || null,
+            is_featured: normalizePostRowIsFeatured(post),
           };
         })
         .filter((post: any) => {
@@ -1564,20 +1581,64 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
         mixedPosts.push(post);
       }
 
-      console.log('HOME TRENDING APPLIED:', mixedPosts.slice(0, 5));
+      if (import.meta.env.DEV) {
+        console.log('HOME TRENDING APPLIED:', mixedPosts.slice(0, 5));
+      }
       setPosts(mixedPosts);
     } catch (err) {
       console.error('Error in fetchPosts:', err);
       setPosts([]);
     } finally {
       setLoading(false);
+      fetchInFlightRef.current = false;
+      lastFetchCompletedAtRef.current = Date.now();
     }
   };
+
+  fetchPostsRef.current = fetchPosts;
+
+  const scheduleThrottledFetchPosts = useCallback(() => {
+    if (fetchInFlightRef.current) return;
+    if (
+      lastFetchCompletedAtRef.current > 0 &&
+      Date.now() - lastFetchCompletedAtRef.current < 3000
+    ) {
+      return;
+    }
+    if (throttledFetchDebounceRef.current != null) window.clearTimeout(throttledFetchDebounceRef.current);
+    throttledFetchDebounceRef.current = window.setTimeout(() => {
+      throttledFetchDebounceRef.current = null;
+      if (fetchInFlightRef.current) return;
+      if (
+        lastFetchCompletedAtRef.current > 0 &&
+        Date.now() - lastFetchCompletedAtRef.current < 3000
+      ) {
+        return;
+      }
+      void fetchPostsRef.current();
+    }, 2000);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (throttledFetchDebounceRef.current != null) window.clearTimeout(throttledFetchDebounceRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     fetchPosts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshKey, user?.id]);
+
+  /** After boost / monetization changes, refetch so `posts` rows (e.g. is_featured) stay in sync. */
+  useEffect(() => {
+    const off1 = subscribeMonetizationRefresh(scheduleThrottledFetchPosts);
+    const off2 = subscribePostMonetization(() => scheduleThrottledFetchPosts());
+    return () => {
+      off1();
+      off2();
+    };
+  }, [scheduleThrottledFetchPosts]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1601,24 +1662,13 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
       }
     };
     const fetchActiveAds = async () => {
-      const nowIso = new Date().toISOString();
-      const { data, error } = await supabase
-        .from('ads')
-        .select('id, title, image_url, link_url, clicks, impressions, created_at, ends_at, target_country, target_interest, target_min_age, target_max_age')
-        .eq('is_active', true)
-        .or(`starts_at.is.null,starts_at.lte.${nowIso}`)
-        .or(`ends_at.is.null,ends_at.gte.${nowIso}`)
-        .order('created_at', { ascending: false });
+      const { data, error } = await getActiveAds(supabase, { limit: 24 });
       if (error) {
         console.warn('[Home] ads fetch failed:', error);
         if (!cancelled) setAds([]);
         return;
       }
-      if (!cancelled) {
-        setAds(
-          (data || []).filter((a: any) => String(a?.image_url || '').trim() && String(a?.link_url || '').trim())
-        );
-      }
+      if (!cancelled) setAds(data);
     };
     void fetchViewerProfile();
     void fetchActiveAds();
@@ -1696,25 +1746,32 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
         (payload) => {
           if (payload.eventType === 'UPDATE' && payload.new && typeof payload.new === 'object' && 'id' in payload.new) {
             const id = (payload.new as { id: string }).id;
+            const raw = payload.new as Record<string, unknown>;
             setPosts((prev) =>
-              prev.map((p) =>
-                p.id === id
-                  ? {
-                      ...p,
-                      ...payload.new,
-                      likes_count: p.likes_count,
-                      comments_count: p.comments_count,
-                      profiles: p.profiles,
-                      username: p.username,
-                      avatar_url: p.avatar_url,
-                    }
-                  : p
-              )
+              prev.map((p) => {
+                if (p.id !== id) return p;
+                const mergedFeatured =
+                  'is_featured' in raw || 'isFeatured' in raw
+                    ? normalizePostRowIsFeatured(raw as { is_featured?: unknown; isFeatured?: unknown })
+                    : normalizePostRowIsFeatured(p);
+                return {
+                  ...p,
+                  ...payload.new,
+                  likes_count: p.likes_count,
+                  comments_count: p.comments_count,
+                  profiles: p.profiles,
+                  username: p.username,
+                  avatar_url: p.avatar_url,
+                  is_featured: mergedFeatured,
+                };
+              })
             );
             return;
           }
-          console.log('[Home] realtime posts change -> fetchPosts()');
-          fetchPosts();
+          if (import.meta.env.DEV) {
+            console.log('[Home] realtime posts change -> scheduleThrottledFetchPosts()');
+          }
+          scheduleThrottledFetchPosts();
         }
       )
       .subscribe();
@@ -1722,16 +1779,17 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
     return () => {
       supabase.removeChannel(channel);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [scheduleThrottledFetchPosts]);
 
   // Fetch non-expired story map for all user_ids for avatar ring and navigation
   useEffect(() => {
     fetchActiveStoriesMap().then(setUserStoriesMap);
   }, [refreshKey]);
 
-  const handleDeletePost = async (postId: string, postUserId: string) => {
-    console.log('[Feed] handleDeletePost', { postId, postUserId });
+  const handleDeletePost = useCallback(async (postId: string, postUserId: string) => {
+    if (import.meta.env.DEV) {
+      console.log('[Feed] handleDeletePost', { postId, postUserId });
+    }
     if (!user || user.id !== postUserId) {
       alert('You can only delete your own posts');
       return;
@@ -1746,13 +1804,29 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
           .eq('user_id', user.id);
 
         if (error) throw error;
-        setPosts(posts.filter(p => p.id !== postId));
+        setPosts((prev) => prev.filter((p) => p.id !== postId));
       } catch (err) {
         console.error('Error deleting post:', err);
         alert('Failed to delete post');
       }
     }
-  };
+  }, [user]);
+
+  const handlePostUpdated = useCallback((postId: string, newContent: string) => {
+    setPosts((prev) =>
+      prev.map((p) => (p.id === postId ? { ...p, content: newContent } : p))
+    );
+  }, []);
+
+  const handlePostViewRecorded = useCallback((postId: string) => {
+    setPosts((prev) =>
+      prev.map((p) =>
+        p.id === postId
+          ? { ...p, view_count: getViews(p) + 1, views: getViews(p) + 1 }
+          : p
+      )
+    );
+  }, []);
 
   const filteredPosts = posts;
   const targetedAds = useMemo(() => {
@@ -1773,7 +1847,9 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
       const minMatch = tMin == null || (Number.isFinite(viewerAge) && viewerAge >= tMin);
       const maxMatch = tMax == null || (Number.isFinite(viewerAge) && viewerAge <= tMax);
       const match = countryMatch && interestMatch && minMatch && maxMatch;
-      console.log('TARGETED ADS FILTER:', { user: adViewerProfile, ad, match });
+      if (import.meta.env.DEV) {
+        console.log('TARGETED ADS FILTER:', { user: adViewerProfile, ad, match });
+      }
       return match;
     });
     return matched.length > 0 ? matched : ads;
@@ -1783,7 +1859,9 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
     if (!top) return [];
     const matched = ads.filter((ad) => String(ad.target_interest || '').trim().toLowerCase() === top);
     matched.forEach((ad) => {
-      console.log('SMART ADS MATCH:', { userTopInterest: top, ad, score: 1 });
+      if (import.meta.env.DEV) {
+        console.log('SMART ADS MATCH:', { userTopInterest: top, ad, score: 1 });
+      }
     });
     return matched;
   }, [ads, userTopInterest]);
@@ -1808,7 +1886,9 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
           hasReachedGuarantee && impressions > 100 && ctr < 0.01 ? 0.6 : 0;
 
         const priority = ctr + durationBoost - lowPerformancePenalty;
-        console.log('ADS RANKING:', { ctr, impressions, priority });
+        if (import.meta.env.DEV) {
+          console.log('ADS RANKING:', { ctr, impressions, priority });
+        }
         return priority;
       };
       return score(b) - score(a);
@@ -1837,7 +1917,7 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
     let adIndex = 0;
     filteredPosts.forEach((post, idx) => {
       items.push({ kind: 'post', post });
-      if ((idx + 1) % 5 === 0) {
+      if (idx % 5 === 0 && adPool.length > 0) {
         const ad = adPool[adIndex % adPool.length];
         if (ad) items.push({ kind: 'ad', ad });
         adIndex += 1;
@@ -1845,6 +1925,12 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
     });
     return items;
   }, [filteredPosts, smartMatchedAds, targetedAds]);
+
+  const postIdToIndex = useMemo(() => {
+    const m = new Map<string, number>();
+    filteredPosts.forEach((p, i) => m.set(String(p.id), i));
+    return m;
+  }, [filteredPosts]);
 
   return (
     <div className="space-y-6 pb-4">
@@ -1855,32 +1941,20 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
           if (item.kind === 'ad') {
             return (
               <React.Fragment key={`ad-${item.ad.id}-${itemIndex}`}>
-                <SponsoredAdCard ad={item.ad} />
+                <AdCard ad={item.ad} className={cn(homeCard, 'overflow-hidden')} tone="light" />
               </React.Fragment>
             );
           }
           const post = item.post;
-          const index = filteredPosts.findIndex((p) => String(p.id) === String(post.id));
+          const index = postIdToIndex.get(String(post.id)) ?? -1;
           return (
             <React.Fragment key={post.id}>
               <PostItem
                 post={post}
                 index={index}
-                onDelete={() => handleDeletePost(post.id, post.user_id)}
-                onPostUpdated={(postId, newContent) => {
-                  setPosts((prev) =>
-                    prev.map((p) => (p.id === postId ? { ...p, content: newContent } : p))
-                  );
-                }}
-                onPostViewRecorded={(postId) => {
-                  setPosts((prev) =>
-                    prev.map((p) =>
-                      p.id === postId
-                        ? { ...p, view_count: getViews(p) + 1, views: getViews(p) + 1 }
-                        : p
-                    )
-                  );
-                }}
+                onDelete={handleDeletePost}
+                onPostUpdated={handlePostUpdated}
+                onPostViewRecorded={handlePostViewRecorded}
                 userStoriesMap={userStoriesMap}
               />
               {index === 0 && (
@@ -1916,54 +1990,6 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
         </div>
       )}
     </div>
-  );
-}
-
-function SponsoredAdCard({
-  ad,
-}: {
-  ad: { id: string; title?: string | null; image_url: string; link_url: string };
-}) {
-  const title = String(ad.title || 'Sponsored').trim() || 'Sponsored';
-  useEffect(() => {
-    let cancelled = false;
-    const trackImpression = async () => {
-      if (cancelled) return;
-      try {
-        await supabase.rpc('increment_ads_impressions', { p_ad_id: ad.id });
-      } catch {
-        /* non-fatal analytics */
-      }
-    };
-    void trackImpression();
-    return () => {
-      cancelled = true;
-    };
-  }, [ad.id]);
-
-  const handleAdClick = async (e: React.MouseEvent<HTMLAnchorElement>) => {
-    e.preventDefault();
-    console.log('AD CLICK:', ad.id);
-    try {
-      await supabase.rpc('increment_ads_clicks', { p_ad_id: ad.id });
-    } catch {
-      const { data } = await supabase.from('ads').select('clicks').eq('id', ad.id).maybeSingle();
-      const nextClicks = Number((data as { clicks?: number | null } | null)?.clicks || 0) + 1;
-      await supabase.from('ads').update({ clicks: nextClicks }).eq('id', ad.id);
-    } finally {
-      window.open(ad.link_url, '_blank', 'noopener,noreferrer');
-    }
-  };
-  return (
-    <article className={cn(homeCard, 'overflow-hidden')}>
-      <a href={ad.link_url} target="_blank" rel="noreferrer noopener" className="block" onClick={handleAdClick}>
-        <img src={ad.image_url} alt={title} className="w-full max-h-[360px] object-cover" referrerPolicy="no-referrer" />
-        <div className="p-3">
-          <p className="text-[10px] font-black uppercase tracking-wider text-indigo-600">Sponsored</p>
-          <p className="mt-1 text-sm font-semibold text-gray-900 dark:text-gray-100">{title}</p>
-        </div>
-      </a>
-    </article>
   );
 }
 
@@ -2015,7 +2041,9 @@ function SuggestedReelsStrip({
           <div className="flex gap-3 min-w-max">
             {reels.map((reel, idx) => {
               const reelUrl = String(reel.video_url ?? '').trim();
-              console.log("VIDEO URL:", reelUrl);
+              if (import.meta.env.DEV) {
+                console.log('VIDEO URL:', reelUrl);
+              }
               const reelPlayable = isValidVideoUrl(reelUrl);
               const reelPoster =
                 typeof reel.image_url === 'string' ? reel.image_url.trim() : '';
@@ -2108,7 +2136,7 @@ function formatPostTimestamp(iso: string | undefined | null): string {
 }
 
 // -------------- Enhanced PostItem: video, double tap, avatar ring, nav ----------
-function PostItem({
+const PostItem = React.memo(function PostItem({
   post,
   index = 0,
   onDelete,
@@ -2118,14 +2146,14 @@ function PostItem({
 }: {
   post: any;
   index?: number;
-  onDelete: () => void;
+  onDelete: (postId: string, postUserId: string) => void | Promise<void>;
   onPostUpdated?: (postId: string, newContent: string) => void;
   /** Optimistic feed update when a video view is counted (once per session per post). */
   onPostViewRecorded?: (postId: string) => void;
   userStoriesMap?: Record<string, any[]>;
   key?: React.Key;
 }) {
-  const { user, profile } = useAuth();
+  const { user, profile, refreshProfile } = useAuth();
   const navigate = useNavigate();
   const [isLiked, setIsLiked] = useState(false);
   const [isSaved, setIsSaved] = useState(false);
@@ -2136,6 +2164,11 @@ function PostItem({
   const [newComment, setNewComment] = useState('');
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
   const [isStoryEditorOpen, setIsStoryEditorOpen] = useState(false);
+  const [tipPickerOpen, setTipPickerOpen] = useState(false);
+  const [tipFlash, setTipFlash] = useState<TipSuccessFlash | null>(null);
+  const [monetizationPost, setMonetizationPost] = useState<MonetizationPostStatus | null>(null);
+  /** False until first monetization fetch completes for this post (avoids showing Boost before we know unlock state). */
+  const [monetizationReady, setMonetizationReady] = useState(false);
   const [loadingComments, setLoadingComments] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [editContent, setEditContent] = useState(post.content);
@@ -2145,6 +2178,9 @@ function PostItem({
 
   // Video player ref for intersection observer
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const videoContainerRef = useRef<HTMLDivElement | null>(null);
+  const [isVideoInViewport, setIsVideoInViewport] = useState(false);
+  const isVideoInViewportRef = useRef(false);
   const hasVideoViewCountedRef = useRef(false);
   const [isTouchDevice, setIsTouchDevice] = useState(false);
   const [isMuted, setIsMuted] = useState(true);
@@ -2166,6 +2202,16 @@ function PostItem({
     setEditContent(post.content ?? '');
   }, [post.id, post.content]);
 
+  useEffect(() => {
+    isVideoInViewportRef.current = isVideoInViewport;
+  }, [isVideoInViewport]);
+
+  useEffect(() => {
+    if (!tipFlash) return;
+    const t = window.setTimeout(() => setTipFlash(null), 2600);
+    return () => window.clearTimeout(t);
+  }, [tipFlash]);
+
   const postProfile = Array.isArray(post.profiles)
     ? post.profiles[0]
     : post.profiles;
@@ -2178,11 +2224,92 @@ function PostItem({
   const videoUrl =
     typeof post.video_url === 'string' ? post.video_url.trim() : post.video_url;
 
-  console.log("VIDEO URL:", post.video_url);
+  if (import.meta.env.DEV) {
+    console.log('VIDEO URL:', post.video_url);
+  }
   const canPlayVideo =
     typeof videoUrl === 'string' &&
     videoUrl.length > 0 &&
     isValidVideoUrl(videoUrl);
+
+  useEffect(() => {
+    if (!canPlayVideo) {
+      setIsVideoInViewport(false);
+      return;
+    }
+    let cancelled = false;
+    let ob: IntersectionObserver | null = null;
+    const tryObserve = () => {
+      if (cancelled) return;
+      const el = videoContainerRef.current;
+      if (!el) {
+        requestAnimationFrame(tryObserve);
+        return;
+      }
+      ob = new IntersectionObserver(
+        (entries) => {
+          const e = entries[0];
+          setIsVideoInViewport(!!e?.isIntersecting);
+        },
+        { root: null, rootMargin: '0px', threshold: [0, 0.1, 0.25] }
+      );
+      ob.observe(el);
+    };
+    requestAnimationFrame(tryObserve);
+    return () => {
+      cancelled = true;
+      if (ob) ob.disconnect();
+      setIsVideoInViewport(false);
+    };
+  }, [canPlayVideo, post.id, videoUrl]);
+
+  /** Same signal as Reels: `posts.is_featured` OR GET /monetization/post unlocked (coin boost). */
+  useEffect(() => {
+    const postId = String(post?.id || '').trim();
+    const ownerId = String(post?.user_id || '').trim();
+    if (!canPlayVideo || !postId || !user?.id || !ownerId || ownerId === user.id) {
+      setMonetizationPost(null);
+      setMonetizationReady(true);
+      return;
+    }
+    if (!isVideoInViewport) {
+      return;
+    }
+    setMonetizationReady(false);
+    let cancelled = false;
+    (async () => {
+      const s = await fetchMonetizationPost(postId);
+      if (!cancelled) {
+        setMonetizationPost(s);
+        setMonetizationReady(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [canPlayVideo, post.id, post.user_id, user?.id, isVideoInViewport]);
+
+  useEffect(() => {
+    const postId = String(post?.id || '').trim();
+    if (!postId || !canPlayVideo) return;
+    return subscribePostMonetization((id) => {
+      if (id !== postId) return;
+      if (!isVideoInViewportRef.current) return;
+      void fetchMonetizationPost(postId).then(setMonetizationPost);
+    });
+  }, [post.id, canPlayVideo]);
+
+  const isBoosted = isPostBoostedForTips(post, monetizationPost);
+
+  useEffect(() => {
+    if (import.meta.env.DEV) {
+      console.log('[Monetization][Home]', post.id, {
+        is_featured: post.is_featured,
+        monetization: monetizationPost,
+        isBoosted,
+      });
+    }
+  }, [post.id, post.is_featured, monetizationPost?.unlocked, isBoosted, monetizationPost]);
 
   /** poster ≈ video.thumbnail || "/fallback.jpg": real HTTP(S) images only; never video_url or #t=0.1 */
   const videoThumb = String((post as { thumbnail?: string | null }).thumbnail ?? '').trim();
@@ -2283,7 +2410,7 @@ function PostItem({
       if (entry.isIntersecting) {
         void node.play().catch(() => {});
         const pid = post?.id != null ? String(post.id) : '';
-        if (pid) {
+        if (pid && import.meta.env.DEV) {
           console.log('VIDEO VISIBLE:', pid);
         }
         if (user?.id && pid) {
@@ -2299,6 +2426,13 @@ function PostItem({
           const next = getViews(post) + 1;
           onPostViewRecorded?.(pid);
           if (user?.id) {
+            if (import.meta.env.DEV) {
+              console.log('[HomePage][userBehavior] calling trackUserBehavior', {
+                action: 'view',
+                userId: user.id,
+                targetId: pid,
+              });
+            }
             void trackUserBehavior({
               userId: user.id,
               actionType: 'view',
@@ -2468,7 +2602,9 @@ function PostItem({
     if (likeRequestInFlightRef.current) {
       return;
     }
-    console.log('LIKE action:', post.id, user.id);
+    if (import.meta.env.DEV) {
+      console.log('LIKE action:', post.id, user.id);
+    }
     likeRequestInFlightRef.current = true;
 
     const wasLiked = isLiked;
@@ -2586,6 +2722,13 @@ function PostItem({
             entityId: post.id,
           });
         }
+        if (import.meta.env.DEV) {
+          console.log('[HomePage][userBehavior] calling trackUserBehavior', {
+            action: 'like',
+            userId: user.id,
+            targetId: String(post.id),
+          });
+        }
         void trackUserBehavior({
           userId: user.id,
           actionType: 'like',
@@ -2593,7 +2736,9 @@ function PostItem({
           targetId: String(post.id),
           category: String(post.category || (post.video_url ? 'video' : 'post')),
         });
-        console.log('REFERRAL TRIGGER: first_like', user.id);
+        if (import.meta.env.DEV) {
+          console.log('REFERRAL TRIGGER: first_like', user.id);
+        }
         void rewardInviter(user.id, 'first_like', 5);
       }
 
@@ -2626,7 +2771,9 @@ function PostItem({
     if (commentRequestInFlightRef.current) {
       return;
     }
-    console.log('COMMENT action:', post.id, user.id);
+    if (import.meta.env.DEV) {
+      console.log('COMMENT action:', post.id, user.id);
+    }
     commentRequestInFlightRef.current = true;
 
     const commentText = newComment.trim();
@@ -2714,6 +2861,13 @@ function PostItem({
           entityId: post.id,
         });
       }
+      if (import.meta.env.DEV) {
+        console.log('[HomePage][userBehavior] calling trackUserBehavior', {
+          action: 'comment',
+          userId: user.id,
+          targetId: String(post.id),
+        });
+      }
       void trackUserBehavior({
         userId: user.id,
         actionType: 'comment',
@@ -2721,7 +2875,9 @@ function PostItem({
         targetId: String(post.id),
         category: String(post.category || (post.video_url ? 'video' : 'post')),
       });
-      console.log('REFERRAL TRIGGER: first_comment', user.id);
+      if (import.meta.env.DEV) {
+        console.log('REFERRAL TRIGGER: first_comment', user.id);
+      }
       void rewardInviter(user.id, 'first_comment', 5);
 
       const newCommentObj = {
@@ -2759,14 +2915,88 @@ function PostItem({
       void navigator.clipboard.writeText(link).catch(() => {});
       if (user?.id) {
         void incrementCoins(user.id, 2);
+        if (import.meta.env.DEV) {
+          console.log('[HomePage][userBehavior] calling trackUserBehavior', {
+            action: 'share',
+            userId: user.id,
+            targetId: String(post.id),
+          });
+        }
+        void trackUserBehavior({
+          userId: user.id,
+          actionType: 'share',
+          targetType: 'post',
+          targetId: String(post.id),
+          category: String(post.category || (post.video_url ? 'video' : 'post')),
+        });
       }
-      console.log('VIRAL EVENT:', { event: 'share_post', postId: post.id, link });
+      if (import.meta.env.DEV) {
+        console.log('VIRAL EVENT:', { event: 'share_post', postId: post.id, link });
+      }
     }
     if (user?.id) {
-      console.log('REFERRAL TRIGGER: first_share', user.id);
+      if (import.meta.env.DEV) {
+        console.log('REFERRAL TRIGGER: first_share', user.id);
+      }
       void rewardInviter(user.id, 'first_share', 5);
     }
     setIsShareModalOpen(true);
+  };
+
+  const handleSendTip = async (amount: number) => {
+    const postId = String(post?.id || '').trim();
+    const ownerId = String(post?.user_id || '').trim();
+    if (!user?.id) {
+      alert('Sign in to send gifts.');
+      return;
+    }
+    if (!isPostBoostedForTips(post, monetizationPost)) return;
+    if (!postId || !ownerId || ownerId === user.id) return;
+    const bal = Number(profile?.coins) || 0;
+    if (bal < amount) {
+      alert(`You need at least ${amount} coins to tip.`);
+      return;
+    }
+    const res = await sendMonetizationGift(postId, amount);
+    if (!res.ok) {
+      alert(res.error || 'Gift failed');
+      return;
+    }
+    await refreshProfile();
+    const u = (profile?.username || user.email?.split('@')[0] || '').trim();
+    setTipFlash({
+      id: Date.now(),
+      text: u ? `${u} ${amount} Tip` : `+${amount} Tip`,
+    });
+  };
+
+  const HOME_QUICK_GIFT_COINS = 50;
+
+  const handleSendHomeGift = async () => {
+    if (!user?.id) {
+      alert('Sign in to send gifts.');
+      return;
+    }
+    if (!isPostBoostedForTips(post, monetizationPost)) return;
+    const postId = String(post?.id || '').trim();
+    const ownerId = String(post?.user_id || '').trim();
+    if (!postId || !ownerId || ownerId === user.id) return;
+    const bal = Number(profile?.coins) || 0;
+    if (bal < HOME_QUICK_GIFT_COINS) {
+      alert(`You need at least ${HOME_QUICK_GIFT_COINS} coins to send a gift.`);
+      return;
+    }
+    const res = await sendMonetizationGift(postId, HOME_QUICK_GIFT_COINS);
+    if (!res.ok) {
+      alert(res.error || 'Gift failed');
+      return;
+    }
+    await refreshProfile();
+    const u = (profile?.username || user.email?.split('@')[0] || '').trim();
+    setTipFlash({
+      id: Date.now(),
+      text: u ? `${u} ${HOME_QUICK_GIFT_COINS} Gift` : `+${HOME_QUICK_GIFT_COINS} Gift`,
+    });
   };
 
   const handleReportPost = async () => {
@@ -2787,7 +3017,9 @@ function PostItem({
         reason,
       })
       .select('*');
-    console.log('REPORT INSERT:', data, error);
+    if (import.meta.env.DEV) {
+      console.log('REPORT INSERT:', data, error);
+    }
     if (error) {
       if (String((error as { code?: string; message?: string })?.code || '') === '23505') {
         alert('You have already reported this post');
@@ -2820,11 +3052,13 @@ function PostItem({
     if (!editContent.trim()) return;
 
     try {
-      console.log('[PostItem] handleSaveEdit', {
-        postId: post.id,
-        userId: user.id,
-        postUserId: post.user_id,
-      });
+      if (import.meta.env.DEV) {
+        console.log('[PostItem] handleSaveEdit', {
+          postId: post.id,
+          userId: user.id,
+          postUserId: post.user_id,
+        });
+      }
       const { data, error } = await supabase
         .from('posts')
         .update({ content: editContent.trim() })
@@ -2833,7 +3067,9 @@ function PostItem({
         .select('id, content')
         .maybeSingle();
 
-      console.log('[PostItem] handleSaveEdit supabase response', { data, error });
+      if (import.meta.env.DEV) {
+        console.log('[PostItem] handleSaveEdit supabase response', { data, error });
+      }
       if (error) throw error;
       if (!data) {
         console.error('[PostItem] update affected 0 rows (RLS or id mismatch)', {
@@ -2871,12 +3107,14 @@ function PostItem({
     }
 
     const wasSaved = isSaved;
-    console.log('SAVE action:', post.id, userId);
-    console.log('[PostItem] handleSaveToggle', {
-      postId: post.id,
-      userId,
-      wasSaved,
-    });
+    if (import.meta.env.DEV) {
+      console.log('SAVE action:', post.id, userId);
+      console.log('[PostItem] handleSaveToggle', {
+        postId: post.id,
+        userId,
+        wasSaved,
+      });
+    }
 
     if (wasSaved) {
       const { error } = await supabase
@@ -2889,7 +3127,9 @@ function PostItem({
         console.error('[PostItem] saved_posts delete failed', error);
         return;
       }
-      console.log('[PostItem] saved_posts delete success', { post_id: post.id, user_id: userId });
+      if (import.meta.env.DEV) {
+        console.log('[PostItem] saved_posts delete success', { post_id: post.id, user_id: userId });
+      }
       setIsSaved(false);
       return;
     }
@@ -2908,7 +3148,9 @@ function PostItem({
       return;
     }
     if (inserted) {
-      console.log('[PostItem] saved_posts insert success', inserted);
+      if (import.meta.env.DEV) {
+        console.log('[PostItem] saved_posts insert success', inserted);
+      }
     } else {
       console.warn(
         '[PostItem] saved_posts insert OK (no error) but .select returned no row — allow SELECT on saved_posts for returning rows, or verify row in dashboard',
@@ -2949,10 +3191,12 @@ function PostItem({
           if (!reelsError && Array.isArray(reelsRows)) {
             for (const r of reelsRows) {
               const reelVideoUrl = normalizeReelUrl(String((r as any)?.video_url || ''));
-              console.log('MATCHING:', {
-                home: normalizedVideoUrl,
-                reel: reelVideoUrl
-              });
+              if (import.meta.env.DEV) {
+                console.log('MATCHING:', {
+                  home: normalizedVideoUrl,
+                  reel: reelVideoUrl,
+                });
+              }
               if (reelVideoUrl && reelVideoUrl === normalizedVideoUrl) {
                 if ((r as any)?.id != null) {
                   matchedReelId = String((r as any).id);
@@ -2996,11 +3240,13 @@ function PostItem({
       return;
     }
 
-    console.log('[Home] navigate to reels', {
-      reelId,
-      index,
-      videoUrl
-    });
+    if (import.meta.env.DEV) {
+      console.log('[Home] navigate to reels', {
+        reelId,
+        index,
+        videoUrl,
+      });
+    }
     navigate(`/reels/${reelId}`, {
       state: {
         selectedReelId: reelId,
@@ -3068,7 +3314,7 @@ function PostItem({
         </div>
         <PostMenu
           isMe={postUser.isMe}
-          onDelete={onDelete}
+          onDelete={() => void onDelete(post.id, post.user_id)}
           onEdit={() => setIsEditing(true)}
           onReport={() => void handleReportPost()}
           onShare={handleShare}
@@ -3113,6 +3359,7 @@ function PostItem({
           {canPlayVideo ? (
             // Tap target on wrapper; feed video: contain (full frame visible), poster first to avoid black flash
             <div
+              ref={videoContainerRef}
               className="group relative w-full cursor-pointer touch-manipulation overflow-hidden rounded-xl bg-black bg-cover bg-center"
               style={
                 feedPosterResolved
@@ -3145,6 +3392,21 @@ function PostItem({
                     </div>
                   )}
                 </div>
+              ) : !isVideoInViewport ? (
+                <div className="relative flex w-full justify-center bg-transparent min-h-[200px]">
+                  {feedPosterResolved ? (
+                    <img
+                      src={feedPosterResolved}
+                      alt=""
+                      className="max-h-[500px] w-full object-contain bg-transparent"
+                      referrerPolicy="no-referrer"
+                    />
+                  ) : (
+                    <div className="w-full min-h-[200px] flex items-center justify-center text-white/60 text-sm">
+                      Video
+                    </div>
+                  )}
+                </div>
               ) : (
                 <div className="relative flex w-full justify-center bg-transparent">
                   <video
@@ -3170,7 +3432,7 @@ function PostItem({
                   />
                 </div>
               )}
-              {isTouchDevice && !feedVideoError && (
+              {isTouchDevice && !feedVideoError && isVideoInViewport && (
                 <div
                   onClick={(e) => {
                     e.stopPropagation();
@@ -3190,6 +3452,7 @@ function PostItem({
                 </div>
               )}
               <HeartOverlay show={showHeart} />
+              <TipSuccessOverlay flash={tipFlash} />
             </div>
           ) : imageUrl ? (
             <div className="relative overflow-hidden bg-gray-100 border border-gray-100 rounded-xl w-full">
@@ -3262,6 +3525,39 @@ function PostItem({
             active={showComments}
             onClick={() => setShowComments(!showComments)}
           />
+          {canPlayVideo && !!user?.id && String(post.user_id || '').trim() && String(post.user_id || '').trim() !== user.id && (
+            <>
+              {isBoosted ? (
+                <>
+                  <FeedAction
+                    icon={<Coins size={20} className="text-yellow-500" />}
+                    label="Tip"
+                    onClick={() => setTipPickerOpen(true)}
+                  />
+                  <FeedAction
+                    icon={<Gift size={20} className="text-orange-400" />}
+                    label="Gift"
+                    onClick={() => void handleSendHomeGift()}
+                  />
+                </>
+              ) : !monetizationReady ? (
+                <div className="flex-[2] min-w-0" aria-hidden />
+              ) : (
+                <button
+                  type="button"
+                  title="Boost to receive tips"
+                  onClick={() => navigate(user?.id ? '/profile' : '/login')}
+                  className={cn(
+                    'flex-1 flex items-center justify-center gap-2 py-2 rounded-xl transition-all text-gray-400',
+                    'hover:bg-gray-100 dark:hover:bg-gray-800 hover:text-amber-600 dark:hover:text-amber-400'
+                  )}
+                >
+                  <Sparkles size={20} className="shrink-0 opacity-80" />
+                  <span className="text-xs font-bold hidden sm:inline">Boost</span>
+                </button>
+              )}
+            </>
+          )}
           <FeedAction icon={<Share2 size={20} />} label="Share" onClick={handleShare} />
           <FeedAction
             icon={<Bookmark size={20} className={cn("transition-colors", isSaved && "text-yellow-500 fill-yellow-500")} />}
@@ -3338,6 +3634,16 @@ function PostItem({
         </AnimatePresence>
       </div>
 
+      <MonetizationTipPicker
+        open={tipPickerOpen}
+        onClose={() => setTipPickerOpen(false)}
+        balanceCoins={profile?.coins != null ? Number(profile.coins) : undefined}
+        onPick={(amount) => {
+          setTipPickerOpen(false);
+          void handleSendTip(amount);
+        }}
+      />
+
       <ShareModal
         isOpen={isShareModalOpen}
         onClose={() => setIsShareModalOpen(false)}
@@ -3361,7 +3667,7 @@ function PostItem({
       />
     </div>
   );
-}
+});
 
 // --- PostMenu/MenuButton, RightSidebar, FeedAction, PeopleYouMayKnow, TrendingSection, SuggestedGroups unchanged ---
 
@@ -3402,8 +3708,8 @@ function PostMenu({ isMe, onEdit, onDelete, onReport, onShare, onCopyLink }: { i
             <div className="py-1">
               {isMe ? (
                 <>
-                  <MenuButton icon={<Edit2 size={16} />} label="Edit Post" onClick={() => { console.log('[PostMenu] Edit Post'); onEdit(); setIsOpen(false); }} />
-                  <MenuButton icon={<Trash2 size={16} />} label="Delete Post" onClick={() => { console.log('[PostMenu] Delete Post'); onDelete(); setIsOpen(false); }} className="text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20" />
+                  <MenuButton icon={<Edit2 size={16} />} label="Edit Post" onClick={() => { if (import.meta.env.DEV) console.log('[PostMenu] Edit Post'); onEdit(); setIsOpen(false); }} />
+                  <MenuButton icon={<Trash2 size={16} />} label="Delete Post" onClick={() => { if (import.meta.env.DEV) console.log('[PostMenu] Delete Post'); onDelete(); setIsOpen(false); }} className="text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20" />
                 </>
               ) : (
                 <>
@@ -3815,8 +4121,10 @@ function TrendingSection() {
         if (error || !rows?.length) {
           const hashtags: { tag: string; count: number }[] = [];
           const posts: TrendingPostRow[] = [];
-          console.log("TRENDING HASHTAGS:", hashtags);
-          console.log("TRENDING POSTS:", posts);
+          if (import.meta.env.DEV) {
+            console.log('TRENDING HASHTAGS:', hashtags);
+            console.log('TRENDING POSTS:', posts);
+          }
           setTrendRows([]);
           return;
         }
@@ -3846,15 +4154,19 @@ function TrendingSection() {
 
         const posts = validPosts;
 
-        console.log("TRENDING HASHTAGS:", hashtags);
-        console.log("TRENDING POSTS:", posts);
+        if (import.meta.env.DEV) {
+          console.log('TRENDING HASHTAGS:', hashtags);
+          console.log('TRENDING POSTS:', posts);
+        }
 
         if (!cancelled) setTrendRows(hashtags);
       } catch {
         const hashtags: { tag: string; count: number }[] = [];
         const posts: TrendingPostRow[] = [];
-        console.log("TRENDING HASHTAGS:", hashtags);
-        console.log("TRENDING POSTS:", posts);
+        if (import.meta.env.DEV) {
+          console.log('TRENDING HASHTAGS:', hashtags);
+          console.log('TRENDING POSTS:', posts);
+        }
         if (!cancelled) setTrendRows([]);
       } finally {
         if (!cancelled) setLoadingTrends(false);
@@ -3924,7 +4236,9 @@ function SuggestedGroups() {
         return;
       }
 
-      console.log('Suggested groups:', data);
+      if (import.meta.env.DEV) {
+        console.log('Suggested groups:', data);
+      }
 
       let rows = Array.isArray(data) ? [...data] : [];
       const uid = user?.id ? String(user.id).trim() : '';
