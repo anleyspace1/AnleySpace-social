@@ -88,18 +88,25 @@ export type MonetizationPostStatus = {
   creatorId?: string;
 };
 
-/** Parse PostgREST / Postgres timestamptz for unlock checks (Safari-safe; handles `YYYY-MM-DD HH:mm:ss+tz`). */
+/**
+ * Parse `expires_at` from Supabase for unlock (Vercel / WebKit-safe).
+ * Values like `YYYY-MM-DD HH:mm:ss+00` are not reliably parsed by `new Date()` everywhere — normalize first space to `T`, then `Date.parse`.
+ */
 function expiresAtToUnlockMs(expiresAtRaw: unknown): { ms: number; unlocked: boolean } {
   if (expiresAtRaw == null) return { ms: 0, unlocked: false };
-  const s = String(expiresAtRaw).trim();
-  if (!s) return { ms: 0, unlocked: false };
-  const normalized =
-    /^\d{4}-\d{2}-\d{2}/.test(s) && s.includes(' ') && !s.includes('T') ? s.replace(' ', 'T') : s;
-  const ms = Date.parse(normalized);
-  if (!Number.isFinite(ms)) {
+  const expires_at = String(expiresAtRaw).trim();
+  if (!expires_at) return { ms: 0, unlocked: false };
+
+  const normalized = expires_at.includes('T') ? expires_at : expires_at.replace(' ', 'T');
+  const expiresMs = Date.parse(normalized);
+
+  if (!Number.isFinite(expiresMs)) {
+    console.warn('[monetization] expires_at parse failed, treating as locked', { raw: expiresAtRaw });
     return { ms: NaN, unlocked: false };
   }
-  return { ms, unlocked: ms > Date.now() };
+
+  const unlocked = expiresMs > Date.now();
+  return { ms: expiresMs, unlocked };
 }
 
 /** Same mapping as `server.ts` GET /api/monetization/post/:postId — used when the API host is unavailable (e.g. Vercel static). */
@@ -126,10 +133,7 @@ function monetizationStatusFromPostMonetizationRow(
       boostProgress: 0,
     };
   }
-  const { ms: expiresAtMs, unlocked } = expiresAtToUnlockMs(row.expires_at);
-  if (isMonetizationDebugEnabled() && row.expires_at && !Number.isFinite(expiresAtMs)) {
-    console.warn('[monetization] invalid expires_at', { raw: row.expires_at });
-  }
+  const { unlocked } = expiresAtToUnlockMs(row.expires_at);
   const maxC = Number(row.max_boost_earnings_cents) || 0;
   const boostC = Number(row.boost_earnings_cents) || 0;
   const organicC = Number(row.organic_earnings_cents) || 0;
