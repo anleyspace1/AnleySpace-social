@@ -695,7 +695,7 @@ export default function ReelsPage() {
   }
 
   return (
-    <div className="relative flex h-full min-h-0 flex-1 flex-col bg-[#0A0A0A] font-sans overflow-hidden">
+    <div className="relative flex h-full min-h-0 max-lg:h-[100dvh] max-lg:max-h-[100dvh] flex-1 flex-col bg-[#0A0A0A] font-sans max-lg:overflow-x-hidden max-lg:overflow-y-visible lg:overflow-hidden">
       {/* Top Navigation Bar */}
       <div className="absolute top-0 left-0 right-0 h-14 sm:h-16 flex items-center justify-between px-4 sm:px-6 z-[100] bg-gradient-to-b from-black/80 to-transparent">
         <div className="w-20" /> {/* Spacer for symmetry */}
@@ -751,14 +751,16 @@ export default function ReelsPage() {
       </div>
 
       {/* Main Content Area — single scroll: feed is the only vertical overflow (matches App main min-h-0 chain) */}
-      <div className="flex min-h-0 flex-1 overflow-hidden">
-        {/* Reels Feed — sole vertical scroll + snap; avoid 100vh inline so it matches parent 100dvh flex */}
+      <div className="flex min-h-0 flex-1 max-lg:overflow-visible lg:overflow-hidden">
+        {/* Reels Feed — sole vertical scroll; mobile: explicit 100dvh + snap-mandatory + touch momentum */}
         <div
           className={cn(
-            'relative h-full min-h-0 w-full flex-1 overflow-y-auto no-scrollbar',
-            'snap-y max-lg:snap-proximity lg:snap-mandatory',
+            'relative w-full flex-1 min-h-0 overflow-y-auto no-scrollbar',
+            'max-lg:h-[100dvh] max-lg:max-h-[100dvh]',
+            'lg:h-full',
+            'snap-y snap-mandatory',
             'max-lg:overscroll-y-auto lg:overscroll-y-contain',
-            '[-webkit-overflow-scrolling:touch] touch-pan-y',
+            '[-webkit-overflow-scrolling:touch]',
             'lg:transition-all lg:duration-500 lg:ease-in-out lg:touch-auto',
             isCommentsOpen ? 'lg:mr-0' : ''
           )}
@@ -784,10 +786,10 @@ export default function ReelsPage() {
                     key={`ad-${entry.ad.id}-${index}`}
                     className={cn(
                       'relative box-border w-full shrink-0 snap-start p-0 m-0',
-                      'max-lg:h-[100dvh] max-lg:min-h-[100dvh] max-lg:max-h-[100dvh] max-lg:[scroll-snap-stop:normal] max-lg:touch-pan-y',
+                      'max-lg:h-[100dvh] max-lg:min-h-[100dvh] max-lg:max-h-[100dvh]',
                       'lg:h-full flex items-center justify-center bg-black'
                     )}
-                    style={isTouchDevice ? { scrollSnapAlign: 'start', backgroundColor: '#000' } : undefined}
+                    style={isTouchDevice ? { scrollSnapAlign: 'start', backgroundColor: '#000' } : { scrollSnapAlign: 'start' }}
                   >
                     <div className="w-full max-w-lg px-4 py-6">
                       <AdCard
@@ -810,10 +812,10 @@ export default function ReelsPage() {
                   data-reel-id={video.id}
                   className={cn(
                     'relative box-border w-full shrink-0 snap-start p-0 m-0',
-                    'max-lg:h-[100dvh] max-lg:min-h-[100dvh] max-lg:max-h-[100dvh] max-lg:[scroll-snap-stop:normal] max-lg:touch-pan-y',
+                    'max-lg:h-[100dvh] max-lg:min-h-[100dvh] max-lg:max-h-[100dvh]',
                     'lg:h-full'
                   )}
-                  style={isTouchDevice ? { scrollSnapAlign: 'start', backgroundColor: '#000' } : undefined}
+                  style={isTouchDevice ? { scrollSnapAlign: 'start', backgroundColor: '#000' } : { scrollSnapAlign: 'start' }}
                 >
                   <VideoPost
                     video={video}
@@ -2302,10 +2304,7 @@ function VideoPost({
   return (
     <div
       ref={reelContainerRef}
-      className={cn(
-        'relative isolate h-full min-h-0 w-full flex-shrink-0 overflow-hidden bg-black group',
-        isTouchDevice && 'touch-pan-y'
-      )}
+      className="relative isolate h-full min-h-0 w-full flex-shrink-0 overflow-hidden bg-black group"
     >
       {video.isViral && (
         <div className="pointer-events-none absolute top-2 left-2 z-[30] bg-orange-500 text-white text-xs px-2 py-1 rounded-full font-bold shadow-lg">
@@ -2341,12 +2340,7 @@ function VideoPost({
             style={{ backgroundColor: '#000' }}
           />
           {/* Main player — shrink-wrapped + centered so sides/top-bottom show blur, not black pillarbox */}
-          <div
-            className={cn(
-              'absolute inset-0 z-[10] flex h-full w-full min-h-0 min-w-0 items-center justify-center',
-              isTouchDevice && 'touch-pan-y'
-            )}
-          >
+          <div className="absolute inset-0 z-[10] flex h-full w-full min-h-0 min-w-0 items-center justify-center">
             <video
               key={video.id}
               ref={(el) => {
@@ -2357,7 +2351,6 @@ function VideoPost({
               poster={posterForPlayer}
               className={cn(
                 'relative z-[10] max-h-full max-w-full object-contain',
-                isTouchDevice && 'touch-pan-y',
                 !isReady && 'invisible'
               )}
               controls={!isTouchDevice}
@@ -2371,11 +2364,7 @@ function VideoPost({
               onPause={handleMainVideoPauseOrEnd}
               onEnded={handleMainVideoPauseOrEnd}
               onClick={handleVideoSurfaceTap}
-              style={
-                isTouchDevice
-                  ? { touchAction: 'pan-y' as const }
-                  : { cursor: 'pointer' }
-              }
+              style={!isTouchDevice ? { cursor: 'pointer' } : undefined}
             />
           </div>
         </>

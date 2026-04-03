@@ -471,7 +471,9 @@ function AppContent() {
       className={cn(
         'min-h-screen font-sans overflow-x-hidden',
         isReels || isCreateReel
-          ? 'flex h-[100dvh] max-h-[100dvh] flex-col overflow-hidden bg-black text-white'
+          ? isReels
+            ? 'flex h-[100dvh] max-h-[100dvh] flex-col bg-black text-white max-lg:overflow-x-hidden max-lg:overflow-y-visible lg:overflow-hidden'
+            : 'flex h-[100dvh] max-h-[100dvh] flex-col overflow-hidden bg-black text-white'
           : isHome
             ? 'bg-[#F5F6FA] text-gray-900 flex flex-col min-h-[100dvh] h-[100dvh] overflow-hidden'
             : isMessages || isGroupChat
@@ -487,7 +489,9 @@ function AppContent() {
         className={cn(
           isMessages || isGroupChat ? 'flex w-full' : 'mx-auto flex',
           isReels || isCreateReel
-            ? 'max-w-none min-h-0 w-full flex-1 flex-col p-0'
+            ? isReels
+              ? 'max-w-none min-h-0 w-full flex-1 flex-col p-0 max-lg:overflow-x-hidden max-lg:overflow-y-visible'
+              : 'max-w-none min-h-0 w-full flex-1 flex-col p-0'
             : isMessages || isGroupChat
               ? 'max-w-none w-full h-full flex-1 min-h-0 pt-14 sm:pt-16 px-0 lg:px-0 pb-0 overflow-hidden'
             : 'max-w-[1600px] pt-14 sm:pt-16 px-0 lg:px-6 pb-[72px] lg:pb-0',
@@ -529,7 +533,9 @@ function AppContent() {
             className={cn(
               'flex-1 min-w-0',
               isReels || isCreateReel
-                ? 'flex min-h-0 flex-1 flex-col overflow-hidden p-0'
+                ? isReels
+                  ? 'flex min-h-0 flex-1 flex-col max-lg:overflow-x-hidden max-lg:overflow-y-visible lg:overflow-hidden p-0'
+                  : 'flex min-h-0 flex-1 flex-col overflow-hidden p-0'
                 : isHome
                   ? 'flex-1 min-h-0 h-full overflow-y-auto overflow-x-hidden home-feed-scroll bg-[#F5F6FA] px-3 sm:px-4 py-4 lg:py-6'
                   : isMessages
