@@ -29,7 +29,7 @@ import { NavLink, useParams, useNavigate, useSearchParams } from 'react-router-d
 import { MOCK_USER } from '../constants';
 import { cn } from '../lib/utils';
 import { Post, Video } from '../types';
-import { apiUrl, fetchFeedApiSafe } from '../lib/apiOrigin';
+import { apiUrl, fetchFeedApiSafe, shouldSkipOptionalExpressUserSync } from '../lib/apiOrigin';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import ShareModal from '../components/ShareModal';
@@ -797,19 +797,21 @@ export default function ProfilePage() {
 
       // No existing thread yet: ensure target user is present in local cache so Messages page can open immediately.
       if (!existingMessages || existingMessages.length === 0) {
-        try {
-          await fetch(apiUrl('/api/users/sync'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              id: targetUserId,
-              username: displayUser.username || targetUserId,
-              full_name: displayUser.displayName || displayUser.username || null,
-              avatar: displayUser.avatar || null,
-            }),
-          });
-        } catch (syncErr) {
-          console.warn('Message sync fallback failed:', syncErr);
+        if (!shouldSkipOptionalExpressUserSync()) {
+          try {
+            await fetchFeedApiSafe(apiUrl('/api/users/sync'), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                id: targetUserId,
+                username: displayUser.username || targetUserId,
+                full_name: displayUser.displayName || displayUser.username || null,
+                avatar: displayUser.avatar || null,
+              }),
+            });
+          } catch (syncErr) {
+            console.warn('Message sync fallback failed:', syncErr);
+          }
         }
       }
 

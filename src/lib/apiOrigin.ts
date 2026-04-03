@@ -81,3 +81,24 @@ export function responseLooksLikeJsonApi(res: Response | null): boolean {
   const ct = res.headers.get('content-type') || '';
   return ct.includes('application/json');
 }
+
+/**
+ * True when `getApiBase()` is a different origin than the SPA (e.g. `VITE_API_ORIGIN` set to a separate API host).
+ * Browser `fetch` to that host requires CORS; optional same-site-only routes should be skipped in prod to avoid console noise.
+ */
+export function isExpressApiBaseCrossOrigin(): boolean {
+  if (typeof window === 'undefined') return false;
+  const base = getApiBase().replace(/\/$/, '');
+  const origin = window.location.origin.replace(/\/$/, '');
+  if (!base || !origin) return false;
+  return base !== origin;
+}
+
+/**
+ * Express-only helpers like `POST /api/users/sync` (local SQLite). Skip in production when the API base is
+ * cross-origin and the target likely has no CORS for those routes — avoids failed preflights and CORS console errors.
+ * Does not skip when API is same-origin (e.g. unset `VITE_API_ORIGIN` on Vercel).
+ */
+export function shouldSkipOptionalExpressUserSync(): boolean {
+  return import.meta.env.PROD && isExpressApiBaseCrossOrigin();
+}

@@ -56,6 +56,7 @@ import { startCreatorValidViewWatch, stopCreatorValidViewWatch } from '../lib/cr
 import { trackUserBehavior } from '../lib/userBehavior';
 import {
   fetchMonetizationPost,
+  isMonetizationDebugEnabled,
   mergeMonetizationPostStatus,
   sendMonetizationGift,
   type MonetizationPostStatus,
@@ -1565,9 +1566,10 @@ function VideoPost({
     const merged = mergeMonetizationPostStatus(primary, secondary);
     setMonetization(merged);
     setMonetizationReady(true);
-    if (import.meta.env.DEV) {
+    if (isMonetizationDebugEnabled()) {
       console.log('[Monetization][Reels]', rid, {
         is_featured: (video as { is_featured?: unknown })?.is_featured,
+        unlocked: merged?.unlocked,
         monetization: merged,
         mergedWithHomePostId: alt ?? null,
       });

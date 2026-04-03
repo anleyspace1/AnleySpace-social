@@ -6,7 +6,7 @@ import Cropper, { Area } from 'react-easy-crop';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import { cn } from '../lib/utils';
-import { apiUrl } from '../lib/apiOrigin';
+import { apiUrl, fetchFeedApiSafe, shouldSkipOptionalExpressUserSync } from '../lib/apiOrigin';
 
 const inputClass =
   'w-full bg-white dark:bg-gray-800 !text-gray-900 dark:!text-gray-100 placeholder:!text-gray-500 dark:placeholder:!text-gray-400 caret-gray-900 dark:caret-white border border-gray-200 dark:border-gray-700 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-indigo-500 transition duration-200';
@@ -97,27 +97,31 @@ export default function EditProfilePage() {
         throw error;
       }
       
-      // Sync with local DB immediately
-      try {
-        console.log('DEBUG: Syncing profile to local DB:', formData);
-        const syncRes = await fetch(apiUrl('/api/users/sync'), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            id: user.id,
-            username: formData.username,
-            full_name: formData.displayName,
-            avatar: formData.avatar,
-            bio: formData.bio
-          })
-        });
-        if (!syncRes.ok) {
-          console.error(`DEBUG: Sync API error: ${syncRes.status}`);
-        } else {
-          console.log('DEBUG: Sync successful');
+      // Optional Express / local DB sync (skipped in prod when API base is cross-origin — avoids CORS on Vercel)
+      if (!shouldSkipOptionalExpressUserSync()) {
+        try {
+          console.log('DEBUG: Syncing profile to local DB:', formData);
+          const syncRes = await fetchFeedApiSafe(apiUrl('/api/users/sync'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              id: user.id,
+              username: formData.username,
+              full_name: formData.displayName,
+              avatar: formData.avatar,
+              bio: formData.bio
+            })
+          });
+          if (!syncRes) {
+            console.warn('DEBUG: Sync request skipped or failed (network)');
+          } else if (!syncRes.ok) {
+            console.error(`DEBUG: Sync API error: ${syncRes.status}`);
+          } else {
+            console.log('DEBUG: Sync successful');
+          }
+        } catch (syncErr) {
+          console.error('DEBUG: Failed to sync after save:', syncErr);
         }
-      } catch (syncErr) {
-        console.error('DEBUG: Failed to sync after save:', syncErr);
       }
       
       console.log('Profile saved successfully, refreshing...');

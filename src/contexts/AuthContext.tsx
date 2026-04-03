@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import { User } from '@supabase/supabase-js';
 import { supabase, isSupabaseConfigured, invalidateSessionCache } from '../lib/supabase';
-import { apiUrl } from '../lib/apiOrigin';
+import { apiUrl, fetchFeedApiSafe, shouldSkipOptionalExpressUserSync } from '../lib/apiOrigin';
 import { loadPersonalizationFromSupabase } from '../lib/personalizedRanking';
 import { incrementCoins } from '../lib/coinsWallet';
 
@@ -232,27 +232,29 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         referredBy: (profileRow as { referred_by?: string | null }).referred_by ?? null,
       });
 
-      // Sync with local SQLite DB
-      try {
-        console.log(`AUTH: Syncing profile for ${profileRow.username} (${profileRow.id}) to local DB`);
-        const syncRes = await fetch(apiUrl('/api/users/sync'), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            id: profileRow.id,
-            username: profileRow.username,
-            full_name: profileRow.display_name || profileRow.full_name,
-            avatar: profileRow.avatar_url
-          })
-        });
-        if (syncRes.ok) {
-          console.log(`AUTH: Local DB sync successful for ${profileRow.username}`);
-        } else {
-          const errData = await syncRes.json();
-          console.error(`AUTH: Local DB sync failed for ${profileRow.username}:`, errData);
+      // Optional Express / local SQLite sync — skip when API host is cross-origin in prod (avoids CORS noise on Vercel)
+      if (!shouldSkipOptionalExpressUserSync()) {
+        try {
+          console.log(`AUTH: Syncing profile for ${profileRow.username} (${profileRow.id}) to local DB`);
+          const syncRes = await fetchFeedApiSafe(apiUrl('/api/users/sync'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              id: profileRow.id,
+              username: profileRow.username,
+              full_name: profileRow.display_name || profileRow.full_name,
+              avatar: profileRow.avatar_url
+            })
+          });
+          if (syncRes?.ok) {
+            console.log(`AUTH: Local DB sync successful for ${profileRow.username}`);
+          } else if (syncRes) {
+            const errData = await syncRes.json().catch(() => ({}));
+            console.error(`AUTH: Local DB sync failed for ${profileRow.username}:`, errData);
+          }
+        } catch (err) {
+          console.error('AUTH: Failed to sync user to local DB:', err);
         }
-      } catch (err) {
-        console.error('AUTH: Failed to sync user to local DB:', err);
       }
     } catch (err) {
       console.error('Profile fetch error:', err);

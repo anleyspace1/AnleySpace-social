@@ -37,7 +37,7 @@ import {
 import { MOCK_CHATS, MOCK_USER } from '../constants';
 import { Message } from '../types';
 import { cn } from '../lib/utils';
-import { apiUrl, fetchFeedApiSafe, responseLooksLikeJsonApi } from '../lib/apiOrigin';
+import { apiUrl, fetchFeedApiSafe, responseLooksLikeJsonApi, shouldSkipOptionalExpressUserSync } from '../lib/apiOrigin';
 import { readCallApiJson } from '../lib/callApiHelpers';
 import { createSocketIoClient } from '../lib/socketIoClient';
 import { insertDmNotificationFallback } from '../lib/supabaseNotifications';
@@ -400,19 +400,21 @@ export default function MessagesPage() {
         if (!injectedProfiles.has(targetProfile.id)) {
           injectedProfiles.set(targetProfile.id, targetProfile);
         }
-        try {
-          await fetch(apiUrl('/api/users/sync'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              id: targetProfile.id,
-              username: targetProfile.username,
-              full_name: targetProfile.full_name,
-              avatar: targetProfile.avatar_url
-            })
-          });
-        } catch (e) {
-          console.error('Error syncing target user:', e);
+        if (!shouldSkipOptionalExpressUserSync()) {
+          try {
+            await fetchFeedApiSafe(apiUrl('/api/users/sync'), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                id: targetProfile.id,
+                username: targetProfile.username,
+                full_name: targetProfile.full_name,
+                avatar: targetProfile.avatar_url
+              })
+            });
+          } catch (e) {
+            console.error('Error syncing target user:', e);
+          }
         }
       };
 

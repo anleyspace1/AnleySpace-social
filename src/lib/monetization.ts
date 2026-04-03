@@ -3,6 +3,17 @@ import { getBearerAuthHeaders } from './supabaseAuthHeaders';
 import { emitMonetizationRefresh, emitPostMonetizationRefresh } from './monetizationRealtime';
 import { isSupabaseConfigured, supabase } from './supabase';
 
+/** Dev or `?debugMonetization=1` — log monetization / unlocked / is_featured for Vercel debugging. */
+export function isMonetizationDebugEnabled(): boolean {
+  if (import.meta.env.DEV) return true;
+  if (typeof window === 'undefined') return false;
+  try {
+    return new URLSearchParams(window.location.search).get('debugMonetization') === '1';
+  } catch {
+    return false;
+  }
+}
+
 /** 1 coin = $0.01 USD */
 export const COIN_USD = 0.01;
 
@@ -130,7 +141,7 @@ async function fetchMonetizationPostFromSupabase(postId: string): Promise<Moneti
       .eq('post_id', postId)
       .maybeSingle();
     if (error) {
-      if (import.meta.env.DEV) console.warn('[monetization] Supabase post_monetization', error.message);
+      if (isMonetizationDebugEnabled()) console.warn('[monetization] Supabase post_monetization', error.message);
       return null;
     }
     return monetizationStatusFromPostMonetizationRow(row);
@@ -144,11 +155,15 @@ function isMonetizationPostPayload(j: unknown): j is MonetizationPostStatus {
   return typeof (j as Record<string, unknown>).unlocked === 'boolean';
 }
 
-/**
- * Loads boost / unlock state for tips & gifts UI. Tries Express API first (local dev / deployed API);
- * falls back to Supabase so Vercel static builds match local behavior without `VITE_API_ORIGIN`.
- */
-export async function fetchMonetizationPost(postId: string): Promise<MonetizationPostStatus | null> {
+function logMonetizationDebug(
+  label: string,
+  payload: { postId: string; unlocked?: boolean; source: string }
+): void {
+  if (!isMonetizationDebugEnabled()) return;
+  console.log('[monetization]', label, payload);
+}
+
+async function tryFetchMonetizationFromApi(postId: string): Promise<MonetizationPostStatus | null> {
   try {
     const res = await fetch(apiUrl(`/api/monetization/post/${encodeURIComponent(postId)}`));
     if (responseLooksLikeJsonApi(res) && res.ok) {
@@ -156,9 +171,49 @@ export async function fetchMonetizationPost(postId: string): Promise<Monetizatio
       if (isMonetizationPostPayload(j)) return j;
     }
   } catch {
-    /* network or invalid JSON (e.g. HTML from SPA host) */
+    /* CORS, network, or invalid JSON */
   }
-  return fetchMonetizationPostFromSupabase(postId);
+  return null;
+}
+
+/**
+ * Loads boost / unlock state for tips & gifts UI.
+ * - **Development:** tries Express `/api/monetization/post` first (local proxy), then Supabase.
+ * - **Production:** reads Supabase `post_monetization` first (no CORS to a separate API host), then API if Supabase unavailable.
+ */
+export async function fetchMonetizationPost(postId: string): Promise<MonetizationPostStatus | null> {
+  if (import.meta.env.DEV) {
+    const fromApi = await tryFetchMonetizationFromApi(postId);
+    logMonetizationDebug('fetch order: dev API first', {
+      postId,
+      source: fromApi ? 'api' : 'pending',
+      unlocked: fromApi?.unlocked,
+    });
+    if (fromApi) return fromApi;
+    const fromSb = await fetchMonetizationPostFromSupabase(postId);
+    logMonetizationDebug('fetch order: dev Supabase fallback', {
+      postId,
+      source: fromSb ? 'supabase' : 'none',
+      unlocked: fromSb?.unlocked,
+    });
+    return fromSb;
+  }
+
+  const fromSb = await fetchMonetizationPostFromSupabase(postId);
+  logMonetizationDebug('fetch order: prod Supabase first', {
+    postId,
+    source: fromSb != null ? 'supabase' : 'none',
+    unlocked: fromSb?.unlocked,
+  });
+  if (fromSb != null) return fromSb;
+
+  const fromApi = await tryFetchMonetizationFromApi(postId);
+  logMonetizationDebug('fetch order: prod API fallback', {
+    postId,
+    source: fromApi ? 'api' : 'none',
+    unlocked: fromApi?.unlocked,
+  });
+  return fromApi;
 }
 
 /** When Home post id ≠ reel row id, merge unlock signals so Tip/Gifts match Home. */
