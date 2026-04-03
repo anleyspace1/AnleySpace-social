@@ -113,15 +113,43 @@ export default function ReelsPage() {
   const navState = location.state as any;
   const selectedVideoUrl: string | undefined = navState?.videoUrl;
   const selectedPost: any | null = navState?.selectedPost ?? null;
-  /** Home feed post id when it differs from the reel row id (same video URL). Used for monetization API merge in VideoPost. */
-  const homeNavPostId =
-    navState?.postId != null && String(navState.postId).trim() !== ''
-      ? String(navState.postId).trim()
-      : '';
   const selectedVideoId: string | null =
     (navState?.selectedReelId ? String(navState.selectedReelId) : null) ||
     (navState?.videoId ? String(navState.videoId) : null) ||
     (params.id ? String(params.id) : null);
+
+  /** Home feed post id (may differ from reel row id). From state, or sessionStorage after refresh / state loss. */
+  const homeNavPostIdFromState =
+    navState?.postId != null && String(navState.postId).trim() !== ''
+      ? String(navState.postId).trim()
+      : '';
+
+  const homeNavPostId = useMemo(() => {
+    if (homeNavPostIdFromState) return homeNavPostIdFromState;
+    const routeReelId =
+      (params.id ? String(params.id) : '') || (selectedVideoId ? String(selectedVideoId) : '');
+    if (!routeReelId) return '';
+    try {
+      const storedReel = sessionStorage.getItem('reels_nav_reel_id');
+      const storedPost = sessionStorage.getItem('reels_nav_home_post_id');
+      if (storedReel && storedPost && String(storedReel) === routeReelId) {
+        return storedPost;
+      }
+    } catch {
+      /* ignore */
+    }
+    return '';
+  }, [homeNavPostIdFromState, params.id, selectedVideoId, location.key]);
+
+  useEffect(() => {
+    if (!homeNavPostIdFromState || !selectedVideoId) return;
+    try {
+      sessionStorage.setItem('reels_nav_reel_id', String(selectedVideoId));
+      sessionStorage.setItem('reels_nav_home_post_id', homeNavPostIdFromState);
+    } catch {
+      /* ignore */
+    }
+  }, [homeNavPostIdFromState, selectedVideoId]);
 
   // In the “selected from Home” mode, we replace the feed with a single video.
   const isSelectedMode = !!selectedVideoId;
@@ -397,6 +425,14 @@ export default function ReelsPage() {
         });
 
         finalList = mergeFeaturedFromHomeSelectedPost(finalList, selectedPost, targetId, normalizeUrl);
+        if (isMonetizationDebugEnabled() && selectedPost?.id != null && targetId) {
+          const mergedRow = finalList.find((v: any) => String(v?.id) === String(targetId));
+          console.log('[ReelsPage][mergeFeatured]', {
+            targetId,
+            selectedPostId: String(selectedPost.id),
+            mergedIsFeatured: mergedRow?.is_featured,
+          });
+        }
 
         setVideos(finalList);
         const targetById = targetId
@@ -1553,6 +1589,13 @@ function VideoPost({
   const canGiftOrTip = postBoosted && !isOwner && !!user?.id;
 
   useEffect(() => {
+    if (!isMonetizationDebugEnabled()) return;
+    const rid = video?.id != null ? String(video.id) : '';
+    console.log('[VideoPost][monetization]', rid, monetization);
+    console.log('[BoostCheck]', rid, (video as { is_featured?: unknown })?.is_featured, monetization);
+  }, [video?.id, monetization]);
+
+  useEffect(() => {
     if (!isMonetizationDebugEnabled() || !monetizationReady) return;
     const rid = video?.id != null ? String(video.id) : '';
     console.log('[canGiftOrTip debug]', {
@@ -1603,11 +1646,18 @@ function VideoPost({
       monetizationPostIdOverride && String(monetizationPostIdOverride) !== String(rid)
         ? String(monetizationPostIdOverride)
         : null;
-    const [primary, secondary] = await Promise.all([
-      fetchMonetizationPost(rid),
-      alt ? fetchMonetizationPost(alt) : Promise.resolve(null),
-    ]);
-    const merged = mergeMonetizationPostStatus(primary, secondary);
+    const loadMerged = async () => {
+      const [primary, secondary] = await Promise.all([
+        fetchMonetizationPost(rid),
+        alt ? fetchMonetizationPost(alt) : Promise.resolve(null),
+      ]);
+      return mergeMonetizationPostStatus(primary, secondary);
+    };
+    let merged = await loadMerged();
+    if (merged == null) {
+      await new Promise((r) => setTimeout(r, 400));
+      merged = await loadMerged();
+    }
     setMonetization(merged);
     setMonetizationReady(true);
     if (isMonetizationDebugEnabled()) {

@@ -3255,6 +3255,12 @@ const PostItem = React.memo(function PostItem({
         selectedPost: post,
       }
     });
+    try {
+      sessionStorage.setItem('reels_nav_reel_id', String(reelId));
+      sessionStorage.setItem('reels_nav_home_post_id', String(post.id));
+    } catch {
+      /* ignore */
+    }
   };
 
   const handleFeedImageLoad = useCallback((e: React.SyntheticEvent<HTMLImageElement>) => {
