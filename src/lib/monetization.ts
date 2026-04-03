@@ -82,6 +82,20 @@ export type MonetizationPostStatus = {
   creatorId?: string;
 };
 
+/** Parse PostgREST / Postgres timestamptz for unlock checks (Safari-safe; handles `YYYY-MM-DD HH:mm:ss+tz`). */
+function expiresAtToUnlockMs(expiresAtRaw: unknown): { ms: number; unlocked: boolean } {
+  if (expiresAtRaw == null) return { ms: 0, unlocked: false };
+  const s = String(expiresAtRaw).trim();
+  if (!s) return { ms: 0, unlocked: false };
+  const normalized =
+    /^\d{4}-\d{2}-\d{2}/.test(s) && s.includes(' ') && !s.includes('T') ? s.replace(' ', 'T') : s;
+  const ms = Date.parse(normalized);
+  if (!Number.isFinite(ms)) {
+    return { ms: NaN, unlocked: false };
+  }
+  return { ms, unlocked: ms > Date.now() };
+}
+
 /** Same mapping as `server.ts` GET /api/monetization/post/:postId — used when the API host is unavailable (e.g. Vercel static). */
 function monetizationStatusFromPostMonetizationRow(
   row: {
@@ -106,9 +120,7 @@ function monetizationStatusFromPostMonetizationRow(
       boostProgress: 0,
     };
   }
-  const expiresAtMs = row.expires_at ? new Date(String(row.expires_at)).getTime() : 0;
-  const now = Date.now();
-  const unlocked = Number.isFinite(expiresAtMs) && expiresAtMs > now;
+  const { ms: expiresAtMs, unlocked } = expiresAtToUnlockMs(row.expires_at);
   if (isMonetizationDebugEnabled() && row.expires_at && !Number.isFinite(expiresAtMs)) {
     console.warn('[monetization] invalid expires_at', { raw: row.expires_at });
   }
@@ -141,7 +153,7 @@ async function fetchMonetizationPostFromSupabase(postId: string): Promise<Moneti
     const { data: row, error } = await supabase
       .from('post_monetization')
       .select(
-        'post_id, creator_id, tier, price_coins, max_boost_earnings_cents, boost_earnings_cents, organic_earnings_cents, expires_at, created_at'
+        'post_id, creator_id, tier, price_coins, max_boost_earnings_cents, boost_earnings_cents, organic_earnings_cents, expires_at'
       )
       .eq('post_id', pid)
       .maybeSingle();
@@ -211,10 +223,7 @@ function normalizeMonetizationApiPayload(j: unknown): MonetizationPostStatus | n
   };
 }
 
-function logMonetizationDebug(
-  label: string,
-  payload: { postId: string; unlocked?: boolean; source: string }
-): void {
+function logMonetizationDebug(label: string, payload: Record<string, unknown>): void {
   if (!isMonetizationDebugEnabled()) return;
   console.log('[monetization]', label, payload);
 }
@@ -264,7 +273,12 @@ export async function fetchMonetizationPost(postId: string): Promise<Monetizatio
     source: fromSb != null ? 'supabase' : 'none',
     unlocked: fromSb?.unlocked,
   });
-  if (fromSb?.unlocked) return fromSb;
+  if (fromSb?.unlocked) {
+    if (isMonetizationDebugEnabled() && import.meta.env.PROD) {
+      console.log('[Monetization][Vercel]', postId, { fromSb, result: fromSb });
+    }
+    return fromSb;
+  }
 
   const fromApi = await tryFetchMonetizationFromApi(postId);
   const merged = mergeMonetizationPostStatus(fromSb, fromApi);
@@ -274,8 +288,11 @@ export async function fetchMonetizationPost(postId: string): Promise<Monetizatio
     apiUnlocked: fromApi?.unlocked,
     mergedUnlocked: merged?.unlocked,
   });
-  if (merged) return merged;
-  return fromSb ?? fromApi;
+  const result = merged ?? fromSb ?? fromApi;
+  if (isMonetizationDebugEnabled() && import.meta.env.PROD) {
+    console.log('[Monetization][Vercel]', postId, { fromSb, fromApi, merged, result });
+  }
+  return result;
 }
 
 /** When Home post id ≠ reel row id, merge unlock signals so Tip/Gifts match Home. */

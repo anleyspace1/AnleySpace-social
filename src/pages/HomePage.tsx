@@ -61,7 +61,12 @@ import { rewardInviter } from '../lib/referralRewards';
 import { getUserTopInterest, trackUserBehavior } from '../lib/userBehavior';
 import { incrementCoins } from '../lib/coinsWallet';
 import { startCreatorValidViewWatch, stopCreatorValidViewWatch } from '../lib/creatorValidViews';
-import { fetchMonetizationPost, sendMonetizationGift, type MonetizationPostStatus } from '../lib/monetization';
+import {
+  fetchMonetizationPost,
+  isMonetizationDebugEnabled,
+  sendMonetizationGift,
+  type MonetizationPostStatus,
+} from '../lib/monetization';
 import { isPostBoostedForTips, normalizePostRowIsFeatured } from '../lib/monetizationFeaturedUi';
 import { subscribeMonetizationRefresh, subscribePostMonetization } from '../lib/monetizationRealtime';
 import { MonetizationTipPicker } from '../components/MonetizationTipPicker';
@@ -2180,7 +2185,6 @@ const PostItem = React.memo(function PostItem({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const videoContainerRef = useRef<HTMLDivElement | null>(null);
   const [isVideoInViewport, setIsVideoInViewport] = useState(false);
-  const isVideoInViewportRef = useRef(false);
   const hasVideoViewCountedRef = useRef(false);
   const [isTouchDevice, setIsTouchDevice] = useState(false);
   const [isMuted, setIsMuted] = useState(true);
@@ -2201,10 +2205,6 @@ const PostItem = React.memo(function PostItem({
   useEffect(() => {
     setEditContent(post.content ?? '');
   }, [post.id, post.content]);
-
-  useEffect(() => {
-    isVideoInViewportRef.current = isVideoInViewport;
-  }, [isVideoInViewport]);
 
   useEffect(() => {
     if (!tipFlash) return;
@@ -2272,9 +2272,6 @@ const PostItem = React.memo(function PostItem({
       setMonetizationReady(true);
       return;
     }
-    if (!isVideoInViewport) {
-      return;
-    }
     setMonetizationReady(false);
     let cancelled = false;
     (async () => {
@@ -2287,14 +2284,13 @@ const PostItem = React.memo(function PostItem({
     return () => {
       cancelled = true;
     };
-  }, [canPlayVideo, post.id, post.user_id, user?.id, isVideoInViewport]);
+  }, [canPlayVideo, post.id, post.user_id, user?.id]);
 
   useEffect(() => {
     const postId = String(post?.id || '').trim();
     if (!postId || !canPlayVideo) return;
     return subscribePostMonetization((id) => {
       if (id !== postId) return;
-      if (!isVideoInViewportRef.current) return;
       void fetchMonetizationPost(postId).then(setMonetizationPost);
     });
   }, [post.id, canPlayVideo]);
@@ -2302,14 +2298,9 @@ const PostItem = React.memo(function PostItem({
   const isBoosted = isPostBoostedForTips(post, monetizationPost);
 
   useEffect(() => {
-    if (import.meta.env.DEV) {
-      console.log('[Monetization][Home]', post.id, {
-        is_featured: post.is_featured,
-        monetization: monetizationPost,
-        isBoosted,
-      });
-    }
-  }, [post.id, post.is_featured, monetizationPost?.unlocked, isBoosted, monetizationPost]);
+    if (!isMonetizationDebugEnabled()) return;
+    console.log('[Monetization][Vercel]', post.id, monetizationPost);
+  }, [post.id, monetizationPost]);
 
   /** poster ≈ video.thumbnail || "/fallback.jpg": real HTTP(S) images only; never video_url or #t=0.1 */
   const videoThumb = String((post as { thumbnail?: string | null }).thumbnail ?? '').trim();

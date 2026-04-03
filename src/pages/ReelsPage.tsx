@@ -1611,7 +1611,7 @@ function VideoPost({
     setMonetization(merged);
     setMonetizationReady(true);
     if (isMonetizationDebugEnabled()) {
-      console.log('[Monetization][Reels]', rid, {
+      console.log(import.meta.env.PROD ? '[Monetization][Vercel]' : '[Monetization][Reels]', rid, {
         is_featured: (video as { is_featured?: unknown })?.is_featured,
         unlocked: merged?.unlocked,
         monetization: merged,
