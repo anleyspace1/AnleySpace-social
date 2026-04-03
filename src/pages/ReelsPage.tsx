@@ -1499,6 +1499,33 @@ function SoundSelector({ onClose, onSelect, selectedSoundId }: { onClose: () => 
   );
 }
 
+/**
+ * Monetization rows are keyed by `posts.id`. Reel rows and Home feed rows can differ — collect every
+ * candidate id (deduped) so `fetchMonetizationPost` is not reel-id-only on Vercel.
+ */
+function monetizationCandidatePostIds(
+  video: { id?: unknown; home_post_id?: string; original_post_id?: string } | null | undefined,
+  monetizationPostIdOverride?: string | null
+): string[] {
+  const ids: string[] = [];
+  const add = (raw: unknown) => {
+    const s = raw != null && String(raw).trim() !== '' ? String(raw).trim() : '';
+    if (s && !ids.includes(s)) ids.push(s);
+  };
+  add(video?.id);
+  add(monetizationPostIdOverride);
+  try {
+    const sr = sessionStorage.getItem('reels_nav_reel_id');
+    const sp = sessionStorage.getItem('reels_nav_home_post_id');
+    if (sr && sp && video?.id != null && String(sr) === String(video.id)) add(sp);
+  } catch {
+    /* ignore */
+  }
+  add((video as { home_post_id?: string }).home_post_id);
+  add((video as { original_post_id?: string }).original_post_id);
+  return ids;
+}
+
 function VideoPost({
   video,
   reelId,
@@ -1664,16 +1691,14 @@ function VideoPost({
       return;
     }
     setMonetizationReady(false);
-    const alt =
-      monetizationPostIdOverride && String(monetizationPostIdOverride) !== String(rid)
-        ? String(monetizationPostIdOverride)
-        : null;
+    const candidateIds = monetizationCandidatePostIds(video, monetizationPostIdOverride);
     const loadMerged = async () => {
-      const [primary, secondary] = await Promise.all([
-        fetchMonetizationPost(rid),
-        alt ? fetchMonetizationPost(alt) : Promise.resolve(null),
-      ]);
-      return mergeMonetizationPostStatus(primary, secondary);
+      const results = await Promise.all(candidateIds.map((id) => fetchMonetizationPost(id)));
+      let merged: MonetizationPostStatus | null = null;
+      for (const row of results) {
+        merged = mergeMonetizationPostStatus(merged, row);
+      }
+      return merged;
     };
     let merged = await loadMerged();
     if (merged == null) {
@@ -1688,10 +1713,15 @@ function VideoPost({
         is_featured: (video as { is_featured?: unknown })?.is_featured,
         unlocked: merged?.unlocked,
         monetization: merged,
-        mergedWithHomePostId: alt ?? null,
+        monetizationCandidatePostIds: candidateIds,
       });
     }
-  }, [video?.id, monetizationPostIdOverride]);
+  }, [
+    video?.id,
+    monetizationPostIdOverride,
+    (video as { home_post_id?: string }).home_post_id,
+    (video as { original_post_id?: string }).original_post_id,
+  ]);
 
   useEffect(() => {
     void reloadMonetization();
@@ -1699,14 +1729,16 @@ function VideoPost({
 
   useEffect(() => {
     return subscribePostMonetization((postId) => {
-      const rid = video?.id != null ? String(video.id) : null;
-      const alt =
-        monetizationPostIdOverride && String(monetizationPostIdOverride) !== String(rid)
-          ? String(monetizationPostIdOverride)
-          : null;
-      if (rid && (postId === rid || (alt && postId === alt))) void reloadMonetization();
+      const ids = monetizationCandidatePostIds(video, monetizationPostIdOverride);
+      if (ids.some((id) => id === postId)) void reloadMonetization();
     });
-  }, [video?.id, monetizationPostIdOverride, reloadMonetization]);
+  }, [
+    video?.id,
+    monetizationPostIdOverride,
+    (video as { home_post_id?: string }).home_post_id,
+    (video as { original_post_id?: string }).original_post_id,
+    reloadMonetization,
+  ]);
 
   useEffect(() => {
     if (!tipFlash) return;
