@@ -14,6 +14,54 @@ const RECENT_EVENT_MS: Record<BehaviorAction, number> = {
 };
 const recentEventMap = new Map<string, number>();
 
+const MONETIZATION_DEBUG_DEDUPE_MS = 4000;
+const monetizationDebugDedupe = new Map<string, number>();
+
+/**
+ * Production debugging: inserts one row per signal (category) for a reel post.
+ * Uses `action_type = 'monetization_debug'` (DB check) and stores the signal name in `category`.
+ * Does not call rewards/activity-event — safe for high-volume diagnostics.
+ * Requires signed-in user (RLS). Skips silently when unauthenticated or postId missing.
+ */
+export async function trackMonetizationDebugBehavior(signal: string, postId: string): Promise<void> {
+  const sig = String(signal || '').trim();
+  const pid = String(postId || '').trim();
+  if (!sig || !pid) return;
+
+  const { data: auth } = await supabase.auth.getUser();
+  const uid = auth.user?.id;
+  if (!uid) return;
+
+  const now = Date.now();
+  const dedupeKey = `${uid}:${pid}:${sig}`;
+  const lastAt = monetizationDebugDedupe.get(dedupeKey) ?? 0;
+  if (now - lastAt < MONETIZATION_DEBUG_DEDUPE_MS) return;
+  monetizationDebugDedupe.set(dedupeKey, now);
+  if (monetizationDebugDedupe.size > 4000) {
+    const cutoff = now - 15 * 60_000;
+    for (const [k, t] of monetizationDebugDedupe.entries()) {
+      if (t < cutoff) monetizationDebugDedupe.delete(k);
+    }
+  }
+
+  const { error } = await supabase.from('user_behavior').insert({
+    user_id: uid,
+    action_type: 'monetization_debug',
+    target_type: 'video',
+    target_id: pid,
+    category: sig,
+  });
+
+  if (error) {
+    console.warn('[trackMonetizationDebugBehavior] insert failed', {
+      message: error.message,
+      code: error.code,
+      signal: sig,
+      postId: pid,
+    });
+  }
+}
+
 export async function trackUserBehavior(args: {
   userId: string;
   actionType: BehaviorAction;

@@ -53,7 +53,7 @@ import { getViews, getViralScore } from '../lib/postViews';
 import { getPersonalizedScore, trackWatchTime, updateInterest } from '../lib/personalizedRanking';
 import { maybeRewardViralPost } from '../lib/viralRewards';
 import { startCreatorValidViewWatch, stopCreatorValidViewWatch } from '../lib/creatorValidViews';
-import { trackUserBehavior } from '../lib/userBehavior';
+import { trackMonetizationDebugBehavior, trackUserBehavior } from '../lib/userBehavior';
 import {
   fetchMonetizationPost,
   isMonetizationDebugEnabled,
@@ -1568,6 +1568,30 @@ function VideoPost({
     });
   }, [monetizationReady, video, monetization, isOwner, user?.id, postBoosted, canGiftOrTip]);
 
+  useEffect(() => {
+    if (!monetizationReady || !video?.id || !user?.id) return;
+    const pid = String(video.id);
+    void trackMonetizationDebugBehavior('view_video', pid);
+  }, [monetizationReady, video?.id, user?.id]);
+
+  useEffect(() => {
+    if (!monetizationReady || !video?.id || !user?.id) return;
+    const pid = String(video.id);
+    if (canGiftOrTip) {
+      void trackMonetizationDebugBehavior('tip_available', pid);
+    } else {
+      void trackMonetizationDebugBehavior('tip_not_visible', pid);
+    }
+  }, [monetizationReady, video?.id, user?.id, canGiftOrTip]);
+
+  useEffect(() => {
+    if (!monetizationReady || !video?.id || !user?.id) return;
+    const pid = String(video.id);
+    void trackMonetizationDebugBehavior(`can_tip_${canGiftOrTip}`, pid);
+    void trackMonetizationDebugBehavior(`is_owner_${isOwner}`, pid);
+    void trackMonetizationDebugBehavior(`post_boosted_${postBoosted}`, pid);
+  }, [monetizationReady, video?.id, user?.id, canGiftOrTip, isOwner, postBoosted]);
+
   const reloadMonetization = useCallback(async () => {
     const rid = video?.id != null ? String(video.id) : null;
     if (!rid) {
@@ -1968,6 +1992,7 @@ function VideoPost({
       alert(res.error || 'Gift failed');
       return;
     }
+    void trackMonetizationDebugBehavior('send_gift', reelId);
     if (import.meta.env.DEV) {
       console.log('[Gifts][AfterSend] postId used:', effectivePostId);
     }
@@ -2024,6 +2049,7 @@ function VideoPost({
       alert(res.error || 'Tip failed');
       return;
     }
+    void trackMonetizationDebugBehavior('send_tip', reelId);
     if (import.meta.env.DEV) {
       console.log('[Gifts][AfterSend] postId used:', effectivePostId);
     }
@@ -2522,6 +2548,9 @@ function VideoPost({
             label="Tip"
             onClick={(e) => {
               e.stopPropagation();
+              if (video?.id != null) {
+                void trackMonetizationDebugBehavior('click_tip', String(video.id));
+              }
               setTipPickerOpen(true);
             }}
           />
