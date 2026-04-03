@@ -37,13 +37,14 @@ export function isMonetizationUnlockedForTips(
 }
 
 /**
- * Tip/gift UI: boosted when `posts.is_featured` is true OR monetization is unlocked
- * (`post_monetization` after coin boost — matches Reels which loads GET /monetization/post).
+ * Tip/gift UI: boosted when the post row is featured (DB-backed) OR monetization reports `unlocked`.
+ * Does not require monetization to be loaded; featured alone is enough.
  */
 export function isPostBoostedForTips(
   post: { is_featured?: unknown; isFeatured?: unknown } | null | undefined,
   monetization: { unlocked?: unknown; monetizationLocked?: unknown } | null | undefined
 ): boolean {
-  if (normalizePostRowIsFeatured(post)) return true;
-  return isMonetizationUnlockedForTips(monetization);
+  const isFeatured = normalizePostRowIsFeatured(post);
+  const isUnlocked = !!monetization?.unlocked;
+  return isFeatured || isUnlocked;
 }
