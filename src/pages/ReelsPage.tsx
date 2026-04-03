@@ -1588,28 +1588,50 @@ function VideoPost({
   const postBoosted = isPostBoostedForTips(video, monetization);
   const canGiftOrTip = postBoosted && !isOwner && !!user?.id;
 
+  /** Production diagnostics: not behind `import.meta.env.DEV`. Runs when VideoPost mounts / deps change. */
   useEffect(() => {
-    if (!isMonetizationDebugEnabled()) return;
-    const rid = video?.id != null ? String(video.id) : '';
-    console.log('[VideoPost][monetization]', rid, monetization);
-    console.log('[BoostCheck]', rid, (video as { is_featured?: unknown })?.is_featured, monetization);
-  }, [video?.id, monetization]);
-
-  useEffect(() => {
-    if (!isMonetizationDebugEnabled() || !monetizationReady) return;
-    const rid = video?.id != null ? String(video.id) : '';
-    console.log('[canGiftOrTip debug]', {
-      postId: rid,
-      monetization,
-      monetization_unlocked: monetization?.unlocked,
-      monetization_monetizationLocked: monetization?.monetizationLocked,
-      video_is_featured: (video as { is_featured?: unknown })?.is_featured,
-      isOwner,
-      user_id: user?.id,
+    const payload = {
+      videoId: video.id,
+      isFeatured: video.is_featured,
+      unlocked: monetization?.unlocked,
+      isOwner: video.user_id === user?.id,
+      postUserId: (video as { post_user_id?: string }).post_user_id,
+      ownerIdResolved: ownerId,
+      isOwnerActual: isOwner,
+      monetizationNull: monetization == null,
+      monetizationReady,
+      featuredNormalized: normalizePostRowIsFeatured(video),
+      monetizationUnlocked,
       postBoosted,
       canGiftOrTip,
+      tipGate: { postBoosted, notOwner: !isOwner, signedIn: !!user?.id },
+      monetizationPostIdOverride: monetizationPostIdOverride ?? null,
+    };
+    console.log('BoostCheck', payload);
+    console.warn('BoostCheck', payload);
+    console.log('DEBUG_IDS', {
+      videoId: video.id,
+      postUserId: video.post_user_id,
+      videoUserId: video.user_id,
+      monetizationPostIdOverride,
+      monetization,
+      unlocked: monetization?.unlocked,
     });
-  }, [monetizationReady, video, monetization, isOwner, user?.id, postBoosted, canGiftOrTip]);
+  }, [
+    video?.id,
+    video?.user_id,
+    (video as { post_user_id?: string }).post_user_id,
+    video?.is_featured,
+    monetization,
+    monetizationReady,
+    user?.id,
+    ownerId,
+    isOwner,
+    postBoosted,
+    canGiftOrTip,
+    monetizationPostIdOverride,
+    monetizationUnlocked,
+  ]);
 
   useEffect(() => {
     if (!monetizationReady || !video?.id || !user?.id) return;
