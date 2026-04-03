@@ -296,19 +296,74 @@ export function mergeMonetizationPostStatus(
   };
 }
 
-export async function purchaseMonetizationBoost(postId: string, tier: BoostTierId): Promise<{ ok: boolean; error?: string }> {
-  const headers = await getBearerAuthHeaders();
-  if (!headers) return { ok: false, error: 'Not signed in' };
-  const res = await fetch(apiUrl('/api/monetization/boost'), {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ postId, tier }),
+async function purchaseMonetizationBoostViaSupabaseRpc(
+  postId: string,
+  tier: BoostTierId
+): Promise<{ ok: boolean; error?: string }> {
+  const { data, error } = await supabase.rpc('monetization_boost_purchase', {
+    p_post_id: postId,
+    p_tier: tier,
   });
-  const j = await res.json().catch(() => ({}));
-  if (!res.ok) return { ok: false, error: typeof j.error === 'string' ? j.error : 'Boost failed' };
+  if (error) {
+    return { ok: false, error: error.message || 'Boost failed' };
+  }
+  const row = data as { ok?: boolean; error?: string } | null;
+  if (!row || row.ok !== true) {
+    return { ok: false, error: typeof row?.error === 'string' ? row.error : 'Boost failed' };
+  }
   emitPostMonetizationRefresh(postId);
   emitMonetizationRefresh();
   return { ok: true };
+}
+
+/**
+ * Purchase boost via local Express in dev, or Supabase RPC in production (Vercel has no `/api/monetization/boost`).
+ */
+export async function purchaseMonetizationBoost(postId: string, tier: BoostTierId): Promise<{ ok: boolean; error?: string }> {
+  const headers = await getBearerAuthHeaders();
+  if (!headers) return { ok: false, error: 'Not signed in' };
+
+  if (import.meta.env.DEV) {
+    try {
+      const res = await fetch(apiUrl('/api/monetization/boost'), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ postId, tier }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (res.ok) {
+        emitPostMonetizationRefresh(postId);
+        emitMonetizationRefresh();
+        return { ok: true };
+      }
+      // fall through: RPC when API missing or returns error
+    } catch {
+      /* network — try RPC */
+    }
+    if (!isSupabaseConfigured) {
+      return { ok: false, error: 'Boost failed' };
+    }
+    return purchaseMonetizationBoostViaSupabaseRpc(postId, tier);
+  }
+
+  if (!isSupabaseConfigured) {
+    try {
+      const res = await fetch(apiUrl('/api/monetization/boost'), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ postId, tier }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: typeof j.error === 'string' ? j.error : 'Boost failed' };
+      emitPostMonetizationRefresh(postId);
+      emitMonetizationRefresh();
+      return { ok: true };
+    } catch {
+      return { ok: false, error: 'Boost failed' };
+    }
+  }
+
+  return purchaseMonetizationBoostViaSupabaseRpc(postId, tier);
 }
 
 export async function sendMonetizationGift(
