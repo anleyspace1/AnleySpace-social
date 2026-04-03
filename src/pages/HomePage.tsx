@@ -2263,7 +2263,10 @@ const PostItem = React.memo(function PostItem({
     };
   }, [canPlayVideo, post.id, videoUrl]);
 
-  /** Same signal as Reels: `posts.is_featured` OR GET /monetization/post unlocked (coin boost). */
+  /**
+   * Monetization for Tip/Gift: not gated by `isVideoInViewport` (avoids Vercel/IO missing fetch).
+   * Same signal as Reels: `posts.is_featured` OR `post_monetization` unlocked (coin boost).
+   */
   useEffect(() => {
     const postId = String(post?.id || '').trim();
     const ownerId = String(post?.user_id || '').trim();

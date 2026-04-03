@@ -3,6 +3,12 @@ import { getBearerAuthHeaders } from './supabaseAuthHeaders';
 import { emitMonetizationRefresh, emitPostMonetizationRefresh } from './monetizationRealtime';
 import { isSupabaseConfigured, supabase } from './supabase';
 
+/**
+ * Vercel monetization bundle (2026-04):
+ * - `expiresAtToUnlockMs`: Safari-safe unlock (space → T in ISO-like timestamps).
+ * - `fetchMonetizationPost`: prod Supabase first; `console.log('[Monetization][Vercel]', …)` when `?debugMonetization=1`.
+ * - `purchaseMonetizationBoost`: prod uses `monetization_boost_purchase` RPC when Supabase is configured.
+ */
 /** Dev or `?debugMonetization=1` — log monetization / unlocked / is_featured for Vercel debugging. */
 export function isMonetizationDebugEnabled(): boolean {
   if (import.meta.env.DEV) return true;
