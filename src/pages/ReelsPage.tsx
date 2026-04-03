@@ -131,9 +131,10 @@ export default function ReelsPage() {
     if (!routeReelId) return '';
     try {
       const storedReel = sessionStorage.getItem('reels_nav_reel_id');
-      const storedPost = sessionStorage.getItem('reels_nav_home_post_id');
+      const storedPost =
+        sessionStorage.getItem('reels_home_post_id') || sessionStorage.getItem('reels_nav_home_post_id');
       if (storedReel && storedPost && String(storedReel) === routeReelId) {
-        return storedPost;
+        return String(storedPost).trim();
       }
     } catch {
       /* ignore */
@@ -146,6 +147,7 @@ export default function ReelsPage() {
     try {
       sessionStorage.setItem('reels_nav_reel_id', String(selectedVideoId));
       sessionStorage.setItem('reels_nav_home_post_id', homeNavPostIdFromState);
+      sessionStorage.setItem('reels_home_post_id', homeNavPostIdFromState);
     } catch {
       /* ignore */
     }
@@ -1500,6 +1502,25 @@ function SoundSelector({ onClose, onSelect, selectedSoundId }: { onClose: () => 
 }
 
 /**
+ * Original Home feed `posts.id` persisted when navigating Home → Reels (paired with `reels_nav_reel_id`).
+ * Prefer `reels_home_post_id`, fall back to legacy `reels_nav_home_post_id`.
+ */
+function storedReelsHomePostIdForVideo(videoId: unknown): string | null {
+  if (videoId == null) return null;
+  try {
+    const sr = sessionStorage.getItem('reels_nav_reel_id');
+    const sp =
+      sessionStorage.getItem('reels_home_post_id')?.trim() ||
+      sessionStorage.getItem('reels_nav_home_post_id')?.trim() ||
+      '';
+    if (!sp || !sr || String(sr) !== String(videoId)) return null;
+    return sp;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Monetization rows are keyed by `posts.id`. Reel rows and Home feed rows can differ — collect every
  * candidate id (deduped) so `fetchMonetizationPost` is not reel-id-only on Vercel.
  */
@@ -1514,13 +1535,7 @@ function monetizationCandidatePostIds(
   };
   add(video?.id);
   add(monetizationPostIdOverride);
-  try {
-    const sr = sessionStorage.getItem('reels_nav_reel_id');
-    const sp = sessionStorage.getItem('reels_nav_home_post_id');
-    if (sr && sp && video?.id != null && String(sr) === String(video.id)) add(sp);
-  } catch {
-    /* ignore */
-  }
+  add(storedReelsHomePostIdForVideo(video?.id));
   add((video as { home_post_id?: string }).home_post_id);
   add((video as { original_post_id?: string }).original_post_id);
   return ids;
@@ -1604,13 +1619,10 @@ function VideoPost({
     { id: 'g6', icon: '🌹', price: 50 },
   ];
 
-  const ownerId = String(
-    (video as { post_user_id?: string; user_id?: string })?.post_user_id ??
-      (video as { user_id?: string })?.user_id ??
-      (video as { user?: { id?: string } })?.user?.id ??
-      ''
-  ).trim();
-  const isOwner = !!user?.id && ownerId === user.id;
+  const ownerId =
+    (video as { post_user_id?: string; user_id?: string }).post_user_id ||
+    (video as { post_user_id?: string; user_id?: string }).user_id;
+  const isOwner = !!user && ownerId != null && ownerId !== '' && String(ownerId) === String(user.id);
   const monetizationUnlocked = isMonetizationUnlockedForTips(monetization);
   const postBoosted = isPostBoostedForTips(video, monetization);
   const canGiftOrTip = postBoosted && !isOwner && !!user?.id;
@@ -1621,7 +1633,7 @@ function VideoPost({
       videoId: video.id,
       isFeatured: video.is_featured,
       unlocked: monetization?.unlocked,
-      isOwner: video.user_id === user?.id,
+      isOwner,
       postUserId: (video as { post_user_id?: string }).post_user_id,
       ownerIdResolved: ownerId,
       isOwnerActual: isOwner,

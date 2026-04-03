@@ -1972,8 +1972,16 @@ function Feed({ category, refreshKey }: { category?: string | null; refreshKey?:
                 <SuggestedReelsStrip
                   reels={suggestedReels}
                   onOpenReel={(reel) => {
+                    try {
+                      sessionStorage.setItem('reels_nav_reel_id', String(reel.id));
+                      sessionStorage.setItem('reels_nav_home_post_id', String(reel.id));
+                      sessionStorage.setItem('reels_home_post_id', String(reel.id));
+                    } catch {
+                      /* ignore */
+                    }
                     navigate(`/reels/${reel.id}?autoplaySound=1`, {
                       state: {
+                        postId: reel.id,
                         selectedReelId: reel.id,
                         videoId: reel.id,
                         videoUrl: reel.video_url,
@@ -3258,6 +3266,7 @@ const PostItem = React.memo(function PostItem({
     try {
       sessionStorage.setItem('reels_nav_reel_id', String(reelId));
       sessionStorage.setItem('reels_nav_home_post_id', String(post.id));
+      sessionStorage.setItem('reels_home_post_id', String(post.id));
     } catch {
       /* ignore */
     }

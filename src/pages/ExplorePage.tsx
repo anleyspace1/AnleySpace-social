@@ -146,14 +146,23 @@ function ExploreVideoPostCard({
   const { user, profile, refreshProfile } = useAuth();
   const thumb = typeof post.image_url === 'string' ? post.image_url.trim() : '';
   const videoUrl = String(post.video_url || '').trim();
-  const open = () =>
+  const open = () => {
+    try {
+      sessionStorage.setItem('reels_nav_reel_id', String(post.id));
+      sessionStorage.setItem('reels_nav_home_post_id', String(post.id));
+      sessionStorage.setItem('reels_home_post_id', String(post.id));
+    } catch {
+      /* ignore */
+    }
     navigate(`/reels/${post.id}`, {
       state: {
+        postId: post.id,
         videoId: post.id,
         selectedReelId: post.id,
         videoUrl,
       },
     });
+  };
   return (
     <div onClick={open} className="group cursor-pointer">
       <div className="relative mb-2 aspect-[9/16] overflow-hidden rounded-xl bg-[#1a1c26]">
