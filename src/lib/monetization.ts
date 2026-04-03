@@ -107,7 +107,11 @@ function monetizationStatusFromPostMonetizationRow(
     };
   }
   const expiresAtMs = row.expires_at ? new Date(String(row.expires_at)).getTime() : 0;
-  const unlocked = expiresAtMs > Date.now();
+  const now = Date.now();
+  const unlocked = Number.isFinite(expiresAtMs) && expiresAtMs > now;
+  if (isMonetizationDebugEnabled() && row.expires_at && !Number.isFinite(expiresAtMs)) {
+    console.warn('[monetization] invalid expires_at', { raw: row.expires_at });
+  }
   const maxC = Number(row.max_boost_earnings_cents) || 0;
   const boostC = Number(row.boost_earnings_cents) || 0;
   const organicC = Number(row.organic_earnings_cents) || 0;
@@ -132,14 +136,23 @@ function monetizationStatusFromPostMonetizationRow(
  */
 async function fetchMonetizationPostFromSupabase(postId: string): Promise<MonetizationPostStatus | null> {
   if (!isSupabaseConfigured) return null;
+  const pid = String(postId).trim();
   try {
     const { data: row, error } = await supabase
       .from('post_monetization')
       .select(
         'post_id, creator_id, tier, price_coins, max_boost_earnings_cents, boost_earnings_cents, organic_earnings_cents, expires_at, created_at'
       )
-      .eq('post_id', postId)
+      .eq('post_id', pid)
       .maybeSingle();
+    if (isMonetizationDebugEnabled()) {
+      console.log('[monetization] RAW post_monetization', {
+        postId: pid,
+        error: error ? { message: error.message, code: error.code, details: error.details } : null,
+        row: row ?? null,
+        expires_at: row && (row as { expires_at?: unknown }).expires_at,
+      });
+    }
     if (error) {
       if (isMonetizationDebugEnabled()) console.warn('[monetization] Supabase post_monetization', error.message);
       return null;
@@ -152,7 +165,50 @@ async function fetchMonetizationPostFromSupabase(postId: string): Promise<Moneti
 
 function isMonetizationPostPayload(j: unknown): j is MonetizationPostStatus {
   if (j == null || typeof j !== 'object') return false;
-  return typeof (j as Record<string, unknown>).unlocked === 'boolean';
+  const o = j as Record<string, unknown>;
+  const u = o.unlocked;
+  return (
+    typeof u === 'boolean' ||
+    typeof u === 'number' ||
+    typeof u === 'string' ||
+    typeof o.monetizationLocked === 'boolean'
+  );
+}
+
+/** Normalize API JSON (numbers/strings) into MonetizationPostStatus shape. */
+function normalizeMonetizationApiPayload(j: unknown): MonetizationPostStatus | null {
+  if (j == null || typeof j !== 'object') return null;
+  const o = j as Record<string, unknown>;
+  const uRaw = o.unlocked;
+  const mlRaw = o.monetizationLocked;
+  let unlocked: boolean;
+  if (typeof uRaw === 'boolean') {
+    unlocked = uRaw;
+  } else if (uRaw === true || uRaw === 'true' || uRaw === 1 || uRaw === '1') {
+    unlocked = true;
+  } else if (typeof uRaw === 'string' && uRaw.toLowerCase() === 'true') {
+    unlocked = true;
+  } else if (uRaw === false || uRaw === 'false' || uRaw === 0) {
+    unlocked = false;
+  } else if (mlRaw === false || mlRaw === 'false') {
+    unlocked = true;
+  } else if (mlRaw === true) {
+    unlocked = false;
+  } else {
+    return null;
+  }
+  return {
+    ok: o.ok !== false && o.ok !== 'false',
+    unlocked,
+    monetizationLocked: !unlocked,
+    tier: (o.tier as string | null) ?? null,
+    expiresAt: o.expiresAt != null ? String(o.expiresAt) : null,
+    boostEarningsCents: Number(o.boostEarningsCents) || 0,
+    maxBoostEarningsCents: Number(o.maxBoostEarningsCents) || 0,
+    organicEarningsCents: Number(o.organicEarningsCents) || 0,
+    boostProgress: Number(o.boostProgress) || 0,
+    creatorId: o.creatorId != null ? String(o.creatorId) : undefined,
+  };
 }
 
 function logMonetizationDebug(
@@ -168,7 +224,10 @@ async function tryFetchMonetizationFromApi(postId: string): Promise<Monetization
     const res = await fetch(apiUrl(`/api/monetization/post/${encodeURIComponent(postId)}`));
     if (responseLooksLikeJsonApi(res) && res.ok) {
       const j: unknown = await res.json();
-      if (isMonetizationPostPayload(j)) return j;
+      if (isMonetizationPostPayload(j)) {
+        const normalized = normalizeMonetizationApiPayload(j);
+        if (normalized) return normalized;
+      }
     }
   } catch {
     /* CORS, network, or invalid JSON */
@@ -205,15 +264,18 @@ export async function fetchMonetizationPost(postId: string): Promise<Monetizatio
     source: fromSb != null ? 'supabase' : 'none',
     unlocked: fromSb?.unlocked,
   });
-  if (fromSb != null) return fromSb;
+  if (fromSb?.unlocked) return fromSb;
 
   const fromApi = await tryFetchMonetizationFromApi(postId);
-  logMonetizationDebug('fetch order: prod API fallback', {
+  const merged = mergeMonetizationPostStatus(fromSb, fromApi);
+  logMonetizationDebug('fetch order: prod merge Supabase+API', {
     postId,
-    source: fromApi ? 'api' : 'none',
-    unlocked: fromApi?.unlocked,
+    supabaseUnlocked: fromSb?.unlocked,
+    apiUnlocked: fromApi?.unlocked,
+    mergedUnlocked: merged?.unlocked,
   });
-  return fromApi;
+  if (merged) return merged;
+  return fromSb ?? fromApi;
 }
 
 /** When Home post id ≠ reel row id, merge unlock signals so Tip/Gifts match Home. */

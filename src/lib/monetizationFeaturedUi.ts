@@ -23,16 +23,27 @@ export function isPostFeaturedForMonetization(
   return normalizePostRowIsFeatured(post);
 }
 
+/** Normalize API/DB unlock signals (boolean, string, number, or `monetizationLocked` inverse). */
+export function isMonetizationUnlockedForTips(
+  monetization: { unlocked?: unknown; monetizationLocked?: unknown } | null | undefined
+): boolean {
+  if (monetization == null) return false;
+  const u = monetization.unlocked;
+  const ml = monetization.monetizationLocked;
+  if (u === true || u === 'true' || u === 1 || u === '1') return true;
+  if (typeof u === 'string' && u.toLowerCase() === 'true') return true;
+  if (ml === false || ml === 'false' || ml === 0) return true;
+  return false;
+}
+
 /**
  * Tip/gift UI: boosted when `posts.is_featured` is true OR monetization is unlocked
  * (`post_monetization` after coin boost — matches Reels which loads GET /monetization/post).
  */
 export function isPostBoostedForTips(
   post: { is_featured?: unknown; isFeatured?: unknown } | null | undefined,
-  monetization: { unlocked?: unknown } | null | undefined
+  monetization: { unlocked?: unknown; monetizationLocked?: unknown } | null | undefined
 ): boolean {
   if (normalizePostRowIsFeatured(post)) return true;
-  if (monetization == null) return false;
-  const u = monetization.unlocked;
-  return u === true || u === 'true' || u === 1;
+  return isMonetizationUnlockedForTips(monetization);
 }

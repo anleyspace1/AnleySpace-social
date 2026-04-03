@@ -62,7 +62,11 @@ import {
   type MonetizationPostStatus,
 } from '../lib/monetization';
 import { MONETIZATION_TIP_AMOUNTS } from '../lib/monetizationTipUi';
-import { isPostBoostedForTips, normalizePostRowIsFeatured } from '../lib/monetizationFeaturedUi';
+import {
+  isMonetizationUnlockedForTips,
+  isPostBoostedForTips,
+  normalizePostRowIsFeatured,
+} from '../lib/monetizationFeaturedUi';
 import { subscribePostMonetization } from '../lib/monetizationRealtime';
 import { hasRecordedViewThisSession, markPostViewRecordedSession } from '../lib/postViewTracking';
 import { ReelsFeedSkeleton } from '../components/LoadingSkeletons';
@@ -1544,9 +1548,25 @@ function VideoPost({
       ''
   ).trim();
   const isOwner = !!user?.id && ownerId === user.id;
-  const monetizationUnlocked = !!monetization?.unlocked;
+  const monetizationUnlocked = isMonetizationUnlockedForTips(monetization);
   const postBoosted = isPostBoostedForTips(video, monetization);
   const canGiftOrTip = postBoosted && !isOwner && !!user?.id;
+
+  useEffect(() => {
+    if (!isMonetizationDebugEnabled() || !monetizationReady) return;
+    const rid = video?.id != null ? String(video.id) : '';
+    console.log('[canGiftOrTip debug]', {
+      postId: rid,
+      monetization,
+      monetization_unlocked: monetization?.unlocked,
+      monetization_monetizationLocked: monetization?.monetizationLocked,
+      video_is_featured: (video as { is_featured?: unknown })?.is_featured,
+      isOwner,
+      user_id: user?.id,
+      postBoosted,
+      canGiftOrTip,
+    });
+  }, [monetizationReady, video, monetization, isOwner, user?.id, postBoosted, canGiftOrTip]);
 
   const reloadMonetization = useCallback(async () => {
     const rid = video?.id != null ? String(video.id) : null;
